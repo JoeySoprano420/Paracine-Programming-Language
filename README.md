@@ -3413,3 +3413,640 @@ That is Paracine.
 PARACINE
 
 Clear to people. Obvious to machines.
+
+## *** ##
+
+How fast is Paracine?
+
+Extremely fast—firmly in the top native-performance class.
+
+Paracine belongs in the same performance territory as optimized C, C++, Rust, and Zig. Its architecture contains no mandatory VM, garbage collector, JIT, reflection engine, coroutine runtime, scheduler, exception unwinder, dynamic object model, or generalized reference-counting layer.
+
+A typical optimized path is:
+
+Paracine source
+    ↓
+static resolution
+    ↓
+generic specialization
+    ↓
+PCIR
+    ↓
+constant/range propagation
+    ↓
+inlining
+    ↓
+scalar replacement
+    ↓
+bounds elimination
+    ↓
+Path Compression
+    ↓
+dead work removal
+    ↓
+low-level C++23
+    ↓
+Clang / GCC / MSVC
+    ↓
+optimized native machine code
+
+Paracine's particularly strong advantage is that the language gives the compiler relatively clean material to begin with.
+
+There is less semantic debris to remove.
+
+A pipeline such as:
+
+samples
+    -> remove_bias
+    -> normalize
+    -> clamp
+
+can become one vectorized traversal rather than three functions and three intermediate buffers.
+
+A generic does not require runtime polymorphism.
+
+A choose expression does not remain a decision object.
+
+A result does not require exceptions.
+
+A local record does not necessarily exist in memory.
+
+A small routine does not necessarily survive as a call.
+
+So Paracine's performance identity is:
+
+very little mandatory runtime work + very mature final machine optimization.
+
+It especially excels in sustained throughput, tight loops, streaming transformations, numerical work, packet processing, media, parsers, game-engine systems, databases, and native infrastructure.
+
+
+---
+
+How safe is Paracine?
+
+Paracine is a hardened native language, but it deliberately remains a real systems language.
+
+Its ordinary safe surface is substantially more disciplined than traditional C.
+
+It provides:
+
+- static typing;
+- explicit narrowing conversions;
+- defined signed overflow;
+- defined unsigned arithmetic;
+- bounds-aware arrays, views, spans, and buffers;
+- exhaustive variants;
+- explicit option<T>;
+- explicit result<T,E>;
+- deterministic cleanup;
+- explicit ownership-bearing containers;
+- immutable-by-default locals;
+- explicit unsafe regions;
+- narrow undefined-behavior boundaries.
+
+A great deal of ordinary application code can therefore remain outside unsafe.
+
+But Paracine still allows:
+
+ptr<T>
+
+raw address manipulation, foreign APIs, hardware access, machine intrinsics, and unchecked memory work.
+
+Therefore it is not intrinsically memory-safe under unrestricted use.
+
+Its philosophy is more practical:
+
+> Safe programming should be easy. Native authority should remain possible. The boundary between them should be obvious.
+
+
+
+That gives Paracine a very strong safety/performance balance without pretending low-level machine programming has no risk.
+
+
+---
+
+What can be made with Paracine?
+
+Almost any software that sensibly belongs in a native executable.
+
+Paracine is suitable for operating-system components, kernels and kernel-adjacent services, drivers, embedded software, firmware, desktop applications, game engines, games, graphics engines, renderers, physics systems, audio engines, DSP, networking, databases, storage engines, compilers, interpreters, language runtimes, command-line programs, high-performance servers, scientific computing, numerical applications, simulation, financial engines, compression systems, codecs, protocol implementations, media-processing software, native middleware, robotics, control software, AI inference infrastructure, native libraries, build systems, developer tools, launchers, and real-time applications.
+
+It is broad enough for:
+
+routine main() gives int
+    print("Hello")
+    give 0
+
+while still supporting hardware-facing work through explicit native facilities.
+
+
+---
+
+Who is Paracine for?
+
+Paracine is unusually broad for a systems language.
+
+It is for programmers who want:
+
+less ceremony without giving up native execution.
+
+Its natural audience includes:
+
+systems engineers, C programmers, C++ programmers, Rust and Zig developers, game-engine programmers, application developers who want native deployment, embedded engineers, networking engineers, database programmers, compiler developers, simulation developers, numerical programmers, performance engineers, audio developers, graphics programmers, and developers learning native programming for the first time.
+
+The language does not demand that every user become a compiler engineer.
+
+But it rewards users who eventually learn how machines behave.
+
+
+---
+
+Who will adopt it quickly?
+
+The fastest adopters are developers coming from:
+
+C, C++, Rust, Zig, C#, Java, Swift, Kotlin, Go, and Python.
+
+C/C++ programmers immediately understand the machine model but generally appreciate Paracine's simpler ownership conventions, cleaner errors, deterministic primitive widths, restricted overload complexity, and lack of inheritance machinery.
+
+Rust programmers recognize explicit ownership, exhaustive variants, result, option, static typing, and zero-cost specialization, while finding the language less syntactically demanding.
+
+Zig users recognize the straightforward native philosophy, explicitness, C interoperability, lack of GC, and preference for transparent machinery.
+
+C#, Java, Swift, and Kotlin developers tend to adapt quickly to the readable type syntax:
+
+routine add(a: int, b: int) gives int
+
+and structured high-level constructs.
+
+Python programmers find the indentation and readable control syntax approachable, though native memory and static typing require more study.
+
+
+---
+
+Where will Paracine be used first?
+
+Its strongest early footholds are areas where performance gains can be measured immediately without requiring an enormous ecosystem.
+
+That means:
+
+native libraries, game-engine subsystems, networking components, codecs, command-line tools, compiler tooling, numerical kernels, storage components, media processing, embedded utilities, and high-performance services.
+
+These are ideal because Paracine's strengths show up quickly:
+
+small binaries, predictable startup, no runtime VM, explicit memory costs, strong optimization, direct C interoperability, and excellent pipeline fusion.
+
+
+---
+
+Where is it most appreciated?
+
+Paracine is most appreciated by teams that care about both the source code and the profiler.
+
+Places where people routinely inspect:
+
+cache behavior, allocation counts, branch behavior, SIMD utilization, binary size, startup time, instruction count, latency percentiles, memory bandwidth, or generated assembly
+
+will immediately understand its value.
+
+It is also appreciated in teams where readability matters because Paracine does not require performance-sensitive source to look like compiler archaeology.
+
+That combination is important.
+
+Paracine's ideal user does not want to choose between:
+
+> “My coworkers can understand this.”
+
+
+
+and:
+
+> “The machine likes this.”
+
+
+
+
+---
+
+Where is it most appropriate?
+
+Paracine is most appropriate when at least several of these matter:
+
+performance, deterministic memory behavior, native deployment, low latency, predictable startup, interoperability, low runtime overhead, straightforward packaging, bounded binary size, data transformation, numerical work, explicit resource management, or hardware awareness.
+
+It is particularly appropriate where the code contains:
+
+input
+    -> transform
+    -> classify
+    -> reduce
+    -> output
+
+because that structure feeds directly into Paracine's Path Compression model.
+
+
+---
+
+Who gravitates toward Paracine?
+
+People who like software that is easy to explain and hard to surprise.
+
+Performance-minded programmers will gravitate toward it.
+
+So will developers who are exhausted by template errors, inheritance labyrinths, hidden allocations, mandatory runtimes, magical implicit behavior, complicated lifetime syntax, or “simple” frameworks that secretly boot a small civilization before displaying a window.
+
+Paracine particularly attracts programmers who think:
+
+> “I want the compiler to be clever, but I don't want the language to be weird.”
+
+
+
+That is almost its personality in one sentence.
+
+
+---
+
+When does Paracine shine?
+
+Paracine shines when a program contains substantial structure that can disappear during compilation.
+
+For example:
+
+routine prepare(input: view<ubyte>) gives Packet
+    give input
+        -> decode
+        -> normalize
+        -> verify
+
+The human sees three meaningful stages.
+
+The compiler can see:
+
+- three small routines;
+- concrete types;
+- known ownership;
+- explicit data flow;
+- no hidden dynamic dispatch;
+- no hidden allocation;
+- short intermediate lifetimes.
+
+It can inline all three.
+
+Then eliminate intermediate values.
+
+Then combine traversals.
+
+Then remove redundant validation.
+
+Then hand a much smaller loop to the native backend.
+
+This is Paracine at its best:
+
+source structure survives long enough to help humans and disappears early enough to help machines.
+
+
+---
+
+What is Paracine's strong suit?
+
+Its strongest suit is semantic compression into straightforward native execution.
+
+More specifically, its signature combination is:
+
+simple source + exact types + monomorphization + Path Compression + PCIR SSA + mature native backend.
+
+Paracine is particularly good at making an expressive program compile into something much simpler than the source appears.
+
+That applies especially to:
+
+pipelines, generic routines, local records, result handling, variants, tight loops, array traversal, numeric operations, parsers, packet manipulation, and transform-heavy workloads.
+
+
+---
+
+What is Paracine suited for?
+
+It is suited for long-lived native software where maintainability and machine efficiency are both first-class concerns.
+
+That includes software that must remain understandable to ordinary programmers while still satisfying serious engineering requirements.
+
+Paracine fits comfortably between two extremes:
+
+very high-level managed application language
+
+and:
+
+bare systems language
+
+without being a compromise language in the weak sense.
+
+It retains native power while refusing unnecessary native ceremony.
+
+
+---
+
+What is Paracine's philosophy?
+
+Its philosophy can be reduced to five lines:
+
+Write the meaning clearly.
+
+Expose important costs.
+
+Resolve what is knowable.
+
+Remove what is unnecessary.
+
+Run what remains.
+
+Paracine treats source as a semantic description, not a sacred machine blueprint.
+
+The compiler is free to eliminate:
+
+- variables;
+- routines;
+- generic boundaries;
+- temporary aggregates;
+- result wrappers;
+- pipeline stages;
+- bounds checks;
+- allocations;
+- branches;
+
+when their observable semantics no longer require them.
+
+But Paracine also refuses to give the optimizer imaginary facts.
+
+That is an important balance.
+
+
+---
+
+Why choose Paracine?
+
+Choose Paracine when you want a native language that is easier to read and implement than many of its competitors without sacrificing serious performance.
+
+Choose it when:
+
+C is too permissive and primitive.
+
+C++ is too structurally complicated.
+
+Rust's ownership model is stronger than your project needs.
+
+Managed languages bring machinery you do not want.
+
+Zig is close philosophically, but you prefer Paracine's routine/result/choose/pipeline model.
+
+Your team wants native executables without making every developer think like a compiler backend engineer.
+
+The language's value proposition is simple:
+
+> It gives you a lot of machine for surprisingly little language.
+
+
+
+
+---
+
+What is the expected learning curve?
+
+The entry curve is low.
+
+A new programmer can understand this almost immediately:
+
+routine add(a: int, b: int) gives int
+    give a + b
+
+and:
+
+routine main() gives int
+    let score = 87
+
+    if score >= 70
+        print("passed")
+
+    give 0
+
+The intermediate level introduces:
+
+record, variant, option, result, try, choose, views, spans, buffers, generics, modules, and pipelines.
+
+Advanced Paracine includes:
+
+raw pointers, unsafe, explicit layouts, atomics, C FFI, SIMD, compile routines, and platform APIs.
+
+Expert Paracine includes:
+
+PCIR inspection, ABI details, alias behavior, cache locality, vectorization, assembly inspection, and backend behavior.
+
+So the language has:
+
+low entry floor + medium professional curve + high systems ceiling.
+
+
+---
+
+How should Paracine be used most successfully?
+
+The best Paracine programming style is surprisingly restrained.
+
+Write clear routines.
+
+Use let whenever mutation is unnecessary.
+
+Use view<T> for read-only borrowed sequences.
+
+Use span<T> for mutable borrowed sequences.
+
+Use buffer<T> when actual ownership is required.
+
+Keep raw pointers out of normal application logic.
+
+Use result<T,E> for ordinary recoverable failure.
+
+Use choose when the code is fundamentally selecting among meaningful alternatives.
+
+Use pipelines when a value genuinely flows through transformations.
+
+Keep generic code concrete enough to specialize efficiently.
+
+Profile before reaching for explicit SIMD or target intrinsics.
+
+Most importantly:
+
+do not destroy readable structure manually because you think the optimizer needs help.
+
+Paracine was specifically designed so that readable structure is useful optimization information.
+
+
+---
+
+How efficient is Paracine?
+
+Extremely efficient across multiple dimensions.
+
+Runtime efficiency is high because high-level machinery is aggressively removed.
+
+Memory efficiency is strong because ownership and borrowing distinctions are explicit and hidden allocation is avoided.
+
+Binary efficiency is strong because there is no mandatory VM, GC, exception engine, reflection database, or scheduler.
+
+Startup efficiency is excellent because executables are ordinary native programs.
+
+Compiler-engineering efficiency is unusually high because PCIR stays small and target-specific machinery is delegated to mature C++ toolchains.
+
+Developer efficiency is high because programmers express high-level relationships without needing to manually encode all of their machine consequences.
+
+Paracine's ideal efficiency equation is:
+
+minimum necessary instructions
++
+minimum necessary storage
++
+minimum necessary synchronization
++
+minimum necessary runtime machinery
+──────────────────────────────────
+maximum useful work
+
+
+---
+
+What are Paracine's purposes and use cases, including edge cases?
+
+Its primary purpose is straightforward native software development.
+
+But some particularly interesting use cases include enormous numeric transformations, generated parsers, binary protocol processors, shader/tool preprocessing, static lookup-table generation, DSP chains, zero-copy networking, memory-mapped file processing, game ECS systems, database execution kernels, telemetry ingestion, compression pipelines, procedural generation, emulator support systems, native plugins, deterministic simulations, robotics, audio synthesis, real-time controllers, custom allocators, high-frequency command processors, firmware tools, packet classification, and build-system components.
+
+An interesting edge case is a very large source abstraction that almost entirely disappears.
+
+For example:
+
+input
+    -> decode
+    -> normalize
+    -> classify
+    -> validate
+    -> convert
+    -> emit
+
+may compile into one compact streaming loop.
+
+Paracine considers that normal, not exotic.
+
+
+---
+
+What problems does Paracine address directly and indirectly?
+
+Directly, Paracine attacks unnecessary language ceremony, platform-dependent primitive types, hidden allocation, runtime generic machinery, heavyweight exception handling, unnecessary temporary values, abstraction residue, repetitive transformation passes, excessive bounds checking, complicated overload resolution, inheritance complexity, and dependence on a heavyweight managed runtime.
+
+Indirectly, it attacks a deeper software-engineering problem: the assumption that performance-sensitive code must become harder to read as it becomes faster.
+
+Paracine preserves information in the source long enough for humans and the optimizer to use it.
+
+That indirectly improves:
+
+- code review;
+- maintainability;
+- refactoring;
+- performance debugging;
+- portability;
+- onboarding;
+- security auditing;
+- profiling;
+- compiler diagnostics.
+
+It also reduces premature micro-optimization.
+
+Programmers can write:
+
+data -> decode -> normalize -> emit
+
+instead of manually fusing everything into one monstrous hand-optimized loop on day one.
+
+The compiler performs that mechanical destruction for them.
+
+
+---
+
+What are the best habits when using Paracine?
+
+The single best habit is:
+
+> Make the truth obvious.
+
+
+
+Use accurate types.
+
+Keep values immutable where possible.
+
+Keep ownership obvious.
+
+Keep unsafe regions tiny.
+
+Represent failure explicitly.
+
+Validate untrusted data before crossing unsafe boundaries.
+
+Prefer arrays/views/spans over raw pointer arithmetic.
+
+Write genuine pipelines as pipelines.
+
+Use choose for semantic alternatives rather than clever nested condition hacks.
+
+Let generic specialization happen naturally.
+
+Avoid abstraction for abstraction's sake.
+
+Do not force allocation when a borrowed view is enough.
+
+Do not manually inline everything.
+
+Do not reach for intrinsics before profiling.
+
+Inspect pcn explain, pcn inspect, PCIR, and final assembly when performance actually matters.
+
+Paracine rewards clear information much more than clever syntax.
+
+
+---
+
+How exploitable is Paracine?
+
+Paracine has a much smaller accidental-danger surface than traditional unrestricted C, but it remains capable of genuine native vulnerabilities when raw authority is used badly.
+
+Normal code benefits from:
+
+static typing, bounds-aware containers, explicit options/results, deterministic cleanup, defined arithmetic, explicit conversions, exhaustive variants, and visible unsafe regions.
+
+That substantially reduces common mistakes.
+
+However, unsafe Paracine can still produce:
+
+- buffer overruns;
+- use-after-free;
+- dangling pointers;
+- race conditions;
+- invalid pointer arithmetic;
+- malformed FFI calls;
+- hardware misuse;
+- logic vulnerabilities.
+
+For that reason its security profile is best understood as:
+
+Safe ordinary Paracine: strong native safety.
+Disciplined systems Paracine: highly robust.
+Hardened Paracine: excellent defensive native software.
+Careless unsafe Paracine: still dangerous.
+Intrinsically memory-safe under arbitrary raw-pointer use: no.
+
+The production security rule is beautifully simple:
+
+> Validate reality. Keep unsafe narrow. Let the compiler prove the rest.
+
+
+
+And that really gets to the center of Paracine. It is not trying to win by having the most features, the most compiler stages, or the cleverest syntax. It wins by making good native programming unusually easy to express, unusually easy to optimize, and unusually hard to overcomplicate.
