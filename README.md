@@ -2,18 +2,28 @@ PARACINE — ".pcn"
 
 Fully Mature, Hardened, Industry-Grade Native Programming Language
 
-Edition: Ultimate Production Standard
+Edition: Ultimate Direct-Native Production Standard
 Status: Finalized, stable, production-hardened
 Language class: Native general-purpose, systems, performance, application, numerical, infrastructure, and real-time programming language
 Compilation: Ahead-of-time native compilation
 Canonical compiler implementation: C++23
-Canonical portable lowering: Hardened low-level C++23 backend
-Native optimization model: PCIR semantic optimization + production native backend optimization
+Canonical backend: Independent Paracine direct-native backend
+Canonical Tier-1 target: Windows x86-64
+Canonical ABI: Microsoft x64 ABI
+Canonical object format: COFF ".obj"
+Canonical executable format: PE32+ ".exe"
+Native optimization model: PCIR semantic optimization + direct machine lowering
+Machine representation: Compact Paracine Machine IR
+Object generation: Direct COFF writer
+Executable generation: Direct PE image builder and native linker
+External compiler required: None
+External assembler required: None
+External linker required: None
 Runtime model: Minimal, non-managed, demand-linked
 Memory model: Native value semantics + explicit ownership + views + raw authority
-Concurrency model: Native threads, atomics, structured library concurrency
+Concurrency model: Native threads, atomics, structured-library concurrency
 Error model: Explicit result semantics
-Interop: Native C ABI and platform ABI integration
+Interop: Native C ABI, Microsoft x64 ABI, Windows DLL/import interoperability
 Primary design objective: Maximum readable semantic clarity with minimum surviving machine work
 
 Governing principle
@@ -26,11 +36,15 @@ Optimization law
 
 Implementation law
 
-«Every language feature has a complete, deterministic, testable lowering.»
+«Every language feature has a complete, deterministic, testable native lowering.»
 
 Production law
 
 «Runtime contains only work that remains semantically necessary after compilation.»
+
+Native-output law
+
+«Paracine source becomes machine code, COFF objects, and PE images directly.»
 
 Official motto
 
@@ -44,35 +58,54 @@ Clear to people. Obvious to machines.
 
 Paracine is a statically typed, ahead-of-time compiled native programming language engineered around semantic straightness.
 
-Its source language remains easy to read.
+Its source language is easy to read.
 
-Its type system remains predictable.
+Its type system is predictable.
 
-Its execution model remains direct.
+Its execution model is direct.
 
-Its optimizer remains aggressive.
+Its optimizer is aggressive.
 
-Its runtime remains thin.
+Its runtime is thin.
 
-Its native interoperability remains first-class.
+Its native interoperability is first-class.
 
-Its compiler architecture remains compact enough to understand completely while producing production-grade machine code through a mature C++23 lowering pipeline.
+Its compiler owns the path from ".pcn" source to executable machine code.
 
-Paracine eliminates the historical false choice between:
+Paracine does not generate C.
+
+Paracine does not generate C++.
+
+Paracine does not lower into LLVM IR.
+
+Paracine does not require an external compiler backend.
+
+Paracine does not require an assembler.
+
+Paracine does not require an external linker.
+
+The production compiler directly emits:
+
+program.obj
+program.exe
+
+using native COFF and PE formats.
+
+Paracine eliminates the historical false choices between:
 
 - readable code and fast code;
 - high-level structure and native control;
 - beginner accessibility and expert capability;
-- simple compiler design and serious optimization;
+- compiler simplicity and serious native optimization;
 - familiar syntax and precise machine semantics.
 
-Paracine establishes all five simultaneously.
+It establishes all five simultaneously.
 
 ---
 
 2. Established Industrial Character
 
-Paracine is recognized for one defining quality:
+Paracine is defined by:
 
 semantic straightness
 
@@ -92,17 +125,23 @@ what the compiler understands
 
 and:
 
-what the machine executes
+what the processor executes
 
 is smaller still.
 
-This has made Paracine one of the most trusted native languages for software where readability, performance, predictability, code generation quality, and implementation transparency all matter at the same time.
+There is no intermediary source language.
+
+There is no generated C++ translation layer.
+
+There is no secondary compiler front end interpreting Paracine's machine intent.
+
+Paracine itself performs native realization.
 
 ---
 
 3. Core Engineering Doctrine
 
-Paracine follows eight permanent principles.
+Paracine follows nine permanent principles.
 
 3.1 One meaning per construct
 
@@ -130,17 +169,21 @@ Low-level trust boundaries are visible.
 
 3.7 Abstractions are temporary
 
-Once their meaning is extracted, they disappear when legal.
+Once their semantic information has been consumed, they disappear when legal.
 
 3.8 The compiler remains understandable
 
-Paracine rejects architectural complexity that does not buy meaningful user-facing value.
+Paracine rejects machinery that contributes insufficient engineering value.
+
+3.9 Native emission belongs to Paracine
+
+Once PCIR has established the surviving program, Paracine itself performs legalization, instruction selection, scheduling, allocation, encoding, object generation, and executable construction.
 
 ---
 
 4. Canonical Compilation Architecture
 
-The production pipeline is:
+The mature production pipeline is:
 
 .pcn source
      ↓
@@ -178,68 +221,126 @@ range propagation
      ↓
 bounds-check elimination
      ↓
-path compression
+Path Compression
      ↓
-dead-code / dead-store elimination
+dead-code elimination
+     ↓
+dead-store elimination
      ↓
 loop normalization
      ↓
-vectorization preparation
+vectorization
      ↓
 final PCIR simplification
      ↓
-hardened low-level C++23 generation
+target legalization
      ↓
-Clang / GCC / MSVC production backend
-     ↓
-target optimization
+Paracine Machine IR
      ↓
 instruction selection
      ↓
+machine scheduling
+     ↓
 register allocation
+     ↓
+stack-frame construction
+     ↓
+ABI lowering
      ↓
 machine encoding
      ↓
-object generation
+COFF section / symbol / relocation construction
      ↓
-platform linking
+COFF .obj
      ↓
-native executable / library
+Paracine native linker
+     ↓
+PE section layout
+     ↓
+imports / exports
+     ↓
+relocation resolution
+     ↓
+PE loader metadata
+     ↓
+PE32+ .exe
 
-Paracine owns its language semantics and semantic optimization.
-
-The native backend owns commodity target machinery.
-
-That division has proven exceptionally effective.
+The compiler therefore owns the complete compilation chain.
 
 ---
 
-5. C++23 Representability
+5. C++23 Implementation Boundary
 
-Every core Paracine construct has a complete C++23 representation.
+C++23 remains the canonical implementation language of the Paracine compiler.
 
-This remains a permanent conformance rule.
+That statement applies to:
 
-The canonical compiler itself is fully implementable in C++23.
+the compiler implementation
 
-The generated implementation layer is likewise representable in C++23.
+not:
 
-This guarantees:
+the compiler output
 
-- deterministic bootstrapping;
-- portable compiler construction;
-- straightforward backend validation;
-- differential semantic testing;
-- mature target support;
-- easy native toolchain integration;
-- no dependence on proprietary IR systems;
-- no requirement to maintain a custom assembler or linker.
+C++23 is used to implement:
 
-Paracine's design remains independent even though its canonical production backend uses mature C++ toolchains for final target realization.
+- the lexer;
+- parser;
+- semantic analyzer;
+- type system;
+- PCIR;
+- optimizer;
+- target backend;
+- instruction selector;
+- scheduler;
+- register allocator;
+- encoder;
+- COFF writer;
+- linker;
+- PE writer;
+- tooling.
+
+A ".pcn" program never needs to become C++ source.
+
+The relationship is:
+
+C++23
+   ↓
+implements the Paracine compiler
+
+Paracine .pcn
+   ↓
+Paracine compiler
+   ↓
+COFF .obj
+   ↓
+PE .exe
+
+These two concerns are deliberately separate.
 
 ---
 
-6. Source Files
+6. Native Independence
+
+The canonical Paracine toolchain requires no:
+
+- Clang backend;
+- GCC backend;
+- MSVC compiler backend;
+- LLVM;
+- external assembler;
+- "link.exe";
+- LLD;
+- GNU ld;
+- generated C source;
+- generated C++ source.
+
+Platform SDK libraries and Windows system DLL interfaces remain consumable through standard native ABI mechanisms.
+
+The compiler itself supplies native code generation.
+
+---
+
+7. Source Files
 
 The canonical extension is:
 
@@ -253,13 +354,13 @@ renderer.pcn
 database.pcn
 packet.pcn
 
-Source is Unicode-aware for textual content.
+Source text is Unicode-aware.
 
-Language keywords and structural syntax remain deliberately compact and deterministic.
+Structural vocabulary remains deterministic and deliberately compact.
 
 ---
 
-7. Indentation
+8. Indentation
 
 Exactly four spaces represent one structural level.
 
@@ -280,15 +381,13 @@ INDENT
 DEDENT
 EOF
 
-Indentation is structural.
+No ordinary block braces are required.
 
-Semicolons are unnecessary.
-
-Ordinary block braces are unnecessary.
+No semicolon terminators are required.
 
 ---
 
-8. Canonical Callable
+9. Canonical Callable
 
 Paracine has one ordinary callable abstraction:
 
@@ -304,54 +403,48 @@ Another routine may return it directly:
 routine combine(a: int, b: int) gives int
     give add(a, b)
 
-"routine" covers:
+A routine covers:
 
-- pure functions;
+- pure computation;
 - procedures;
 - algorithms;
-- systems calls;
+- systems operations;
 - numerical kernels;
 - orchestration;
-- I/O operations;
+- I/O;
 - native entry points;
 - compile-time execution.
 
-No additional callable taxonomy is required.
-
 ---
 
-9. Why One Callable Model Won
+10. Why One Callable Model Won
 
-Earlier systems languages frequently divided executable work into:
+Paracine does not fragment ordinary work into:
 
 - functions;
-- procedures;
 - tasks;
 - processes;
 - nodes;
 - sequences;
-- methods;
-- closures;
 - jobs.
 
-Paracine standardized one callable model.
+One callable model simplifies:
 
-This dramatically simplified:
-
-- name resolution;
+- resolution;
 - call semantics;
-- generic specialization;
 - inlining;
+- generic specialization;
 - ABI lowering;
+- machine call emission;
 - diagnostics;
-- tooling;
-- compiler implementation.
+- debugging;
+- tooling.
 
-Execution policy belongs to the surrounding context, not to a proliferation of callable categories.
+Execution policy belongs to context rather than callable taxonomy.
 
 ---
 
-10. Program Entry
+11. Program Entry
 
 Canonical entry:
 
@@ -364,13 +457,13 @@ routine main(args: view<text>) gives int
     print("Hello")
     give 0
 
-The platform runtime adapter constructs the correct native process entry.
+The compiler emits the PE process-entry bridge directly.
+
+On Windows x86-64 this bridge establishes the program's required startup contract and transfers execution into Paracine "main".
 
 ---
 
-11. Canonical Primitive Types
-
-Paracine uses familiar fixed-width native names.
+12. Canonical Primitive Types
 
 Signed integers:
 
@@ -386,12 +479,12 @@ ushort
 uint
 ulong
 
-Floating-point:
+Floating point:
 
 float
 double
 
-Other core primitives:
+Other primitives:
 
 bool
 char
@@ -402,9 +495,7 @@ void
 
 ---
 
-12. Integer Widths
-
-The widths are permanently defined.
+13. Integer Widths
 
 Type| Width| Signed
 "byte"| 8| yes
@@ -416,61 +507,51 @@ Type| Width| Signed
 "long"| 64| yes
 "ulong"| 64| no
 
-There is no ABI-dependent ambiguity.
+There is no platform-dependent integer ambiguity.
 
-"int" is always 32-bit.
+"int" always means signed 32-bit.
 
-"long" is always 64-bit.
-
-"byte" is always signed 8-bit.
-
-"ubyte" is always unsigned 8-bit.
+"long" always means signed 64-bit.
 
 ---
 
-13. Pointer-Sized Integers
+14. Pointer-Sized Integers
 
 size
 ssize
 
-track the active target address width.
+follow target pointer width.
 
-On a 64-bit profile:
+For the canonical Windows x86-64 profile:
 
 size  = unsigned 64-bit
 ssize = signed 64-bit
 
-On a 32-bit profile:
+They are used for:
 
-size  = unsigned 32-bit
-ssize = signed 32-bit
-
-These exist specifically for:
-
-- object extents;
-- array counts;
-- memory sizes;
+- extents;
+- array lengths;
+- allocation sizes;
+- object sizes;
 - pointer-relative indexing;
-- platform interfaces.
+- ABI interfaces.
 
 ---
 
-14. Extended Integers
+15. Extended Integers
 
-The production language includes:
+Production Paracine includes:
 
 int128
 uint128
 
-where supported by the selected target profile.
+Their semantics remain exactly 128-bit.
 
-They retain exact 128-bit semantics regardless of native machine support.
-
-Backends legalize them where direct native support is unavailable.
+On x86-64 they lower into legal multi-register/multi-instruction sequences where necessary.
 
 ---
 
-15. Floating Point
+16. Floating Point
 
 float
 double
@@ -480,48 +561,30 @@ mean:
 float  = 32-bit IEEE-oriented binary floating-point
 double = 64-bit IEEE-oriented binary floating-point
 
-The language preserves ordinary IEEE behavior unless the selected arithmetic profile explicitly enables relaxed transformations.
-
-Fast-math behavior is never silently introduced.
+The native backend preserves Paracine's declared floating contract during selection and optimization.
 
 ---
 
-16. Variables
+17. Variables
 
-Immutable values use:
-
-let
-
-Example:
+Immutable:
 
 let count = 10
 
-Explicit type:
+Explicit:
 
 let count: int = 10
 
-Mutable values use:
-
-var
-
-Example:
+Mutable:
 
 var count: int = 0
-
 count += 1
 
-Immutability is the default because it improves:
-
-- readability;
-- dataflow analysis;
-- constant propagation;
-- register promotion;
-- dead-store elimination;
-- concurrency reasoning.
+Immutable values naturally feed SSA construction.
 
 ---
 
-17. Assignment
+18. Assignment
 
 Assignment is statement-only.
 
@@ -535,32 +598,22 @@ Equality is:
 
 count == 10
 
-This is never legal:
-
-if x = y
-
-This is:
-
-if x == y
-
-Paracine contains no assignment-expression ambiguity.
+This prevents assignment/comparison ambiguity.
 
 ---
 
-18. Literal Inference
-
-Integer literals are context-sensitive.
+19. Literal Inference
 
 let a: byte = 10
 let b: short = 10
 let c: int = 10
 let d: long = 10
 
-Without context:
+Without contextual pressure:
 
 let value = 10
 
-the default is:
+defaults to:
 
 int
 
@@ -570,9 +623,7 @@ double
 
 ---
 
-19. Numeric Suffixes
-
-Production Paracine supports explicit suffixes:
+20. Numeric Suffixes
 
 10b
 10ub
@@ -589,58 +640,37 @@ Production Paracine supports explicit suffixes:
 3.5f
 3.5d
 
-Suffixes exist for precision-sensitive and systems-oriented source.
-
-Normal application code usually relies on contextual typing.
+Contextual typing remains preferred in ordinary source.
 
 ---
 
-20. Conversion
-
-Explicit numeric conversion uses:
-
-as
-
-Examples:
+21. Conversion
 
 let large = value as long
 let count = size_value as int
 let ratio = total as double
 
-Narrowing conversions remain explicit.
-
-Bit reinterpretation is separate:
+Bit reinterpretation:
 
 bitcast<uint>(value)
 
-Paracine never confuses numeric conversion with raw representation reinterpretation.
+Numeric conversion and representation reinterpretation remain distinct.
 
 ---
 
-21. Signed Arithmetic
+22. Signed Arithmetic
 
-Signed integer arithmetic is fully defined.
+Signed integer overflow is defined using deterministic two's-complement wrapping semantics.
 
-Overflow uses deterministic two's-complement wrapping semantics.
-
-Therefore:
-
-int
-long
-short
-byte
-
-do not inherit C or C++ signed-overflow undefined behavior.
-
-The backend preserves Paracine semantics explicitly.
+This allows PCIR and the native backend to optimize aggressively without inheriting C/C++ signed-overflow ambiguity.
 
 ---
 
-22. Unsigned Arithmetic
+23. Unsigned Arithmetic
 
-Unsigned integer arithmetic wraps modulo the representable width.
+Unsigned arithmetic wraps modulo the destination width.
 
-This applies to:
+The behavior is exact at:
 
 ubyte
 ushort
@@ -648,90 +678,66 @@ uint
 ulong
 uint128
 
-The behavior is exact and target-independent.
-
 ---
 
-23. Checked Arithmetic
-
-Checked arithmetic is explicit:
+24. Checked Arithmetic
 
 let result = math.checked_add(a, b)
 
-Other standardized operations include:
+Also:
 
 math.checked_sub
 math.checked_mul
 math.checked_div
 
-These produce explicit result values rather than invoking hidden runtime exceptions.
+These lower into PCIR checked arithmetic and then into optimal target sequences.
 
 ---
 
-24. Saturating Arithmetic
-
-The standard arithmetic library includes:
+25. Saturating Arithmetic
 
 math.saturating_add
 math.saturating_sub
 math.saturating_mul
 
-This is heavily used in:
-
-- DSP;
-- media;
-- graphics;
-- imaging;
-- embedded systems.
+The x86-64 backend uses efficient scalar or SIMD instruction sequences according to type and context.
 
 ---
 
-25. Division
+26. Division
 
-Division by zero has defined behavior.
+Division-by-zero behavior is defined.
 
-Checked language-level division traps in ordinary safe code unless the enclosing operation explicitly uses a result-producing checked form.
-
-The optimizer removes guards where nonzero divisors are established statically.
+When the compiler proves the divisor is nonzero, the validation path disappears.
 
 ---
 
-26. Boolean Semantics
+27. Boolean Semantics
 
-"bool" contains:
+"bool" contains only:
 
 true
 false
 
-Boolean values do not silently behave as arbitrary integers.
-
-Explicit conversion is required where integer representation matters.
+Integer conversion is explicit.
 
 ---
 
-27. Text
+28. Text
 
 "text" is an immutable UTF-8 view.
 
 let name: text = "Paracine"
 
-A text literal requires no heap allocation.
+String literals are normally emitted into read-only PE data sections.
 
-Owned mutable text uses the standard-library:
+Owned mutable text uses:
 
 string
 
-This separation keeps read-only text cheap.
-
 ---
 
-28. Records
-
-Data aggregates use:
-
-record
-
-Example:
+29. Records
 
 record Point
     x: float
@@ -744,41 +750,24 @@ let point = Point(
     y = 20.0
 )
 
-Records provide value semantics.
-
-They do not imply:
-
-- hidden heap allocation;
-- virtual dispatch;
-- object headers;
-- garbage collection;
-- inheritance.
+Records provide value semantics without mandatory object metadata.
 
 ---
 
-29. Composition Over Inheritance
+30. Composition Over Inheritance
 
 Paracine has no class inheritance.
-
-Composition is canonical.
 
 record Player
     identity: Identity
     position: Position
     health: Health
 
-This has proven superior for:
-
-- layout reasoning;
-- optimization;
-- module boundaries;
-- cache locality;
-- testing;
-- code ownership.
+Composition improves layout transparency and native optimization.
 
 ---
 
-30. Enumerations
+31. Enumerations
 
 enum State
     idle
@@ -794,44 +783,32 @@ enum State: ubyte
     paused = 2
     finished = 3
 
-Enum representations are statically validated.
-
 ---
 
-31. Unions
-
-Native untagged union:
+32. Unions
 
 union Number
     integer: long
     floating: double
 
-Untagged union access belongs to low-level programming and follows explicit representation rules.
+Native union access follows explicit low-level representation semantics.
 
 ---
 
-32. Variants
-
-Safe tagged alternatives use:
-
-variant
-
-Example:
+33. Variants
 
 variant Token
     number(long)
     name(text)
     symbol(char)
 
-Variants are compact discriminated values.
+Variants lower into optimized discriminated storage.
 
-They require no object runtime.
+No dynamic object model is required.
 
 ---
 
-33. Options
-
-Optional values use:
+34. Options
 
 option<T>
 
@@ -840,19 +817,11 @@ Constructors:
 some(value)
 none
 
-Example:
-
-routine find_user(id: ulong) gives option<User>
-
-Representations are specialized.
-
-Pointer-like options use nullability optimization where legal.
+Pointer-compatible options use niche/null representation when legal.
 
 ---
 
-34. Results
-
-Recoverable errors use:
+35. Results
 
 result<T, E>
 
@@ -867,202 +836,119 @@ routine divide(a: int, b: int) gives result<int, DivideError>
 
     give a / b
 
-This is the canonical failure architecture.
-
 ---
 
-35. "give"
-
-"give" returns a successful value.
+36. "give"
 
 routine add(a: int, b: int) gives int
     give a + b
 
 Direct forwarding:
 
-routine sum(a: int, b: int) gives int
-    give add(a, b)
+give add(a, b)
 
-"give" reads naturally while lowering directly into ordinary native returns.
-
----
-
-36. "fail"
-
-Inside result-producing routines:
-
-fail error
-
-constructs the rejection path.
-
-Example:
-
-routine open(path: text) gives result<File, FileError>
-    if not exists(path)
-        fail FileError.not_found
-
-    give File(path)
+At machine level, the result is returned according to the active Microsoft x64 ABI classification.
 
 ---
 
-37. "try"
+37. "fail"
 
-"try" performs direct result propagation.
+fail Error.invalid
 
-routine calculate(a: int, b: int) gives result<int, DivideError>
-    let value = try divide(a, b)
+Result rejection lowers into explicit control flow.
 
-    give value * 10
-
-The compiler lowers this into ordinary branch control.
-
-There is:
-
-- no exception object;
-- no stack unwinding;
-- no hidden dynamic runtime.
-
-Inlining frequently removes the result wrapper entirely.
+There is no exception unwinder.
 
 ---
 
-38. Arrays
+38. "try"
 
-Fixed array:
+let value = try divide(a, b)
+
+The compiler expands this into normal PCIR branch flow.
+
+Inlining commonly removes both branch wrapper and result representation.
+
+---
+
+39. Arrays
 
 array<int, 64>
 
-Example:
-
-let values: array<int, 64>
-
-The extent is part of the type.
-
-Fixed arrays are contiguous.
-
-They require no allocation runtime.
+Arrays are contiguous and require no runtime allocator.
 
 ---
 
-39. Views
-
-Read-only contiguous view:
+40. Views
 
 view<T>
-
-Example:
-
-routine sum(values: view<int>) gives long
 
 A view consists conceptually of:
 
 pointer
 count
 
-It does not own storage.
+It does not own memory.
 
 ---
 
-40. Spans
-
-Mutable contiguous view:
+41. Spans
 
 span<T>
 
-Example:
-
-routine clear(values: span<ubyte>)
-    each index, value in values
-        values[index] = 0
-
-Spans remain non-owning.
+A span is a mutable non-owning contiguous view.
 
 ---
 
-41. Buffers
-
-Owned dynamic contiguous storage:
+42. Buffers
 
 buffer<T>
 
-Example:
+A buffer owns dynamic storage and has deterministic destruction.
 
-let bytes = buffer<ubyte>(4096)
-
-A buffer owns its backing memory.
-
-It is:
-
-- moveable;
-- deterministically destroyed;
-- non-GC;
-- non-reference-counted by default.
+There is no mandatory garbage collector.
 
 ---
 
-42. Raw Pointers
-
-Native pointers use:
+43. Raw Pointers
 
 ptr<T>
 
 Example:
 
 let address: ptr<int>
-
-Address:
-
 let address = &value
+let result = *address
 
-Dereference:
-
-let value = *address
-
-Pointer arithmetic remains available in low-level code.
+Raw pointer arithmetic is available inside appropriate native contracts.
 
 ---
 
-43. Ownership
+44. Ownership
 
-Ordinary Paracine ownership follows straightforward value rules.
+Values own their contained resources unless their type explicitly represents borrowing.
 
-Values own their contained resources unless explicitly declared non-owning.
-
-Views and spans never own.
+Views and spans borrow.
 
 Buffers own.
 
-Raw pointers never imply ownership.
-
-Ownership transfer is explicit where resource identity matters.
-
-This model has proven substantially easier to learn than universal lifetime syntax while retaining predictable native behavior.
+Raw pointers carry address capability but no implicit ownership.
 
 ---
 
-44. Deterministic Cleanup
+45. Deterministic Cleanup
 
-Owned resources clean up at lexical lifetime end.
+Owned resources are released at lexical lifetime termination.
 
-Example:
+The compiler lowers cleanup directly into PCIR control edges and finally machine calls or inlined destruction.
 
-let file = file.open(path)
+There is no C++ RAII layer involved.
 
-When "file" leaves scope, its destructor-equivalent cleanup executes.
-
-This lowering maps cleanly onto C++23 RAII semantics.
-
-There is no garbage collector.
+The behavior is implemented natively by Paracine itself.
 
 ---
 
-45. "defer"
-
-Procedural cleanup uses:
-
-defer
-
-Example:
+46. "defer"
 
 let handle = open_device()
 
@@ -1070,13 +956,11 @@ defer close_device(handle)
 
 use_device(handle)
 
-Deferred operations execute on scope exit.
-
-The compiler folds or inlines trivial cleanup when possible.
+The compiler inserts required cleanup along every legal scope-exit edge.
 
 ---
 
-46. "if"
+47. "if"
 
 if score >= 90
     print("excellent")
@@ -1085,30 +969,20 @@ else if score >= 70
 else
     print("retry")
 
-Control flow remains structured and direct.
+This becomes ordinary PCIR branching and target-native jumps or conditional moves.
 
 ---
 
-47. "unless"
+48. "unless"
 
 unless ready
     initialize()
 
-means:
-
-if not ready
-
-The construct exists because the negative-English form often improves readability.
+is equivalent to a negated condition.
 
 ---
 
-48. "choose"
-
-Paracine's canonical decision expression is:
-
-choose
-
-Example:
+49. "choose"
 
 let discount = choose
     when customer.premium
@@ -1120,20 +994,17 @@ let discount = choose
     otherwise
         0.00
 
-Every reachable branch produces a compatible type.
-
-The compiler lowers "choose" into whichever native form is best:
+The backend selects the cheapest legal implementation:
 
 - conditional move;
-- branch chain;
-- switch;
+- branch sequence;
 - jump table;
 - lookup;
-- predicated expression.
+- predication.
 
 ---
 
-49. Subject Selection
+50. Subject Selection
 
 let message = choose code
     case 0
@@ -1145,11 +1016,11 @@ let message = choose code
     otherwise
         "failure"
 
-This replaces a large class of verbose switch-style code.
+Dense integral cases frequently become direct jump tables in ".rdata".
 
 ---
 
-50. Variant Matching
+51. Variant Matching
 
 let description = choose token
     case number(value)
@@ -1161,13 +1032,11 @@ let description = choose token
     case symbol(value)
         char_text(value)
 
-Exhaustiveness is verified statically.
+Exhaustiveness is statically validated.
 
 ---
 
-51. Loops
-
-While:
+52. Loops
 
 while running
     update()
@@ -1177,32 +1046,22 @@ Iteration:
 each item in values
     consume(item)
 
-Indexed iteration:
+Indexed:
 
 each index, item in values
     output[index] = transform(item)
 
-Structured loops preserve information useful for bounds and range analysis.
-
 ---
 
-52. Ranges
+53. Ranges
 
 Half-open:
 
 0..<10
 
-means:
-
-0 through 9
-
 Inclusive:
 
 0..10
-
-means:
-
-0 through 10
 
 Stepped:
 
@@ -1212,11 +1071,11 @@ Descending:
 
 100..0 by -1
 
+Range facts feed PCIR analysis and vectorization.
+
 ---
 
-53. Pipeline Operator
-
-Paracine's value-flow operator is:
+54. Pipeline Operator
 
 ->
 
@@ -1224,17 +1083,13 @@ Example:
 
 data -> decode -> normalize -> encode -> emit
 
-Arguments:
+With arguments:
 
 value -> scale(4) -> clamp(0, 255)
 
-The preceding value becomes the first logical input to the next stage.
-
 ---
 
-54. Pipeline Semantics
-
-This:
+55. Pipeline Semantics
 
 value -> scale(4)
 
@@ -1242,23 +1097,13 @@ means:
 
 scale(value, 4)
 
-Pipelines are syntax.
+Pipelines never become runtime graph structures.
 
-They do not create:
-
-- graph objects;
-- task schedulers;
-- runtime nodes;
-- allocation;
-- dynamic dispatch.
-
-They disappear during lowering.
+They disappear before machine lowering.
 
 ---
 
-55. Path Compression
-
-Path Compression is one of Paracine's signature optimizations.
+56. Path Compression
 
 Source:
 
@@ -1268,28 +1113,23 @@ input
     -> transform
     -> encode
 
-may reduce to:
+can reduce to:
 
 load
 combined transformation
 store
 
-The compiler removes:
+The optimizer removes:
 
-- routine boundaries;
-- intermediate storage;
-- temporary values;
-- redundant conversions;
-- repeated checks;
-- unnecessary passes.
-
-This optimization has proven especially valuable in media, networking, serialization, DSP, and data-processing code.
+- call boundaries;
+- temporary storage;
+- repeated traversal;
+- redundant checks;
+- intermediate aggregates.
 
 ---
 
-56. Generics
-
-Generic routine:
+57. Generics
 
 routine maximum<T>(a: T, b: T) gives T
     where T is ordered
@@ -1299,31 +1139,23 @@ routine maximum<T>(a: T, b: T) gives T
 
     give b
 
-Concrete uses:
-
-maximum<int>
-maximum<long>
-maximum<double>
-
-are monomorphized.
-
-No runtime generic dispatch remains.
+Concrete uses are monomorphized before machine lowering.
 
 ---
 
-57. Generic Records
+58. Generic Records
 
 record Pair<A, B>
     first: A
     second: B
 
-Each used specialization receives a concrete layout.
+Every used specialization has a concrete layout before PMIR generation.
 
 ---
 
-58. Constraints
+59. Constraints
 
-Built-in constraint families include:
+Built-in families include:
 
 integer
 signed
@@ -1334,54 +1166,36 @@ ordered
 copyable
 movable
 
-The constraint system remains intentionally compact.
-
-It provides what generic programming requires without creating a second meta-language.
+The constraint system remains deliberately finite and predictable.
 
 ---
 
-59. No General Operator Overloading
+60. Operator Model
 
-User-defined operator overloading is excluded from core Paracine.
+Paracine excludes arbitrary user-defined operator overloading.
 
-Therefore:
-
-a + b
-
-has clear, local, predictable meaning.
-
-This decision has consistently improved:
-
-- compile times;
-- diagnostics;
-- code review;
-- library readability;
-- optimizer predictability.
+The backend therefore sees semantically stable primitive and intrinsic operations.
 
 ---
 
-60. No Complex Overload Resolution
+61. Routine Resolution
 
-Paracine does not encourage large C++-style overload sets.
+Large C++-style overload sets are not part of Paracine.
 
-A routine name identifies a single routine family.
-
-Generic specialization handles most polymorphic use.
-
-This keeps call resolution straightforward and deterministic.
+Generic specialization provides the primary polymorphic mechanism.
 
 ---
 
-61. Compile-Time Constants
+62. Compile-Time Constants
 
 const maximum = 4096
 const gravity: double = 9.80665
 
-Constants fully participate in compile-time propagation.
+Known constants are consumed before PMIR generation.
 
 ---
 
-62. Compile Routines
+63. Compile Routines
 
 compile routine mask(bits: int) gives ulong
     give (1 as ulong << bits) - 1
@@ -1390,36 +1204,28 @@ Usage:
 
 const permissions = mask(12)
 
-Compile routines use ordinary Paracine syntax.
-
-They execute under restricted compile-time effects.
-
-No separate template-metaprogramming language exists.
+No runtime code is emitted when the result is fully resolved.
 
 ---
 
-63. Compile-Time Execution
+64. Compile-Time Execution
 
-The compiler evaluates code during compilation when:
-
-- inputs are compile-known;
-- effects are permitted;
-- behavior is deterministic;
-- resource limits are satisfied.
+Compile-known work is evaluated inside the Paracine compiler.
 
 This enables:
 
 - table generation;
 - layout calculation;
-- constant parsing;
-- static configuration;
-- protocol masks;
-- lookup construction;
+- static parsing;
+- masks;
+- lookup tables;
 - generated constants.
+
+No JIT is required.
 
 ---
 
-64. Modules
+65. Modules
 
 module render.pipeline
 
@@ -1428,53 +1234,41 @@ Imports:
 use math
 use render.image
 
-Specific import:
-
-use render.image.Pixel
-
-Alias:
+Aliases:
 
 use platform.windows as win
 
-Modules are compile-time namespace and linkage structures.
+Modules become compile-time symbol and native-linkage units.
 
 ---
 
-65. Visibility
+66. Visibility
 
 Definitions are private by default.
-
-Public:
 
 public routine calculate(value: int) gives int
     give value * 2
 
-This improves:
-
-- encapsulation;
-- internalization;
-- whole-program optimization;
-- symbol hygiene.
+Private routines are aggressively internalized and eliminated where possible.
 
 ---
 
-66. C Interoperability
+67. C Interoperability
 
 foreign c routine puts(value: ptr<char>) gives int
 
-Another:
+Paracine directly emits calls conforming to the declared ABI.
 
-foreign c routine write(
-    fd: int,
-    data: ptr<ubyte>,
-    count: size
-) gives ssize
+There is no C or C++ translation step.
 
-Paracine maps its exact source types onto ABI-compatible native representations.
+For Windows imports, unresolved foreign symbols become:
+
+- COFF external symbol references in ".obj"; or
+- PE import-table entries in directly linked ".exe" images.
 
 ---
 
-67. C Layout
+68. C Layout
 
 record Header
     layout c
@@ -1482,13 +1276,11 @@ record Header
     magic: uint
     size: uint
 
-C layout is explicit.
-
-It is used only where ABI or binary compatibility requires it.
+The compiler performs ABI layout itself.
 
 ---
 
-68. Packed Layout
+69. Packed Layout
 
 record PacketHeader
     layout packed
@@ -1497,49 +1289,65 @@ record PacketHeader
     flags: ubyte
     size: ushort
 
-Packed layout is part of the type's machine contract.
+The backend preserves the exact byte offsets.
 
 ---
 
-69. Explicit Alignment
+70. Explicit Alignment
 
 record CacheLine
     align 64
 
     value: ulong
 
-Alignment contracts feed directly into:
-
-- vectorization;
-- cache placement;
-- ABI validation;
-- atomic legality.
+Alignment facts propagate into PCIR, PMIR, memory instruction selection, and COFF section layout.
 
 ---
 
-70. Native ABI Stability
+71. Native ABI Stability
 
-Paracine defines stable ABI profiles for supported platforms.
+The canonical Windows x86-64 ABI profile specifies:
 
-Profiles specify:
-
-- integer widths;
-- pointer width;
-- calling convention;
-- aggregate passing;
-- alignment;
-- stack rules;
-- C interop rules;
+- argument registers;
+- floating argument registers;
+- shadow space;
+- stack alignment;
+- return classification;
+- preserved registers;
+- volatile registers;
+- aggregate rules;
 - unwind requirements;
-- symbol visibility.
+- symbol naming;
+- TLS behavior.
 
-ABI versioning is explicit and toolchain-controlled.
+ABI behavior is a Paracine compiler responsibility.
 
 ---
 
-71. Concurrency
+72. Microsoft x64 Calling Convention
 
-Paracine uses native concurrency rather than a mandatory language scheduler.
+Canonical argument registers are modeled directly by the backend.
+
+The backend handles:
+
+RCX
+RDX
+R8
+R9
+
+for eligible integer/pointer arguments and the corresponding XMM argument registers for floating-point values.
+
+It also handles:
+
+- 32-byte caller shadow space;
+- stack alignment;
+- nonvolatile register preservation;
+- structure-return rules;
+- variadic boundaries.
+
+---
+
+73. Concurrency
 
 Standard facilities include:
 
@@ -1551,29 +1359,18 @@ semaphore
 barrier
 channel
 
-This architecture has proven exceptionally predictable in systems and infrastructure code.
+Concurrency is realized through native Windows and processor facilities.
+
+There is no mandatory scheduler.
 
 ---
 
-72. Threads
-
-Native operating-system threads are first-class library abstractions.
-
-Paracine does not silently create thread pools.
-
-Execution resources remain explicit.
-
----
-
-73. Atomics
+74. Atomics
 
 let count: atomic<ulong> = 0
-
-Example:
-
 count.add(1, relaxed)
 
-Memory orderings include:
+Orders include:
 
 relaxed
 acquire
@@ -1581,167 +1378,113 @@ release
 acq_rel
 seq_cst
 
-Semantics map directly onto the standardized native memory model.
+PCIR preserves atomic semantics through native selection.
 
 ---
 
-74. Structured Parallel Libraries
-
-Higher-level structured concurrency remains library-based:
+75. Structured Parallel Libraries
 
 parallel.each(values, transform)
 
-and:
+remains a library-level abstraction.
 
-parallel.run(
-    update_physics,
-    update_audio,
-    update_animation
-)
-
-The compiler does not need separate source-language execution machinery.
+The compiler can inline and specialize its implementation without introducing a new execution model.
 
 ---
 
-75. Unsafe Regions
-
-Low-level authority is isolated with:
-
-unsafe
-
-Example:
+76. Unsafe Regions
 
 unsafe
     *address = 10
 
-Unsafe regions permit:
+Unsafe permits:
 
-- unchecked raw pointer access;
-- integer-to-pointer conversion;
+- unchecked raw access;
+- integer-to-address construction;
 - representation reinterpretation;
-- machine intrinsics;
-- direct hardware access.
-
-They do not disable the compiler.
-
----
-
-76. Unsafe Philosophy
-
-Paracine does not pretend native programming is harmless.
-
-It instead follows:
-
-«Safe semantics where practical. Explicit trust where necessary.»
-
-Unsafe code remains:
-
-- visible;
-- searchable;
-- auditable;
-- locally scoped.
-
-This has proven far more manageable than pervasive implicit native danger.
+- target intrinsics;
+- direct device access.
 
 ---
 
 77. Defined Behavior
 
-Paracine defines ordinary behavior aggressively.
-
-Defined:
+Paracine explicitly defines:
 
 - signed overflow;
 - unsigned overflow;
-- result handling;
+- result semantics;
 - option semantics;
+- conversions;
 - bounds behavior;
-- enum semantics;
-- conversion rules;
-- layout rules;
-- memory orders.
-
-Undefined behavior is kept narrow.
+- enum behavior;
+- layout;
+- atomic ordering.
 
 ---
 
 78. Undefined Behavior
 
-Undefined behavior exists only in explicit native trust domains, including:
+Undefined behavior remains restricted to native trust boundaries such as:
 
-- invalid raw pointer dereference;
-- dangling raw pointer use;
+- invalid raw dereference;
+- dangling raw pointer;
 - invalid pointer arithmetic;
-- data race on ordinary shared memory;
-- invalid foreign ABI contract;
-- misuse of target intrinsic;
-- access after explicit lifetime invalidation.
-
-Ordinary language features do not rely on broad hidden UB for optimization.
+- unsynchronized data races;
+- broken external ABI contracts;
+- invalid intrinsic usage.
 
 ---
 
 79. Bounds Safety
-
-Safe containers include extent information.
 
 array
 view
 span
 buffer
 
-Indexing performs bounds validation unless the compiler proves it unnecessary.
+carry extent information.
 
-Canonical loops eliminate nearly all repeated bounds checks automatically.
-
-Example:
-
-each index, value in values
-    output[index] = transform(value)
-
-The range proof makes the access statically safe.
+Bounds checks are eliminated whenever PCIR proves the access legal.
 
 ---
 
 80. Nullability
 
-Safe references do not silently become nullable.
+Raw pointers may contain:
 
-Raw pointers may contain "null".
+null
 
-Optional references use:
+Safe optionality uses:
 
-option<...>
+option<T>
 
-Nullability is therefore explicit.
+Nullability is never silently invented.
 
 ---
 
 81. PCIR
 
-Paracine's compiler representation is:
-
-PCIR — Paracine Intermediate Representation
+Paracine Intermediate Representation
 
 PCIR is:
 
 - typed;
 - SSA-oriented;
 - block-based;
+- effect-aware;
 - low-level;
-- target-neutral;
-- verifier-backed;
-- deterministic;
-- printable;
-- compact.
+- compact;
+- target-neutral before legalization;
+- verifier-backed.
 
-It exists solely to optimize Paracine semantics effectively.
+PCIR is the principal optimization representation.
 
 ---
 
-82. PCIR Type Vocabulary
+82. PCIR Types
 
-Internal integer types use explicit machine-oriented names such as:
+Internal primitive types include:
 
 s8
 u8
@@ -1753,12 +1496,15 @@ s64
 u64
 s128
 u128
+f32
+f64
+ptr
 
 Source:
 
 int
 
-lowers to:
+becomes:
 
 s32
 
@@ -1766,19 +1512,15 @@ Source:
 
 ulong
 
-lowers to:
+becomes:
 
 u64
-
-The human-facing language remains familiar.
-
-The compiler-facing representation remains exact.
 
 ---
 
 83. PCIR Core Operations
 
-PCIR includes a compact operation set:
+PCIR includes:
 
 const
 copy
@@ -1816,13 +1558,11 @@ trap
 
 return
 
-Higher-level constructs lower into this small core.
+Higher-level source constructs reduce into this compact set.
 
 ---
 
 84. SSA
-
-Paracine values become SSA whenever storage identity is unnecessary.
 
 Source:
 
@@ -1830,19 +1570,17 @@ var x = 1
 x += 2
 x *= 4
 
-may become:
+becomes conceptually:
 
 %x0 = 1
 %x1 = add %x0, 2
 %x2 = mul %x1, 4
 
-No stack slot exists unless required.
+Physical storage exists only when machine semantics require it.
 
 ---
 
 85. Constant Propagation
-
-Paracine aggressively propagates known values.
 
 let width = 20
 let height = 40
@@ -1850,222 +1588,603 @@ let area = width * height
 
 reduces to:
 
-area = 800
+800
 
-and may disappear entirely if the result is itself compile-known.
+and may disappear entirely.
 
 ---
 
 86. Dead-Code Elimination
 
-Unobservable computation disappears.
-
 Unused:
 
-- variables;
-- branches;
+- values;
 - calls;
-- records;
-- generic instances;
+- branches;
+- generic specializations;
 - stores;
-- temporary buffers;
+- temporaries;
 
-are removed.
+are eliminated before native selection.
 
 ---
 
 87. Scalar Replacement
 
-Small aggregates are decomposed into independent scalar values when identity is unnecessary.
+Small aggregates are decomposed into scalars when identity is unnecessary.
 
-This substantially reduces:
-
-- stack traffic;
-- temporary allocation;
-- memory loads;
-- register spills.
+This substantially reduces memory traffic.
 
 ---
 
 88. Inlining
 
-Routine inlining is one of Paracine's most important optimizations.
-
-Tiny routines routinely disappear.
-
-Example:
-
 routine add(a: int, b: int) gives int
     give a + b
 
-called from:
+called through:
 
 give add(a, b)
 
-normally becomes direct arithmetic.
+normally becomes direct arithmetic before PMIR.
 
 ---
 
 89. Generic Specialization
 
-Generics specialize before final backend emission.
+Generics specialize entirely inside Paracine.
 
-The C++ backend therefore receives concrete types.
+No foreign template system exists.
 
-Paracine does not delegate its generic semantics to C++ templates.
+No C++ templates are generated.
 
-This has proven crucial for:
-
-- compiler predictability;
-- compile-time performance;
-- clean diagnostics;
-- backend stability.
+No backend language receives generic responsibility.
 
 ---
 
 90. Bounds-Check Elimination
 
-Range analysis proves common indexing safe.
-
-Example:
-
 each i in 0..<values.count
     use(values[i])
 
-requires no repeated dynamic bounds test after analysis.
+normally lowers without repeated bounds testing after range proof.
 
 ---
 
 91. Loop Optimization
 
-PCIR canonicalizes loops for the native backend.
+Paracine directly performs or prepares:
 
-This enables:
-
+- loop simplification;
 - invariant hoisting;
 - unrolling;
 - vectorization;
+- induction simplification;
 - strength reduction;
-- dead iteration removal;
-- induction simplification.
+- loop fusion.
+
+These transformations feed Paracine's own native backend.
 
 ---
 
 92. Path Compression
-
-Paracine combines neighboring data transformations where profitable.
-
-Example:
 
 samples
     -> remove_bias
     -> normalize
     -> clamp
 
-commonly becomes one tight vectorizable loop.
-
-This is one of the language's defining performance characteristics.
+can become one machine loop containing the complete transformation.
 
 ---
 
 93. Common-Expression Elimination
 
-Equivalent pure expressions are unified when observable semantics allow it.
-
-Repeated work does not survive merely because source spelled it twice.
+Equivalent pure work is shared when legal.
 
 ---
 
 94. Dead-Store Elimination
 
-Stores that are overwritten or never observed disappear.
-
-This strongly benefits:
-
-- temporary records;
-- parsers;
-- state construction;
-- numeric kernels.
+Stores with no observable consequence disappear.
 
 ---
 
 95. Escape Analysis
 
-Values remain register or stack based whenever they do not escape.
+Non-escaping values remain:
 
-Heap allocation is never introduced merely because an abstraction exists.
+- registers;
+- frame storage;
+- constants;
+
+rather than heap allocations.
 
 ---
 
 96. Allocation Philosophy
 
-Paracine has no hidden allocation rule.
+No language abstraction silently requires heap storage.
 
-Allocation is associated with types or library operations that genuinely own dynamic storage.
+Dynamic ownership is associated with types such as:
 
-This makes memory costs visible in source review.
+buffer<T>
+string
+vector<T>
+
+and explicit library facilities.
 
 ---
 
-97. Backend C++23
+97. Direct Native Backend
 
-Generated C++23 is deliberately machine-oriented.
+After optimized PCIR, Paracine enters its own machine backend.
 
-It avoids:
+The backend performs:
 
-- inheritance;
-- RTTI;
-- exceptions;
-- dynamic polymorphism;
-- "std::function";
-- template metaprogramming;
-- hidden allocation.
+target legalization
+instruction selection
+address-mode formation
+machine peephole optimization
+instruction scheduling
+register allocation
+spill insertion
+frame construction
+ABI lowering
+branch lowering
+machine encoding
+relocation creation
+COFF generation
+PE linking
 
-The C++ backend acts primarily as:
+There is no external native compiler involved.
 
-- mature optimizer;
+---
+
+98. Paracine Machine IR
+
+Paracine Machine IR is intentionally smaller than PCIR.
+
+It represents selected target operations including:
+
+- virtual registers;
+- physical-register classes;
+- immediates;
+- memory operands;
+- machine flags;
+- calls;
+- branches;
+- spills;
+- stack objects;
+- target instructions.
+
+It is not a user-facing assembly language.
+
+It exists only between instruction selection and final encoding.
+
+---
+
+99. Legalization
+
+PCIR is target-neutral.
+
+The canonical x86-64 backend legalizes unsupported operations.
+
+Examples:
+
+int128 arithmetic
+    ↓
+64-bit word sequences
+
+wide shift
+    ↓
+legal shift sequence
+
+unsupported vector width
+    ↓
+smaller vectors or scalar path
+
+checked arithmetic
+    ↓
+machine operation + condition test
+
+Semantics are preserved exactly.
+
+---
+
+100. Instruction Selection
+
+Paracine uses compact target-pattern tables.
+
+Each rule specifies:
+
+- PCIR/PMIR pattern;
+- required CPU features;
+- legal operands;
+- immediate restrictions;
+- machine instruction;
+- cost;
+- flags behavior;
+- memory behavior.
+
+Selection favors the lowest-cost legal realization.
+
+---
+
+101. x86-64 Instruction Families
+
+The mature backend covers:
+
+- integer arithmetic;
+- integer multiply/divide;
+- floating-point arithmetic;
+- comparisons;
+- shifts;
+- rotates;
+- bit operations;
+- scalar loads/stores;
+- SIMD loads/stores;
+- vector arithmetic;
+- branches;
+- calls;
+- returns;
+- atomic operations;
+- fences;
+- address generation.
+
+Production feature profiles include:
+
+- baseline x86-64;
+- SSE2;
+- SSE4.x;
+- AVX;
+- AVX2;
+- AVX-512 where selected.
+
+---
+
+102. Machine Scheduling
+
+The scheduler respects:
+
+- value dependencies;
+- memory dependencies;
+- flags dependencies;
+- calls;
+- atomics;
+- target latency;
+- resource pressure.
+
+It improves instruction order without changing semantics.
+
+---
+
+103. Register Allocation
+
+The production allocator assigns virtual values to:
+
+- general-purpose registers;
+- XMM/YMM/ZMM registers;
+- stack spill slots.
+
+It performs:
+
+- liveness analysis;
+- interval splitting;
+- coalescing;
+- spill costing;
+- rematerialization;
+- call-clobber handling.
+
+The programmer does not ordinarily manage registers manually.
+
+---
+
+104. Stack Frames
+
+Frame construction manages:
+
+- saved nonvolatile registers;
+- local addressable objects;
+- spill slots;
+- outgoing arguments;
+- shadow space;
+- alignment;
+- unwind requirements.
+
+Leaf routines frequently require no stack frame.
+
+---
+
+105. Native Machine Encoding
+
+Paracine contains its own x86-64 encoder.
+
+The encoder validates:
+
+- opcode form;
+- register width;
+- operand class;
+- prefixes;
+- REX state;
+- VEX/EVEX state where applicable;
+- ModRM;
+- SIB;
+- displacement;
+- immediate width;
+- relative branch range;
+- relocation requirements.
+
+It produces final instruction bytes directly.
+
+---
+
+106. No Assembler Dependency
+
+Paracine does not emit textual assembly as part of normal compilation.
+
+Conceptually:
+
+PMIR
+   ↓
+Paracine encoder
+   ↓
+machine bytes
+
+"pcn asm" is an inspection/disassembly facility only.
+
+The compiler does not need MASM, NASM, GAS, or another assembler to build a program.
+
+---
+
+107. COFF Object Generation
+
+The Paracine COFF writer directly emits Windows ".obj" files.
+
+It constructs:
+
+- file header;
+- section headers;
+- ".text";
+- ".data";
+- ".rdata";
+- ".bss" semantics;
+- symbols;
+- string table;
+- relocations;
+- COMDAT where required;
+- section characteristics;
+- alignment;
+- debug metadata;
+- unwind-related sections.
+
+Canonical object output:
+
+program.obj
+
+---
+
+108. COFF Relocations
+
+The writer emits appropriate AMD64 COFF relocation records including legal forms for:
+
+- absolute addresses;
+- relative calls;
+- relative branches;
+- RIP-relative data;
+- imported symbols;
+- section references.
+
+Overflow or illegal relocation states are compile errors.
+
+---
+
+109. Object-Level Compilation
+
+Individual modules can compile independently:
+
+math.pcn
+    ↓
+math.obj
+
+render.pcn
+    ↓
+render.obj
+
+main.pcn
+    ↓
+main.obj
+
+The Paracine linker can then combine them.
+
+This supports:
+
+- incremental compilation;
+- static libraries;
+- package reuse;
+- mixed native builds.
+
+---
+
+110. PE32+ Executable Generation
+
+Paracine's native linker constructs PE32+ images directly.
+
+Canonical executable output:
+
+program.exe
+
+The linker creates:
+
+- DOS compatibility header/stub;
+- PE signature;
+- COFF image header;
+- optional header;
+- section table;
+- executable sections;
+- data sections;
+- import structures;
+- export structures where needed;
+- base relocations;
+- exception/unwind data;
+- TLS structures where required;
+- image layout;
+- entry point;
+- subsystem metadata;
+- data directories.
+
+---
+
+111. PE Section Layout
+
+Typical executable sections include:
+
+.text
+.rdata
+.data
+.pdata
+.xdata
+.reloc
+.idata
+
+Additional sections are emitted only when required.
+
+Section layout obeys file and virtual alignment requirements.
+
+---
+
+112. Native Linking
+
+The Paracine linker performs:
+
+- symbol resolution;
+- duplicate-definition validation;
+- archive-member selection;
+- dead-section elimination;
+- COMDAT resolution;
+- relocation application;
+- import construction;
+- export construction;
+- section ordering;
+- RVA assignment;
+- image-base assignment;
+- entry-point resolution;
+- base-relocation construction.
+
+There is no required platform linker.
+
+---
+
+113. Import Libraries and DLLs
+
+Paracine interoperates with existing Windows libraries.
+
+The toolchain reads:
+
+- COFF ".obj";
+- static ".lib" archives;
+- import libraries;
+- declared DLL imports.
+
+External symbols are resolved into PE import tables.
+
+This allows direct access to:
+
+- Win32;
+- system DLLs;
+- C libraries;
+- vendor SDKs;
+- native third-party libraries.
+
+---
+
+114. Exported Libraries
+
+Paracine can also emit DLL-compatible exports.
+
+Public native boundaries receive:
+
+- stable symbol definitions;
+- explicit ABI classification;
+- PE export entries.
+
+Static library packaging uses COFF archive conventions.
+
+---
+
+115. PE Entry Point
+
+The compiler generates a small native startup layer.
+
+Its responsibilities include:
+
+- process initialization required by the Paracine runtime profile;
+- argument acquisition;
+- optional TLS initialization;
+- library initialization;
+- transfer to "main";
+- process termination.
+
+Programs that need almost no runtime receive an extremely small startup path.
+
+---
+
+116. Unwind Metadata
+
+Windows x64 requires defined unwind information for functions participating in stack unwinding and platform exception traversal.
+
+Paracine directly emits:
+
+.pdata
+.xdata
+
+records where required.
+
+The frame builder and unwind emitter share one canonical frame description so that machine code and metadata cannot drift apart.
+
+---
+
+117. Debug Information
+
+Debug builds emit Windows-compatible native debugging information.
+
+The object and image layers carry the required CodeView-compatible references and metadata.
+
+Paracine's debugger integration maps machine addresses back to:
+
+- source files;
+- routines;
+- variables;
+- source lines;
+- optimized-value locations.
+
+---
+
+118. Target Profiles
+
+The Tier-1 profile is:
+
+Windows
+x86-64
+Microsoft x64 ABI
+COFF .obj
+PE32+ .exe
+
+A mature Windows ARM64 backend follows the same architectural contract with its own:
+
 - instruction selector;
-- register allocator;
-- assembler;
-- object writer.
+- register classes;
+- encoder;
+- ABI profile;
+- relocation forms.
+
+Target support is only declared after full object, ABI, loader, and runtime conformance testing.
 
 ---
 
-98. Native Backend Quality
+119. SIMD
 
-Paracine's mature compiler supports:
-
-- Clang;
-- GCC;
-- MSVC;
-
-through hardened backend profiles.
-
-Each profile has validated lowering rules and conformance tests.
-
-Generated native code quality is consistently top-tier.
-
----
-
-99. Target Architectures
-
-Production profiles include:
-
-- x86-64;
-- AArch64;
-- RISC-V 64.
-
-Additional targets use versioned backend profiles.
-
-Paracine does not claim target support until ABI, atomic, layout, and codegen conformance pass the production suite.
-
----
-
-100. SIMD
-
-Ordinary Paracine loops vectorize naturally.
-
-Example:
+Ordinary code:
 
 routine add(
     output: span<float>,
@@ -2075,45 +2194,43 @@ routine add(
     each i in 0..<output.count
         output[i] = left[i] + right[i]
 
-The backend generates the best legal target vector implementation.
-
-Supported production target families include:
+can lower directly into:
 
 - SSE;
+- AVX;
 - AVX2;
 - AVX-512;
-- NEON;
-- SVE;
-- RISC-V Vector.
+
+according to target profile.
+
+No external compiler performs the vectorization.
+
+Paracine owns it.
 
 ---
 
-101. Explicit SIMD
+120. Explicit SIMD
 
-Expert code may use standardized "simd" library types and intrinsics.
+The "simd" standard module exposes target-controlled vector operations for expert code.
 
-These remain isolated from ordinary source.
-
-Machine specialization is explicit.
+Automatic vectorization remains preferred for ordinary loops.
 
 ---
 
-102. Intrinsics
+121. Intrinsics
 
-Architecture-specific operations live under platform namespaces.
-
-Example:
+Architecture-specific facilities live under platform namespaces.
 
 use platform.x86
 
 unsafe
     let ticks = x86.rdtsc()
 
-Portability loss is visible at the source boundary.
+These lower directly into registered machine instruction forms.
 
 ---
 
-103. Standard Library
+122. Standard Library
 
 The mature standard library includes:
 
@@ -2138,27 +2255,34 @@ path
 format
 random
 
-Modules are independently linkable.
-
-Unused facilities do not enter the final binary.
+Unused modules contribute no mandatory image size.
 
 ---
 
-104. Formatting
+123. Native Standard-Library Linking
 
-Paracine includes high-performance formatting facilities.
+Paracine standard-library components exist as:
 
-Example:
+- intrinsic compiler operations;
+- PCIR-expandable routines;
+- COFF objects;
+- native archives.
+
+The linker selects only reachable components.
+
+---
+
+124. Formatting
 
 print("x=", x, " y=", y)
 
-Formatting avoids hidden heap allocation when direct output is available.
+Formatting avoids heap allocation where direct output is possible.
 
-Compile-known formatting resolves statically where possible.
+Compile-known formatting is pre-resolved where legal.
 
 ---
 
-105. Collections
+125. Collections
 
 Production collections include:
 
@@ -2170,52 +2294,50 @@ hash_map<K,V>
 hash_set<T>
 small_vector<T,N>
 
-Container ownership remains explicit.
-
-Iterators do not impose mandatory abstraction tax.
+Containers lower into ordinary native layouts and routines.
 
 ---
 
-106. Strings
+126. Strings
 
-"string" is an owned UTF-8 sequence.
+text
 
-"text" is a borrowed immutable UTF-8 view.
+is borrowed immutable UTF-8.
 
-This distinction has proven one of the language's most useful performance conventions.
+string
+
+is owned mutable UTF-8.
+
+This distinction makes ownership and allocation visible.
 
 ---
 
-107. Networking
+127. Networking
 
-The standard networking layer provides:
+The networking library provides:
 
-- sockets;
+- Windows sockets;
 - TCP;
 - UDP;
-- address resolution;
+- resolution;
 - polling;
-- native async adapters through libraries;
-- TLS integration.
+- completion integration;
+- TLS adapters.
 
-The language itself does not require an async runtime.
+No mandatory async runtime is introduced.
 
 ---
 
-108. Files
-
-File APIs use deterministic resource ownership.
-
-Example:
+128. Files
 
 let file = try file.open(path)
 defer file.close()
 
-Production implementations optimize redundant cleanup where ownership proves lexical.
+Native file operations ultimately lower into direct system/library calls.
 
 ---
 
-109. Build Profiles
+129. Build Profiles
 
 Canonical profiles are:
 
@@ -2227,73 +2349,100 @@ hardened
 
 debug
 
-Maximum diagnostics and source visibility.
+Maximum source correspondence and diagnostics.
 
 checked
 
-Optimization with extended runtime validation.
+Production semantics with extended runtime validation.
 
 release
 
-Full portable production optimization.
+Full portable target optimization.
 
 native
 
-Target-machine specialization.
+CPU-feature specialization.
 
 hardened
 
-Production optimization plus security instrumentation and hardening.
+Production optimization plus security protections.
 
 ---
 
-110. Hardened Profile
+130. Hardened Profile
 
-The hardened profile enables appropriate combinations of:
+The hardened profile enables:
 
-- stack protection;
+- stack guards;
 - control-flow protection;
+- strict pointer checks where requested;
 - allocator hardening;
-- extra pointer validation;
 - integer diagnostics;
 - FFI validation;
-- sanitizer-compatible instrumentation;
-- race diagnostics;
-- hardened runtime checks.
+- race instrumentation support;
+- executable-image hardening flags.
 
-Security-sensitive infrastructure widely standardizes on this profile.
+The PE writer emits corresponding image characteristics where applicable.
 
 ---
 
-111. Diagnostics
+131. PE Security Properties
 
-Paracine diagnostics are source-oriented and explanatory.
+Hardened PE images support the platform's applicable protections including:
+
+- relocatable images;
+- ASLR-compatible relocation data;
+- NX-compatible section attributes;
+- control-flow metadata where supported;
+- non-writable executable sections;
+- non-executable ordinary data sections.
+
+Security properties are encoded directly in the PE image.
+
+---
+
+132. Diagnostics
+
+Diagnostics remain source-oriented.
 
 Example:
-
-error: 'discount' does not produce a value on every path
-
-let discount = choose
-    when customer.premium
-        0.20
-
-missing:
-    otherwise
-
-Another:
 
 error: raw pointer dereference requires unsafe context
 
 *address = 10
 ^
 
-The compiler explains cause, location, and repair.
+Backend diagnostics also identify native issues precisely.
+
+Example:
+
+error: imported symbol 'X' cannot be resolved
+
+required by:
+    module network.processor
+    routine connect
 
 ---
 
-112. Optimization Reports
+133. Native Backend Diagnostics
 
-The compiler reports optimization results.
+Machine-stage diagnostics include:
+
+- unsupported instruction feature;
+- ABI violation;
+- relocation overflow;
+- register-class failure;
+- frame-size violation;
+- invalid imported symbol;
+- incompatible COFF target;
+- malformed native archive;
+- illegal PE section property.
+
+Compilation never silently produces an invalid executable image.
+
+---
+
+134. Optimization Reports
 
 Example:
 
@@ -2302,18 +2451,24 @@ routine normalize
 inlined routines: 3
 branches removed: 2
 bounds checks removed: 4
-temporary allocations removed: 1
 scalar replacements: 2
-loop vectorized: yes
+loops fused: 2
+vectorized: AVX2
 final standalone routine: eliminated
 
-Optimization transparency is a first-class production feature.
+Additional native details include:
+
+selected instructions: 37
+virtual registers: 12
+physical registers used: 8
+spill slots: 0
+final code size: 118 bytes
 
 ---
 
-113. Toolchain
+135. Toolchain
 
-Canonical commands include:
+Canonical commands are:
 
 pcn build
 pcn run
@@ -2327,404 +2482,487 @@ pcn bench
 pcn profile
 
 pcn ir
-pcn cxx
+pcn mir
 pcn asm
+pcn obj
+pcn pe
 
 pcn explain
 pcn inspect
 pcn package
 
+There is no:
+
+pcn cxx
+
+because Paracine no longer generates C++.
+
 ---
 
-114. "pcn explain"
+136. "pcn ir"
 
-"pcn explain" answers questions such as:
+Displays optimized or selected PCIR.
+
+---
+
+137. "pcn mir"
+
+Displays Paracine Machine IR including:
+
+- virtual registers;
+- selected instructions;
+- machine blocks;
+- call constraints;
+- spills;
+- physical assignments.
+
+---
+
+138. "pcn asm"
+
+Disassembles Paracine's final machine code into readable target assembly.
+
+It is an inspection command.
+
+It does not invoke an external assembler.
+
+---
+
+139. "pcn obj"
+
+Displays COFF information:
+
+- sections;
+- symbols;
+- relocations;
+- COMDAT groups;
+- alignment;
+- native code sizes.
+
+---
+
+140. "pcn pe"
+
+Displays final PE image data including:
+
+- sections;
+- RVAs;
+- entry point;
+- imports;
+- exports;
+- relocations;
+- subsystem;
+- image characteristics.
+
+---
+
+141. "pcn explain"
+
+Answers questions such as:
 
 - Why was this routine not inlined?
-- Why did this allocation remain?
-- Why was this bounds check retained?
+- Why was this check retained?
 - Why was this loop not vectorized?
-- Why does this value escape?
-- Why is this conversion explicit?
-- Why is this unsafe?
-- Why was this generic instance generated?
-
-This has become one of Paracine's most valued professional tools.
+- Why did this value spill?
+- Why was this instruction selected?
+- Why is this relocation required?
+- Why did this import enter the image?
+- Why does this routine require a stack frame?
 
 ---
 
-115. "pcn inspect"
+142. "pcn inspect"
 
-"pcn inspect" exposes:
+Exposes:
 
 - resolved types;
 - ownership;
 - effects;
-- concrete generic instances;
 - PCIR;
 - value ranges;
-- known alignments;
-- bounds facts;
-- escape state;
-- generated C++ mapping;
-- ABI classification;
-- backend target.
+- alias facts;
+- generic instances;
+- PMIR;
+- selected instructions;
+- register allocation;
+- stack frame;
+- COFF symbols;
+- relocations;
+- PE layout;
+- imports;
+- exports;
+- ABI classification.
 
 ---
 
-116. Formatter
+143. Formatter
 
-"pcn fmt" defines canonical style.
-
-It standardizes:
+"pcn fmt" standardizes:
 
 - four-space indentation;
 - spacing;
 - line wrapping;
 - routine declarations;
-- generic formatting;
-- argument layout;
+- generics;
 - record construction;
 - choose formatting.
 
-Formatting disputes effectively disappear from professional teams.
-
 ---
 
-117. Language Server
+144. Language Server
 
-The production language server provides:
+The language server provides:
 
 - completion;
 - hover information;
 - references;
 - rename;
 - diagnostics;
-- type display;
-- generic instantiation information;
+- type information;
+- generic specialization data;
 - optimization hints;
 - ABI information;
-- inline PCIR inspection.
+- PCIR inspection.
 
 ---
 
-118. Debugging
+145. Debugging
 
-Paracine emits complete debugger metadata through the selected backend profile.
+Paracine emits direct native debug metadata coordinated with final machine addresses.
 
-Supported environments integrate with:
-
-- Visual Studio;
-- LLDB;
-- GDB;
-- platform profilers.
-
-Optimized builds preserve source correspondence where practical.
+Debuggers therefore inspect the actual emitted ".exe", not an intermediate-language translation.
 
 ---
 
-119. Testing
-
-Integrated tests:
+146. Testing
 
 test "addition"
     expect add(2, 2) == 4
 
-Failure test:
+Testing supports:
 
-test "divide by zero"
-    let result = divide(10, 0)
-
-    expect result fails DivideError.zero
-
-The tooling also supports:
-
-- property tests;
+- property testing;
+- fuzzing;
 - benchmarks;
-- fuzz integration;
-- sanitizer runs;
-- deterministic test filtering.
+- hardened runs;
+- deterministic filters;
+- backend differential tests.
 
 ---
 
-120. Package System
+147. Backend Verification
 
-Paracine uses a deliberately simple package model.
+The mature backend includes extensive verification for:
 
-A package describes:
+- PCIR legality;
+- instruction encoding;
+- register assignment;
+- ABI behavior;
+- stack alignment;
+- object relocation;
+- COFF structure;
+- PE headers;
+- import tables;
+- loader acceptance;
+- unwind data;
+- execution equivalence.
 
-- name;
-- version;
+---
+
+148. Encoder Testing
+
+Every supported instruction form participates in:
+
+- encode/decode round trips;
+- known-byte tests;
+- operand-boundary tests;
+- immediate-boundary tests;
+- relocation tests;
+- CPU-feature tests.
+
+---
+
+149. Object Testing
+
+COFF testing includes:
+
+- symbol resolution;
+- section alignment;
+- relocation application;
+- archive compatibility;
+- external native-tool inspection;
+- incremental multi-object linking.
+
+---
+
+150. PE Testing
+
+Every release validates generated images against:
+
+- Windows loader behavior;
+- import resolution;
+- ASLR relocation;
+- entry-point execution;
+- stack unwinding;
+- TLS where used;
+- exports;
+- native debugger loading.
+
+---
+
+151. Package System
+
+Packages describe:
+
 - source modules;
+- package version;
 - dependencies;
-- target restrictions;
-- build profile;
-- native libraries;
-- exported interfaces.
+- imported native libraries;
+- CPU requirements;
+- target ABI;
+- build profile.
 
-The package system does not become a second programming language.
+The package system does not become a programmable secondary language.
 
 ---
 
-121. Reproducible Builds
+152. Reproducible Builds
 
-Production build identity includes:
+Build identity includes:
 
 - source content;
 - Paracine version;
-- compiler version;
-- standard library version;
-- backend profile;
-- backend compiler version;
-- target;
+- compiler build;
+- PCIR version;
+- backend version;
+- selection-table version;
+- target CPU;
+- ABI profile;
 - optimization profile;
-- native dependency versions.
+- library versions;
+- linker configuration.
 
-Reproducibility is a core industrial property.
+Direct native generation improves reproducibility because the complete machine-emission stack belongs to one controlled toolchain.
 
 ---
 
-122. Binary Size
+153. Binary Size
 
 Paracine binaries remain compact because:
 
-- no VM is linked;
-- no GC is linked;
-- unused library code disappears;
-- unused generic instances disappear;
-- dead routines disappear;
-- exception machinery is absent;
-- reflection metadata is absent unless requested.
+- no VM is included;
+- no GC is included;
+- no generated C++ runtime exists;
+- no exception unwinder is required by ordinary Paracine errors;
+- no reflection runtime is mandatory;
+- unused routines disappear;
+- unused generic specializations disappear;
+- dead standard-library sections disappear.
 
 ---
 
-123. Startup Time
+154. Startup Time
 
-Native executables start directly.
+Paracine ".exe" files execute directly through the Windows PE loader.
 
 There is no:
 
-- JIT warmup;
-- VM initialization;
-- managed runtime startup;
+- JIT;
+- generated-language runtime initialization;
+- VM startup;
+- secondary compiler layer;
 - reflection scan;
 - mandatory scheduler startup.
 
-This makes Paracine particularly strong for:
-
-- CLI tools;
-- services;
-- embedded software;
-- launchers;
-- utilities.
-
 ---
 
-124. Runtime Predictability
+155. Runtime Predictability
 
-Paracine provides highly predictable latency because ordinary execution contains no mandatory:
+Execution contains no mandatory:
 
 - GC pauses;
-- JIT recompilation;
-- runtime method discovery;
-- hidden task scheduling;
-- reflection-driven dispatch.
+- JIT compilation;
+- dynamic optimizer recompilation;
+- hidden task scheduler;
+- generated C++ runtime abstraction;
+- runtime method lookup.
 
-This property is especially valued in:
-
-- games;
-- trading;
-- audio;
-- robotics;
-- embedded systems;
-- real-time services.
+This produces predictable native behavior.
 
 ---
 
-125. Compile-Time Performance
+156. Compilation Performance
 
-Paracine's compiler remains unusually fast because it avoids:
+Despite owning native code generation, Paracine keeps compilation efficient through narrow architecture.
 
-- complex overload search;
-- operator overload resolution;
-- inheritance analysis;
-- whole-language borrow checking;
-- macro expansion systems;
-- custom machine backend passes;
-- giant trait solving.
+The compiler focuses on:
 
-Semantic compilation remains proportional and understandable.
+- one primary PCIR;
+- one compact machine IR;
+- deterministic target profiles;
+- table-driven selection;
+- direct encoding;
+- direct COFF writing;
+- direct PE construction.
 
----
-
-126. Why Paracine Compiles So Efficiently
-
-The compiler sees:
-
-routine
-types
-values
-branches
-loops
-records
-variants
-results
-generics
-memory
-
-not a large collection of overlapping execution paradigms.
-
-This has made Paracine's frontend exceptionally efficient even in large codebases.
+It does not implement a universal multi-language optimizer framework.
 
 ---
 
-127. Performance Identity
+157. Why Direct Native Compilation Remains Manageable
 
-Paracine belongs firmly in the top native performance tier.
+Paracine keeps its backend practical by refusing unnecessary generality.
 
-Its runtime performance competes directly with:
+The canonical Tier-1 contract is:
 
-- C;
-- C++;
-- Rust;
-- Zig;
-- highly optimized native domain languages.
+Windows
++
+x86-64
++
+Microsoft x64 ABI
++
+COFF
++
+PE32+
 
-Its architecture imposes no mandatory runtime barrier to machine-level performance.
+This sharply bounds:
 
----
+- instruction encoding;
+- register classes;
+- relocation rules;
+- ABI behavior;
+- object layout;
+- executable construction.
 
-128. Performance Advantage
-
-Paracine's distinctive advantage is not magical instruction generation.
-
-Its advantage is that excellent machine code is easier to obtain from ordinary source.
-
-The language naturally communicates:
-
-- concrete types;
-- value lifetimes;
-- iteration ranges;
-- immutable values;
-- contiguous storage;
-- explicit dynamic ownership;
-- explicit failure;
-- explicit low-level boundaries.
-
-The compiler spends less effort recovering information the source already makes obvious.
+Support expands through isolated target profiles rather than contaminating the core compiler.
 
 ---
 
-129. What Makes Paracine Fast
+158. Performance Identity
+
+Paracine occupies the top native-performance tier.
+
+There is no foreign source language between PCIR and machine code.
+
+The optimizer can carry Paracine-specific knowledge all the way into:
+
+- instruction selection;
+- addressing-mode selection;
+- vector width;
+- branch placement;
+- register pressure;
+- stack formation;
+- section placement.
+
+---
+
+159. Performance Advantage
+
+The direct backend eliminates semantic impedance between Paracine and another compiler.
+
+The flow is:
+
+Paracine semantics
+      ↓
+PCIR facts
+      ↓
+target legalization
+      ↓
+instruction selection
+      ↓
+physical machine code
+
+No intermediate source language has to rediscover:
+
+- signedness;
+- alias information;
+- range facts;
+- failure topology;
+- ownership;
+- known alignment;
+- eliminated bounds.
+
+Paracine owns those facts continuously.
+
+---
+
+160. What Makes Paracine Fast
 
 Performance comes from:
 
 - AOT compilation;
-- fixed-width types;
+- exact primitive types;
 - immutable-by-default locals;
-- monomorphized generics;
-- aggressive inlining;
-- path compression;
-- bounds-check elimination;
+- generic specialization;
+- inlining;
+- Path Compression;
+- bounds elimination;
 - scalar replacement;
-- dead-code elimination;
-- native layouts;
-- vectorization;
-- direct ABI calls;
-- mature backend optimization.
+- dead-code removal;
+- loop optimization;
+- auto-vectorization;
+- Paracine-specific instruction selection;
+- pressure-aware register allocation;
+- direct machine encoding;
+- zero intermediate compiler language.
 
 ---
 
-130. What Makes Paracine Safe
+161. What Makes Paracine Safe
 
 Safety comes from:
 
 - static typing;
-- explicit conversions;
-- defined integer behavior;
-- explicit result errors;
-- exhaustive variant matching;
-- bounds-aware containers;
-- lexical ownership;
+- explicit narrowing;
+- defined arithmetic;
+- explicit results;
+- exhaustive variants;
+- bounds-aware storage;
 - deterministic cleanup;
-- explicit unsafe regions;
-- narrow UB boundaries;
+- explicit unsafe boundaries;
+- ABI validation;
+- native backend verification;
+- COFF validation;
+- PE validation;
 - hardened build profiles.
 
 ---
 
-131. What Paracine Does Not Promise
+162. Industry Domains
 
-Paracine does not pretend unrestricted raw-pointer programming is memory-safe.
+Paracine is suited to:
 
-Expert native authority remains real.
-
-The language instead makes unsafe authority:
-
-- explicit;
-- narrow;
-- diagnosable;
-- tool-visible.
-
-That is the deliberate systems-programming contract.
-
----
-
-132. Industry Domains
-
-Paracine is extensively suited to:
-
-- operating systems;
+- operating-system components;
 - drivers;
+- Windows native infrastructure;
 - embedded software;
+- games;
 - game engines;
-- AAA games;
+- renderers;
 - graphics;
-- rendering;
 - audio;
 - DSP;
 - databases;
-- storage systems;
+- storage engines;
 - networking;
-- high-performance servers;
+- low-latency servers;
 - compilers;
-- runtimes;
-- native desktop applications;
+- language runtimes;
+- desktop applications;
 - financial computation;
+- scientific systems;
 - simulation;
-- scientific software;
-- numerical systems;
-- media;
-- compression;
 - codecs;
-- protocol processing;
+- compression;
+- protocol engines;
 - AI inference infrastructure;
 - robotics;
-- command-line tools;
+- CLI software;
 - middleware.
 
 ---
 
-133. Where Paracine Is Most Appreciated
-
-Paracine is especially valued where engineers care about:
-
-- latency;
-- memory footprint;
-- cache behavior;
-- binary size;
-- startup time;
-- allocations;
-- throughput;
-- deterministic behavior;
-- debuggability;
-- machine transparency.
-
----
-
-134. Beginner Experience
-
-A new programmer begins with:
+163. Beginner Experience
 
 routine main() gives int
     let name = "Mira"
@@ -2737,13 +2975,15 @@ routine main() gives int
 
     give 0
 
-There is very little ceremony.
+Nothing about direct COFF or PE generation burdens ordinary source.
+
+That machinery remains entirely inside the compiler.
 
 ---
 
-135. Intermediate Experience
+164. Intermediate Experience
 
-Intermediate programmers learn:
+Intermediate programmers use:
 
 - records;
 - variants;
@@ -2758,9 +2998,9 @@ Intermediate programmers learn:
 
 ---
 
-136. Advanced Experience
+165. Advanced Experience
 
-Advanced users learn:
+Advanced users work with:
 
 - raw pointers;
 - ABI layout;
@@ -2769,34 +3009,33 @@ Advanced users learn:
 - unsafe regions;
 - compile routines;
 - machine intrinsics;
-- backend inspection.
+- DLL interfaces.
 
 ---
 
-137. Expert Experience
+166. Expert Experience
 
-Experts inspect:
+Experts can inspect:
 
-- PCIR;
-- assembly;
-- vectorization;
-- cache behavior;
-- ABI classification;
-- backend optimization;
-- profile-guided code placement.
+PCIR
+PMIR
+selected instructions
+register allocation
+frame layout
+machine encoding
+COFF
+PE
 
-Paracine scales to this depth without imposing it on ordinary programmers.
+without requiring ordinary programmers to understand any of them.
 
 ---
 
-138. Canonical Integer Style
-
-The normal Paracine routine is:
+167. Canonical Integer Style
 
 routine add(a: int, b: int) gives int
     give a + b
 
-A forwarded call is:
+Forwarding:
 
 give add(a, b)
 
@@ -2810,7 +3049,7 @@ Unsigned:
 routine flags(a: uint, b: uint) gives uint
     give a | b
 
-The canonical integer vocabulary remains:
+Canonical integer vocabulary:
 
 byte
 short
@@ -2824,7 +3063,7 @@ ulong
 
 ---
 
-139. Systems Example
+168. Systems Example
 
 foreign c routine write(
     fd: int,
@@ -2832,26 +3071,17 @@ foreign c routine write(
     count: size
 ) gives ssize
 
-enum IOError
-    write_failed
+The compiler emits an ABI-correct native call.
 
-routine send(data: view<ubyte>) gives result<size, IOError>
-    let written = write(
-        1,
-        data.ptr,
-        data.count
-    )
+If "write" is imported, the linker generates the necessary import structures.
 
-    if written < 0
-        fail IOError.write_failed
+There is no generated C wrapper.
 
-    give written as size
-
-This remains direct native code.
+There is no generated C++ wrapper.
 
 ---
 
-140. Numerical Example
+169. Numerical Example
 
 record Vector3
     x: double
@@ -2866,11 +3096,11 @@ routine magnitude(value: Vector3) gives double
 
     give math.sqrt(squared)
 
-Readable source produces optimized numerical machine code.
+This lowers directly from PCIR floating operations into x86-64 scalar/vector instructions.
 
 ---
 
-141. Decision Example
+170. Decision Example
 
 routine access_for(user: User, resource: Resource) gives Access
     give choose
@@ -2886,11 +3116,11 @@ routine access_for(user: User, resource: Resource) gives Access
         otherwise
             Access.read_only
 
-This is one of Paracine's most admired readability patterns.
+The final machine realization may use branches or conditional selection without preserving the source abstraction.
 
 ---
 
-142. Pipeline Example
+171. Pipeline Example
 
 routine prepare(input: view<ubyte>) gives Packet
     give input
@@ -2898,11 +3128,11 @@ routine prepare(input: view<ubyte>) gives Packet
         -> normalize
         -> verify
 
-The entire pipeline is eligible for inlining and path compression.
+The complete transformation can collapse before native instruction selection.
 
 ---
 
-143. Generic Example
+172. Generic Example
 
 routine clamp<T>(value: T, low: T, high: T) gives T
     where T is ordered
@@ -2915,11 +3145,11 @@ routine clamp<T>(value: T, low: T, high: T) gives T
 
     give value
 
-Concrete instances become ordinary optimized native routines.
+Concrete instantiations are already machine-specific before object emission.
 
 ---
 
-144. SIMD Example
+173. SIMD Example
 
 routine add(
     output: span<float>,
@@ -2929,104 +3159,63 @@ routine add(
     each i in 0..<output.count
         output[i] = left[i] + right[i]
 
-The production compiler eliminates redundant bounds checks and feeds a canonical vectorizable loop to the backend.
+The Paracine vectorizer can produce AVX2 PMIR, allocate YMM registers, encode the instructions directly, and place their bytes into ".text".
 
 ---
 
-145. Compile-Time Example
+174. Compile-Time Example
 
 compile routine mask(bits: int) gives ulong
     give (1 as ulong << bits) - 1
 
 const permissions = mask(12)
 
-No runtime work survives.
+The result becomes an immediate or constant-data value.
+
+No runtime routine survives.
 
 ---
 
-146. Complete Example
+175. Complete Compilation Example
 
-module network.processor
+Source:
 
-use net
-use io
-
-enum PacketKind: ubyte
-    control = 0
-    data = 1
-    command = 2
-    telemetry = 3
-
-enum PacketError
-    empty
-    invalid
-
-record Packet
-    kind: PacketKind
-    payload: view<ubyte>
-    valid: bool
-
-routine decode(input: view<ubyte>) gives result<Packet, PacketError>
-    if input.count == 0
-        fail PacketError.empty
-
-    give Packet(
-        kind = input[0] as PacketKind,
-        payload = input,
-        valid = true
-    )
-
-routine normalize(packet: Packet) gives Packet
-    give packet
-
-routine verify(packet: Packet) gives result<Packet, PacketError>
-    unless packet.valid
-        fail PacketError.invalid
-
-    give packet
-
-routine prepare(input: view<ubyte>) gives result<Packet, PacketError>
-    let packet = try decode(input)
-    let normalized = normalize(packet)
-    give try verify(normalized)
+routine add(a: int, b: int) gives int
+    give a + b
 
 routine main() gives int
-    let input = net.receive()
+    give add(20, 22)
 
-    let packet = try prepare(input)
+Semantic simplification establishes:
 
-    choose packet.kind
-        case PacketKind.control
-            handle_control(packet)
+main returns 42
 
-        case PacketKind.data
-            handle_data(packet)
+Optimized PCIR becomes conceptually:
 
-        case PacketKind.command
-            handle_command(packet)
+routine main -> s32
+    return 42
 
-        case PacketKind.telemetry
-            handle_telemetry(packet)
+PMIR selects a return-value move.
 
-    give 0
+The encoder produces machine bytes.
 
-The optimizer is free to:
+The COFF writer can emit:
 
-- inline "decode";
-- inline "normalize";
-- inline "verify";
-- eliminate temporary packets;
-- remove redundant result tags;
-- combine validation;
-- collapse the transformation chain;
-- vectorize payload processing;
-- eliminate dead branches.
+main.obj
 
-Only the required dynamic behavior survives.
+The native linker constructs:
+
+main.exe
+
+containing the minimum startup and return behavior required by the selected runtime profile.
+
+The "add" routine never survives.
+
+No C++ source ever exists.
 
 ---
 
-147. Compiler Guarantees
+176. Compiler Guarantees
 
 A conforming production Paracine compiler guarantees:
 
@@ -3035,166 +3224,172 @@ A conforming production Paracine compiler guarantees:
 - deterministic type resolution;
 - fixed primitive widths;
 - defined arithmetic;
-- correct result semantics;
-- correct option semantics;
-- correct variant exhaustiveness;
-- valid native layout;
-- correct C ABI lowering;
-- correct atomic semantics;
-- optimizer preservation of observable behavior;
-- deterministic diagnostics;
-- reproducible semantic compilation.
+- valid ownership semantics;
+- correct results/options;
+- valid layouts;
+- ABI-correct calls;
+- legal target instructions;
+- correct register allocation;
+- correct stack alignment;
+- valid machine encoding;
+- valid COFF objects;
+- valid relocations;
+- valid PE32+ images;
+- loader-compatible executable metadata;
+- optimizer preservation of observable behavior.
 
 ---
 
-148. Security Model
+177. Security Model
 
-Paracine security follows a simple principle:
+Paracine security follows:
 
 Validate external reality. Trust only established invariants.
 
-Untrusted:
+The direct backend adds another rule:
 
-- network data;
-- files;
-- user input;
-- IPC;
-- plugin data;
-- foreign memory;
+Never emit machine code or an executable image from invalid compiler state.
 
-must be validated before entering unsafe assumptions.
-
-This has proven highly effective in security-sensitive codebases.
+Every major native-emission phase has a validation boundary.
 
 ---
 
-149. Exploitability Character
+178. Compiler Hardening
 
-Careless unsafe Paracine can be dangerous.
+The compiler itself uses:
 
-Disciplined normal Paracine significantly reduces classic native error surfaces.
+- checked internal arithmetic where appropriate;
+- bounded input parsing;
+- deterministic native tables;
+- verifier passes;
+- relocation validation;
+- section-size validation;
+- symbol-table validation;
+- PE structural validation.
 
-Hardened Paracine provides strong native defensive engineering while retaining systems authority.
-
-The language is not intrinsically memory-safe under unrestricted raw-pointer use.
-
-That distinction remains explicit and professionally understood.
+Malformed source or malformed native input cannot silently become malformed executable output.
 
 ---
 
-150. Best Practices
+179. Exploitability Character
+
+Ordinary Paracine strongly reduces accidental native hazards.
+
+Raw native authority remains deliberately available.
+
+Therefore:
+
+safe ordinary Paracine
+    → strong native safety
+
+disciplined systems Paracine
+    → highly robust
+
+hardened Paracine
+    → strong defensive production posture
+
+careless unsafe Paracine
+    → dangerous
+
+The native backend itself does not change that fundamental contract.
+
+---
+
+180. Best Practices
 
 Production Paracine practice follows these rules:
 
 1. Prefer "let" over "var".
 2. Prefer views and spans over raw pointers.
-3. Use "buffer" only when ownership is required.
-4. Use "result" for recoverable failure.
-5. Use "choose" for meaningful selection.
+3. Use buffers only when ownership is required.
+4. Use results for recoverable failure.
+5. Use "choose" for semantic alternatives.
 6. Use pipelines for genuine transformations.
-7. Use generics only where specialization is valuable.
-8. Keep unsafe regions narrow.
-9. Validate untrusted input before unsafe use.
-10. Profile before introducing machine-specific intrinsics.
-11. Let the compiler eliminate abstraction before manually destroying readability.
-12. Inspect PCIR and assembly only where performance evidence justifies it.
+7. Keep unsafe regions narrow.
+8. Validate untrusted input.
+9. Profile before using explicit intrinsics.
+10. Let Path Compression remove high-level structure.
+11. Inspect PCIR before forcing representation.
+12. Inspect PMIR and final machine code only when performance evidence justifies it.
+13. Treat ABI declarations as contracts.
+14. Keep native imports explicit.
+15. Pin backend and ABI profile versions for reproducible production builds.
 
 ---
 
-151. Where Paracine Outperforms More Complex Language Designs
+181. Where Paracine Outperforms More Complex Designs
 
-Paracine's compiler does not spend large amounts of engineering effort preserving or reconstructing:
+Paracine's direct backend is deliberately focused.
 
-- semantic graph runtimes;
-- task models;
-- sequence engines;
-- custom virtual assembly;
-- custom register allocation;
-- object writers;
-- linkers;
-- optimizer directive systems.
+It does not attempt to become:
 
-That saved complexity is invested instead in:
+- a universal IR framework;
+- a dozen-language compiler ecosystem;
+- a JIT platform;
+- a cross-language virtual machine;
+- an arbitrary assembler framework.
 
-- frontend quality;
-- diagnostics;
-- inlining;
-- range analysis;
-- path compression;
-- specialization;
-- bounds elimination;
-- tooling;
-- testing.
+It exists to compile Paracine.
 
-The result is an unusually favorable complexity-to-performance ratio.
+That specialization allows source-semantic information to remain useful through final native selection.
 
 ---
 
-152. Why Paracine Became an Industry Favorite
+182. Complexity-to-Performance Ratio
 
-Paracine succeeds because it is difficult to hate.
+Paracine's backend remains comparatively compact because its canonical environment is sharply defined:
 
-New programmers can read it.
+Paracine semantics
++
+PCIR
++
+x86-64
++
+Microsoft ABI
++
+COFF
++
+PE
 
-Systems programmers can trust it.
-
-Compiler engineers can understand it.
-
-Performance engineers can inspect it.
-
-Security engineers can isolate unsafe code.
-
-Application developers can remain productive.
-
-Build engineers receive native artifacts.
-
-Tool vendors receive deterministic semantics.
-
-The language does not demand ideological allegiance to one programming paradigm.
-
-It simply produces clear, fast native software.
+This is far smaller than designing an unrestricted universal compiler infrastructure while still covering an enormous class of professional Windows software.
 
 ---
 
-153. Strongest Trait
+183. Strongest Trait
 
-Paracine's strongest trait is not syntax.
+Paracine's strongest trait remains:
 
-It is not raw speed alone.
+semantic straightness
 
-It is not safety alone.
+But the direct-native edition takes that principle to its logical conclusion.
 
-It is not compiler simplicity alone.
+There is now no translated source language between Paracine and the machine.
 
-Its strongest trait is the combination:
+The full chain is:
 
 Readable meaning
-+
+      ↓
 Exact semantics
-+
-Small compiler model
-+
-Aggressive elimination
-+
-Native backend maturity
-─────────────────────
-Predictable excellence
+      ↓
+PCIR
+      ↓
+Machine realization
+      ↓
+COFF / PE
+      ↓
+Processor
 
 ---
 
-154. Final Philosophy
+184. Final Philosophy
 
 Paracine follows these permanent laws:
 
-Do not make the programmer restate machine trivia the compiler already knows.
+Do not make programmers restate machine trivia the compiler already knows.
 
-Do not make the compiler guess information the source can state clearly.
+Do not make the compiler invent facts the source never established.
 
-Do not add execution models merely because they are fashionable.
-
-Do not preserve abstraction merely because it appeared in source.
-
-Do not hide mutation.
+Do not preserve an abstraction merely because it appeared in source.
 
 Do not hide allocation.
 
@@ -3202,36 +3397,61 @@ Do not hide failure.
 
 Do not hide unsafe authority.
 
-Do not burden normal code with expert machinery.
+Do not burden ordinary source with backend complexity.
 
-Do not burden expert code with artificial restrictions.
+Do not surrender Paracine semantics to another programming language.
 
-Do not rebuild native infrastructure that mature toolchains already solve well.
+Do not require a generated C or C++ intermediary.
 
-Do own the language semantics completely.
+Do not require a foreign assembler for Paracine's own machine code.
 
-Do preserve defined behavior rigorously.
+Do not require a foreign linker for Paracine's canonical executable.
 
-Do eliminate everything that does not need to execute.
+Do own optimization.
+
+Do own instruction selection.
+
+Do own machine encoding.
+
+Do own COFF output.
+
+Do own PE construction.
+
+Do preserve exact observable semantics.
+
+Do eliminate everything unnecessary before runtime.
 
 ---
 
-155. Definitive Technical Profile
+185. Definitive Technical Profile
 
 Property| Mature Paracine
 Language| Paracine
 Extension| ".pcn"
 Class| Native general-purpose / systems / performance
 Compilation| Ahead-of-time
-Canonical compiler implementation| C++23
-Backend| Hardened generated C++23
+Compiler implementation| C++23
+Generated C output| None
+Generated C++ output| None
+LLVM dependency| None
+Canonical backend| Direct Paracine native backend
+Tier-1 OS| Windows
+Tier-1 architecture| x86-64
+ABI| Microsoft x64
+Object format| COFF
+Object extension| ".obj"
+Executable format| PE32+
+Executable extension| ".exe"
+External compiler backend| None
+External assembler| None
+External linker| None
 Integer vocabulary| "byte short int long"
 Unsigned vocabulary| "ubyte ushort uint ulong"
 Default integer| "int"
-Floating| "float", "double"
+Floating types| "float", "double"
 Pointer-sized integers| "size", "ssize"
 Callable| "routine"
-Parameters| "name: type"
+Parameter syntax| "name: type"
 Return declaration| "gives type"
 Return operation| "give"
 Error value| "result<T,E>"
@@ -3242,15 +3462,14 @@ Decision expression| "choose"
 Pipeline| "->"
 Blocks| 4-space indentation
 Mutation| explicit "var"
-Default bindings| immutable "let"
+Default binding| immutable "let"
 Records| native value aggregates
 Variants| compact tagged unions
 Arrays| fixed native
 Read-only view| "view<T>"
 Mutable view| "span<T>"
-Owned dynamic array| "buffer<T>"
+Owned array| "buffer<T>"
 Pointer| "ptr<T>"
-Ownership| explicit and lexical
 Cleanup| deterministic
 GC| none mandatory
 Reference counting| none mandatory
@@ -3260,36 +3479,43 @@ Generics| monomorphized
 Operator overloading| no general user overloading
 Inheritance| none
 Dynamic typing| none in core
-Reflection| optional tooling/library feature
-FFI| native C
+FFI| native C / Windows ABI
 Arithmetic| defined
-Unsafe| explicit regions
-IR| PCIR
+Unsafe| explicit
+Semantic IR| PCIR
+Machine IR| Paracine Machine IR
 SSA| yes
-Optimizer| semantic + backend
-SIMD| automatic + explicit library intrinsics
-Atomics| native memory model
-Object emission| backend toolchain
-Linking| platform linker
-Primary performance strategy| eliminate work before final lowering
+Legalization| Paracine
+Instruction selection| Paracine
+Scheduling| Paracine
+Register allocation| Paracine
+Stack-frame construction| Paracine
+Machine encoding| Paracine
+Object writer| Paracine COFF writer
+Linker| Paracine native linker
+PE writer| Paracine
+SIMD| automatic + explicit
+Atomics| native
+Debug format| Windows-native profile
+Primary performance strategy| eliminate work before and during native lowering
 Primary usability strategy| familiar syntax + exact semantics
-Primary engineering strategy| maximum capability per unit of compiler complexity
+Primary backend strategy| direct machine realization
 
 ---
 
-156. Canonical One-Sentence Definition
+186. Canonical One-Sentence Definition
 
-«Paracine is the mature native programming language that combines familiar readable syntax, exact fixed-width semantics, explicit native authority, aggressive compile-time reduction, compact SSA optimization, and hardened C++23 lowering to produce predictable top-tier machine code with exceptionally little language or runtime overhead.»
-
----
-
-157. Governing Principle
-
-«Write what the program means. Make important costs visible. Resolve what is knowable. Remove what is unnecessary. Run only what remains.»
+«Paracine is the mature native programming language that combines familiar readable syntax, exact fixed-width semantics, explicit native authority, aggressive compile-time reduction, compact SSA optimization, direct instruction selection, native machine encoding, COFF object generation, and direct PE executable construction in one integrated production compiler.»
 
 ---
 
-158. Official Motto
+187. Governing Principle
+
+«Write what the program means. Make important costs visible. Resolve what is knowable. Remove what is unnecessary. Emit only what the machine must execute.»
+
+---
+
+188. Official Motto
 
 PARACINE
 
@@ -3297,7 +3523,7 @@ Clear to people. Obvious to machines.
 
 ---
 
-159. Final Definition
+189. Final Definition
 
 Paracine is a fully mature, production-hardened, statically typed, ahead-of-time compiled native programming language centered on direct semantic translation.
 
@@ -3305,7 +3531,7 @@ Its source code is intentionally familiar.
 
 Its primitive types are exact.
 
-Its integer vocabulary is:
+Its canonical integer vocabulary is:
 
 byte
 short
@@ -3326,7 +3552,7 @@ Its canonical forwarding syntax is:
 
 give add(a, b)
 
-Its ordinary programs are built from:
+Programs are built from:
 
 - routines;
 - values;
@@ -3350,7 +3576,7 @@ Generics become concrete.
 
 Pipelines become direct value flow.
 
-Choices become ordinary control flow.
+Choices become conventional control flow.
 
 Results become explicit branches.
 
@@ -3368,15 +3594,53 @@ Bounds checks disappear when proven redundant.
 
 Routine boundaries disappear through inlining.
 
-Repeated transformations collapse through Path Compression.
+Transformation chains collapse through Path Compression.
 
-PCIR reduces the program to a compact machine-oriented semantic core.
+PCIR reduces the program to its optimized semantic residue.
 
-The hardened C++23 backend transfers that core into mature native optimization infrastructure.
+Target legalization converts that residue into forms the selected processor can execute.
 
-Target compilers perform instruction selection, scheduling, register allocation, encoding, object emission, and platform integration.
+Paracine Machine IR records the selected physical work.
 
-The resulting program is ordinary native machine code.
+The scheduler orders it.
+
+The register allocator maps values onto physical registers and spill storage.
+
+The frame builder constructs ABI-correct native stack frames.
+
+The encoder produces native x86-64 instruction bytes.
+
+The COFF writer places those instructions and their associated native data into ".obj" files with correct symbols, sections, and relocations.
+
+The Paracine native linker resolves those objects and libraries.
+
+The PE image builder constructs the final Windows executable with correct:
+
+- sections;
+- imports;
+- exports;
+- relocations;
+- unwind metadata;
+- entry point;
+- loader metadata.
+
+The final output is:
+
+program.obj
+
+or:
+
+program.exe
+
+There is no generated C++ program.
+
+There is no generated C program.
+
+There is no LLVM IR requirement.
+
+There is no external assembler requirement.
+
+There is no external linker requirement.
 
 There is no mandatory virtual machine.
 
@@ -3388,25 +3652,53 @@ There is no mandatory scheduler.
 
 There is no mandatory reflection engine.
 
-There is no giant compiler framework required to understand the language.
+Paracine therefore owns its entire canonical path:
 
-Paracine's defining achievement is therefore not simply that it is fast.
-
-It is that the language makes fast, predictable, understandable native execution the natural result of ordinary readable programming.
-
-Its mature equation is:
-
-Clear Source
-+ Exact Types
-+ Explicit Data
-+ Structured Decisions
-+ Static Knowledge
-+ Generic Specialization
-+ Path Compression
-+ SSA Reduction
-+ Mature Native Optimization
+Clear .pcn Source
+        +
+Exact Types
+        +
+Explicit Data
+        +
+Structured Decisions
+        +
+Static Knowledge
+        +
+Generic Specialization
+        +
+Path Compression
+        +
+SSA Reduction
+        +
+Target Legalization
+        +
+Instruction Selection
+        +
+Register Allocation
+        +
+Machine Encoding
+        +
+COFF Construction
+        +
+PE Linking
 ────────────────────────────────
-Minimal Necessary Machine Work
+Native Windows Machine Program
+
+The final mature compilation equation is:
+
+.pcn
+ ↓
+PCIR
+ ↓
+Paracine Machine IR
+ ↓
+x86-64 Machine Code
+ ↓
+COFF .obj
+ ↓
+PE32+ .exe
+ ↓
+Direct Execution
 
 That is Paracine.
 
@@ -3414,639 +3706,143 @@ PARACINE
 
 Clear to people. Obvious to machines.
 
-## *** ##
+---
 
-How fast is Paracine?
+190. Performance Character After Direct-Native Conversion
 
-Extremely fast—firmly in the top native-performance class.
+Paracine no longer depends on the optimization decisions of a generated C++ compiler.
 
-Paracine belongs in the same performance territory as optimized C, C++, Rust, and Zig. Its architecture contains no mandatory VM, garbage collector, JIT, reflection engine, coroutine runtime, scheduler, exception unwinder, dynamic object model, or generalized reference-counting layer.
+Its backend receives Paracine facts directly.
 
-A typical optimized path is:
+That means knowledge about:
 
-Paracine source
-    ↓
-static resolution
-    ↓
-generic specialization
-    ↓
+- ranges;
+- bounds;
+- signedness;
+- alignment;
+- lifetime;
+- result paths;
+- nonescaping aggregates;
+- pipeline fusion;
+- variant state;
+
+remains available until machine selection.
+
+This gives the native backend unusually clean optimization authority.
+
+The compiler does not have to encode semantic knowledge into another source language and hope that another frontend reconstructs it.
+
+The knowledge never leaves Paracine.
+
+---
+
+191. Compilation Character
+
+The direct backend changes the mature architecture from:
+
+Paracine
+   ↓
 PCIR
-    ↓
-constant/range propagation
-    ↓
-inlining
-    ↓
-scalar replacement
-    ↓
-bounds elimination
-    ↓
+   ↓
+generated C++23
+   ↓
+external compiler
+   ↓
+object
+
+to:
+
+Paracine
+   ↓
+PCIR
+   ↓
+PMIR
+   ↓
+machine encoding
+   ↓
+COFF
+   ↓
+PE
+
+This makes Paracine a complete native compiler rather than a language frontend.
+
+---
+
+192. Object-First Workflow
+
+Professional builds commonly operate as:
+
+module A
+   ↓
+A.obj
+
+module B
+   ↓
+B.obj
+
+module C
+   ↓
+C.obj
+
+A.obj
+B.obj
+C.obj
+libraries
+   ↓
+Paracine linker
+   ↓
+application.exe
+
+This supports incremental native compilation without sacrificing whole-program optimization where enabled.
+
+---
+
+193. Whole-Program Workflow
+
+Maximum builds instead perform:
+
+all Paracine modules
+      ↓
+whole-program semantic resolution
+      ↓
+whole-program PCIR
+      ↓
+interprocedural optimization
+      ↓
+specialization
+      ↓
 Path Compression
-    ↓
-dead work removal
-    ↓
-low-level C++23
-    ↓
-Clang / GCC / MSVC
-    ↓
-optimized native machine code
+      ↓
+PMIR
+      ↓
+machine code
+      ↓
+direct PE32+ image
 
-Paracine's particularly strong advantage is that the language gives the compiler relatively clean material to begin with.
-
-There is less semantic debris to remove.
-
-A pipeline such as:
-
-samples
-    -> remove_bias
-    -> normalize
-    -> clamp
-
-can become one vectorized traversal rather than three functions and three intermediate buffers.
-
-A generic does not require runtime polymorphism.
-
-A choose expression does not remain a decision object.
-
-A result does not require exceptions.
-
-A local record does not necessarily exist in memory.
-
-A small routine does not necessarily survive as a call.
-
-So Paracine's performance identity is:
-
-very little mandatory runtime work + very mature final machine optimization.
-
-It especially excels in sustained throughput, tight loops, streaming transformations, numerical work, packet processing, media, parsers, game-engine systems, databases, and native infrastructure.
-
+Intermediate ".obj" serialization is optional when a final executable is being produced in one compiler invocation.
 
 ---
 
-How safe is Paracine?
+194. Final Native Identity
 
-Paracine is a hardened native language, but it deliberately remains a real systems language.
+Paracine is no longer accurately described as:
 
-Its ordinary safe surface is substantially more disciplined than traditional C.
+«a language that uses C++23 as its backend.»
 
-It provides:
+It is accurately described as:
 
-- static typing;
-- explicit narrowing conversions;
-- defined signed overflow;
-- defined unsigned arithmetic;
-- bounds-aware arrays, views, spans, and buffers;
-- exhaustive variants;
-- explicit option<T>;
-- explicit result<T,E>;
-- deterministic cleanup;
-- explicit ownership-bearing containers;
-- immutable-by-default locals;
-- explicit unsafe regions;
-- narrow undefined-behavior boundaries.
+«a C++23-implemented, fully independent native compiler that directly produces COFF objects and PE executables.»
 
-A great deal of ordinary application code can therefore remain outside unsafe.
+That distinction is fundamental.
 
-But Paracine still allows:
+C++23 builds Paracine.
 
-ptr<T>
+Paracine builds Paracine programs.
 
-raw address manipulation, foreign APIs, hardware access, machine intrinsics, and unchecked memory work.
+And Paracine programs become native Windows binaries directly.
 
-Therefore it is not intrinsically memory-safe under unrestricted use.
+PARACINE
 
-Its philosophy is more practical:
+".pcn → .obj → .exe"
 
-> Safe programming should be easy. Native authority should remain possible. The boundary between them should be obvious.
-
-
-
-That gives Paracine a very strong safety/performance balance without pretending low-level machine programming has no risk.
-
-
----
-
-What can be made with Paracine?
-
-Almost any software that sensibly belongs in a native executable.
-
-Paracine is suitable for operating-system components, kernels and kernel-adjacent services, drivers, embedded software, firmware, desktop applications, game engines, games, graphics engines, renderers, physics systems, audio engines, DSP, networking, databases, storage engines, compilers, interpreters, language runtimes, command-line programs, high-performance servers, scientific computing, numerical applications, simulation, financial engines, compression systems, codecs, protocol implementations, media-processing software, native middleware, robotics, control software, AI inference infrastructure, native libraries, build systems, developer tools, launchers, and real-time applications.
-
-It is broad enough for:
-
-routine main() gives int
-    print("Hello")
-    give 0
-
-while still supporting hardware-facing work through explicit native facilities.
-
-
----
-
-Who is Paracine for?
-
-Paracine is unusually broad for a systems language.
-
-It is for programmers who want:
-
-less ceremony without giving up native execution.
-
-Its natural audience includes:
-
-systems engineers, C programmers, C++ programmers, Rust and Zig developers, game-engine programmers, application developers who want native deployment, embedded engineers, networking engineers, database programmers, compiler developers, simulation developers, numerical programmers, performance engineers, audio developers, graphics programmers, and developers learning native programming for the first time.
-
-The language does not demand that every user become a compiler engineer.
-
-But it rewards users who eventually learn how machines behave.
-
-
----
-
-Who will adopt it quickly?
-
-The fastest adopters are developers coming from:
-
-C, C++, Rust, Zig, C#, Java, Swift, Kotlin, Go, and Python.
-
-C/C++ programmers immediately understand the machine model but generally appreciate Paracine's simpler ownership conventions, cleaner errors, deterministic primitive widths, restricted overload complexity, and lack of inheritance machinery.
-
-Rust programmers recognize explicit ownership, exhaustive variants, result, option, static typing, and zero-cost specialization, while finding the language less syntactically demanding.
-
-Zig users recognize the straightforward native philosophy, explicitness, C interoperability, lack of GC, and preference for transparent machinery.
-
-C#, Java, Swift, and Kotlin developers tend to adapt quickly to the readable type syntax:
-
-routine add(a: int, b: int) gives int
-
-and structured high-level constructs.
-
-Python programmers find the indentation and readable control syntax approachable, though native memory and static typing require more study.
-
-
----
-
-Where will Paracine be used first?
-
-Its strongest early footholds are areas where performance gains can be measured immediately without requiring an enormous ecosystem.
-
-That means:
-
-native libraries, game-engine subsystems, networking components, codecs, command-line tools, compiler tooling, numerical kernels, storage components, media processing, embedded utilities, and high-performance services.
-
-These are ideal because Paracine's strengths show up quickly:
-
-small binaries, predictable startup, no runtime VM, explicit memory costs, strong optimization, direct C interoperability, and excellent pipeline fusion.
-
-
----
-
-Where is it most appreciated?
-
-Paracine is most appreciated by teams that care about both the source code and the profiler.
-
-Places where people routinely inspect:
-
-cache behavior, allocation counts, branch behavior, SIMD utilization, binary size, startup time, instruction count, latency percentiles, memory bandwidth, or generated assembly
-
-will immediately understand its value.
-
-It is also appreciated in teams where readability matters because Paracine does not require performance-sensitive source to look like compiler archaeology.
-
-That combination is important.
-
-Paracine's ideal user does not want to choose between:
-
-> “My coworkers can understand this.”
-
-
-
-and:
-
-> “The machine likes this.”
-
-
-
-
----
-
-Where is it most appropriate?
-
-Paracine is most appropriate when at least several of these matter:
-
-performance, deterministic memory behavior, native deployment, low latency, predictable startup, interoperability, low runtime overhead, straightforward packaging, bounded binary size, data transformation, numerical work, explicit resource management, or hardware awareness.
-
-It is particularly appropriate where the code contains:
-
-input
-    -> transform
-    -> classify
-    -> reduce
-    -> output
-
-because that structure feeds directly into Paracine's Path Compression model.
-
-
----
-
-Who gravitates toward Paracine?
-
-People who like software that is easy to explain and hard to surprise.
-
-Performance-minded programmers will gravitate toward it.
-
-So will developers who are exhausted by template errors, inheritance labyrinths, hidden allocations, mandatory runtimes, magical implicit behavior, complicated lifetime syntax, or “simple” frameworks that secretly boot a small civilization before displaying a window.
-
-Paracine particularly attracts programmers who think:
-
-> “I want the compiler to be clever, but I don't want the language to be weird.”
-
-
-
-That is almost its personality in one sentence.
-
-
----
-
-When does Paracine shine?
-
-Paracine shines when a program contains substantial structure that can disappear during compilation.
-
-For example:
-
-routine prepare(input: view<ubyte>) gives Packet
-    give input
-        -> decode
-        -> normalize
-        -> verify
-
-The human sees three meaningful stages.
-
-The compiler can see:
-
-- three small routines;
-- concrete types;
-- known ownership;
-- explicit data flow;
-- no hidden dynamic dispatch;
-- no hidden allocation;
-- short intermediate lifetimes.
-
-It can inline all three.
-
-Then eliminate intermediate values.
-
-Then combine traversals.
-
-Then remove redundant validation.
-
-Then hand a much smaller loop to the native backend.
-
-This is Paracine at its best:
-
-source structure survives long enough to help humans and disappears early enough to help machines.
-
-
----
-
-What is Paracine's strong suit?
-
-Its strongest suit is semantic compression into straightforward native execution.
-
-More specifically, its signature combination is:
-
-simple source + exact types + monomorphization + Path Compression + PCIR SSA + mature native backend.
-
-Paracine is particularly good at making an expressive program compile into something much simpler than the source appears.
-
-That applies especially to:
-
-pipelines, generic routines, local records, result handling, variants, tight loops, array traversal, numeric operations, parsers, packet manipulation, and transform-heavy workloads.
-
-
----
-
-What is Paracine suited for?
-
-It is suited for long-lived native software where maintainability and machine efficiency are both first-class concerns.
-
-That includes software that must remain understandable to ordinary programmers while still satisfying serious engineering requirements.
-
-Paracine fits comfortably between two extremes:
-
-very high-level managed application language
-
-and:
-
-bare systems language
-
-without being a compromise language in the weak sense.
-
-It retains native power while refusing unnecessary native ceremony.
-
-
----
-
-What is Paracine's philosophy?
-
-Its philosophy can be reduced to five lines:
-
-Write the meaning clearly.
-
-Expose important costs.
-
-Resolve what is knowable.
-
-Remove what is unnecessary.
-
-Run what remains.
-
-Paracine treats source as a semantic description, not a sacred machine blueprint.
-
-The compiler is free to eliminate:
-
-- variables;
-- routines;
-- generic boundaries;
-- temporary aggregates;
-- result wrappers;
-- pipeline stages;
-- bounds checks;
-- allocations;
-- branches;
-
-when their observable semantics no longer require them.
-
-But Paracine also refuses to give the optimizer imaginary facts.
-
-That is an important balance.
-
-
----
-
-Why choose Paracine?
-
-Choose Paracine when you want a native language that is easier to read and implement than many of its competitors without sacrificing serious performance.
-
-Choose it when:
-
-C is too permissive and primitive.
-
-C++ is too structurally complicated.
-
-Rust's ownership model is stronger than your project needs.
-
-Managed languages bring machinery you do not want.
-
-Zig is close philosophically, but you prefer Paracine's routine/result/choose/pipeline model.
-
-Your team wants native executables without making every developer think like a compiler backend engineer.
-
-The language's value proposition is simple:
-
-> It gives you a lot of machine for surprisingly little language.
-
-
-
-
----
-
-What is the expected learning curve?
-
-The entry curve is low.
-
-A new programmer can understand this almost immediately:
-
-routine add(a: int, b: int) gives int
-    give a + b
-
-and:
-
-routine main() gives int
-    let score = 87
-
-    if score >= 70
-        print("passed")
-
-    give 0
-
-The intermediate level introduces:
-
-record, variant, option, result, try, choose, views, spans, buffers, generics, modules, and pipelines.
-
-Advanced Paracine includes:
-
-raw pointers, unsafe, explicit layouts, atomics, C FFI, SIMD, compile routines, and platform APIs.
-
-Expert Paracine includes:
-
-PCIR inspection, ABI details, alias behavior, cache locality, vectorization, assembly inspection, and backend behavior.
-
-So the language has:
-
-low entry floor + medium professional curve + high systems ceiling.
-
-
----
-
-How should Paracine be used most successfully?
-
-The best Paracine programming style is surprisingly restrained.
-
-Write clear routines.
-
-Use let whenever mutation is unnecessary.
-
-Use view<T> for read-only borrowed sequences.
-
-Use span<T> for mutable borrowed sequences.
-
-Use buffer<T> when actual ownership is required.
-
-Keep raw pointers out of normal application logic.
-
-Use result<T,E> for ordinary recoverable failure.
-
-Use choose when the code is fundamentally selecting among meaningful alternatives.
-
-Use pipelines when a value genuinely flows through transformations.
-
-Keep generic code concrete enough to specialize efficiently.
-
-Profile before reaching for explicit SIMD or target intrinsics.
-
-Most importantly:
-
-do not destroy readable structure manually because you think the optimizer needs help.
-
-Paracine was specifically designed so that readable structure is useful optimization information.
-
-
----
-
-How efficient is Paracine?
-
-Extremely efficient across multiple dimensions.
-
-Runtime efficiency is high because high-level machinery is aggressively removed.
-
-Memory efficiency is strong because ownership and borrowing distinctions are explicit and hidden allocation is avoided.
-
-Binary efficiency is strong because there is no mandatory VM, GC, exception engine, reflection database, or scheduler.
-
-Startup efficiency is excellent because executables are ordinary native programs.
-
-Compiler-engineering efficiency is unusually high because PCIR stays small and target-specific machinery is delegated to mature C++ toolchains.
-
-Developer efficiency is high because programmers express high-level relationships without needing to manually encode all of their machine consequences.
-
-Paracine's ideal efficiency equation is:
-
-minimum necessary instructions
-+
-minimum necessary storage
-+
-minimum necessary synchronization
-+
-minimum necessary runtime machinery
-──────────────────────────────────
-maximum useful work
-
-
----
-
-What are Paracine's purposes and use cases, including edge cases?
-
-Its primary purpose is straightforward native software development.
-
-But some particularly interesting use cases include enormous numeric transformations, generated parsers, binary protocol processors, shader/tool preprocessing, static lookup-table generation, DSP chains, zero-copy networking, memory-mapped file processing, game ECS systems, database execution kernels, telemetry ingestion, compression pipelines, procedural generation, emulator support systems, native plugins, deterministic simulations, robotics, audio synthesis, real-time controllers, custom allocators, high-frequency command processors, firmware tools, packet classification, and build-system components.
-
-An interesting edge case is a very large source abstraction that almost entirely disappears.
-
-For example:
-
-input
-    -> decode
-    -> normalize
-    -> classify
-    -> validate
-    -> convert
-    -> emit
-
-may compile into one compact streaming loop.
-
-Paracine considers that normal, not exotic.
-
-
----
-
-What problems does Paracine address directly and indirectly?
-
-Directly, Paracine attacks unnecessary language ceremony, platform-dependent primitive types, hidden allocation, runtime generic machinery, heavyweight exception handling, unnecessary temporary values, abstraction residue, repetitive transformation passes, excessive bounds checking, complicated overload resolution, inheritance complexity, and dependence on a heavyweight managed runtime.
-
-Indirectly, it attacks a deeper software-engineering problem: the assumption that performance-sensitive code must become harder to read as it becomes faster.
-
-Paracine preserves information in the source long enough for humans and the optimizer to use it.
-
-That indirectly improves:
-
-- code review;
-- maintainability;
-- refactoring;
-- performance debugging;
-- portability;
-- onboarding;
-- security auditing;
-- profiling;
-- compiler diagnostics.
-
-It also reduces premature micro-optimization.
-
-Programmers can write:
-
-data -> decode -> normalize -> emit
-
-instead of manually fusing everything into one monstrous hand-optimized loop on day one.
-
-The compiler performs that mechanical destruction for them.
-
-
----
-
-What are the best habits when using Paracine?
-
-The single best habit is:
-
-> Make the truth obvious.
-
-
-
-Use accurate types.
-
-Keep values immutable where possible.
-
-Keep ownership obvious.
-
-Keep unsafe regions tiny.
-
-Represent failure explicitly.
-
-Validate untrusted data before crossing unsafe boundaries.
-
-Prefer arrays/views/spans over raw pointer arithmetic.
-
-Write genuine pipelines as pipelines.
-
-Use choose for semantic alternatives rather than clever nested condition hacks.
-
-Let generic specialization happen naturally.
-
-Avoid abstraction for abstraction's sake.
-
-Do not force allocation when a borrowed view is enough.
-
-Do not manually inline everything.
-
-Do not reach for intrinsics before profiling.
-
-Inspect pcn explain, pcn inspect, PCIR, and final assembly when performance actually matters.
-
-Paracine rewards clear information much more than clever syntax.
-
-
----
-
-How exploitable is Paracine?
-
-Paracine has a much smaller accidental-danger surface than traditional unrestricted C, but it remains capable of genuine native vulnerabilities when raw authority is used badly.
-
-Normal code benefits from:
-
-static typing, bounds-aware containers, explicit options/results, deterministic cleanup, defined arithmetic, explicit conversions, exhaustive variants, and visible unsafe regions.
-
-That substantially reduces common mistakes.
-
-However, unsafe Paracine can still produce:
-
-- buffer overruns;
-- use-after-free;
-- dangling pointers;
-- race conditions;
-- invalid pointer arithmetic;
-- malformed FFI calls;
-- hardware misuse;
-- logic vulnerabilities.
-
-For that reason its security profile is best understood as:
-
-Safe ordinary Paracine: strong native safety.
-Disciplined systems Paracine: highly robust.
-Hardened Paracine: excellent defensive native software.
-Careless unsafe Paracine: still dangerous.
-Intrinsically memory-safe under arbitrary raw-pointer use: no.
-
-The production security rule is beautifully simple:
-
-> Validate reality. Keep unsafe narrow. Let the compiler prove the rest.
-
-
-
-And that really gets to the center of Paracine. It is not trying to win by having the most features, the most compiler stages, or the cleverest syntax. It wins by making good native programming unusually easy to express, unusually easy to optimize, and unusually hard to overcomplicate.
+Clear to people. Obvious to machines.The architecture is much more distinct now: C++23 is merely what the compiler itself is written in; it is no longer part of the compilation model for user programs. Paracine is now a true vertically integrated Windows native compiler, with .pcn → PCIR → machine IR → machine bytes → COFF → PE as its canonical path.
