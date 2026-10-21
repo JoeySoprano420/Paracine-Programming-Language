@@ -1768,3 +1768,1255 @@ PARACINE
 ".pcn → .exe"
 
 Clear to people. Obvious to machines.
+
+
+## *** ##
+
+
+Paracine Language Specification
+Normative draft 1.0 — grammar, formal semantics, ownership, modules, standard library
+Status note. The Paracine overview document fixes the vocabulary (routine, gives, give, let, var, record, variant, option<T>, result<T,E>, try, fail, choose, ->, view, span, buffer, defer, unsafe, foreign c routine, where T is ordered, 4-space blocks) and the architecture (PCIR, three outputs). It does not define the grammar, semantics, ownership rules, module system or library. Everything below is a proposed normative definition that stays consistent with that vocabulary. Where I had to choose between alternatives, the choice is marked [Decision] so you can overrule it.
+Part 1. Notation and lexical grammar
+1.1 Metalanguage
+EBNF is used throughout: A = B ; defines a rule, | is alternation, [ X ] is optional, { X } is zero or more, ( X ) groups, 'text' is a literal token, /re/ is a regular expression, (* ... *) is a comment. NEWLINE, INDENT and DEDENT are layout tokens produced by the layout pass (1.4).
+1.2 Source text
+1. A source file is UTF-8, normalized to NFC before lexing. A leading byte-order mark is discarded.
+2. Line terminators are LF; CRLF and CR are normalized to LF.
+3. Tab characters are forbidden outside string and character literals and comments. [Decision] Indentation is exactly four spaces per level.
+4. Trailing whitespace is ignored. A file that does not end in LF has one added.
+1.3 Tokens
+identifier    = /[\p{XID_Start}_][\p{XID_Continue}]*/ ;   (* not a keyword *)
+type_name     = identifier ;                              (* by convention Capitalized for records/variants *)
+
+dec_int       = /[0-9]([0-9_]*[0-9])?/ ;
+hex_int       = /0x[0-9A-Fa-f]([0-9A-Fa-f_]*[0-9A-Fa-f])?/ ;
+bin_int       = /0b[01]([01_]*[01])?/ ;
+oct_int       = /0o[0-7]([0-7_]*[0-7])?/ ;
+int_suffix    = 'byte' | 'short' | 'int' | 'long'
+              | 'ubyte' | 'ushort' | 'uint' | 'ulong' | 'size' | 'ssize' ;
+int_literal   = ( dec_int | hex_int | bin_int | oct_int ) [ '_' int_suffix ] ;
+
+float_literal = /[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?/ [ '_' ( 'float' | 'double' ) ] ;
+bool_literal  = 'true' | 'false' ;
+char_literal  = "'" ( char_escape | /[^'\\\n]/ ) "'" ;      (* one Unicode scalar value *)
+text_literal  = '"' { char_escape | /[^"\\\n]/ } '"' ;
+raw_text      = 'r"' /[^"]*/ '"' ;
+char_escape   = '\\' ( 'n' | 'r' | 't' | '0' | '\\' | "'" | '"'
+              | 'x' hex hex | 'u{' hex { hex } '}' ) ;
+
+line_comment  = '//' { any except NEWLINE } ;
+doc_comment   = '///' { any except NEWLINE } ;
+block_comment = '/*' { any | block_comment } '*/' ;      (* nests *)
+An unsuffixed integer literal has type int if it fits, otherwise it is a compile-time error unless context fixes another integer type. An unsuffixed float literal is double unless context fixes float.
+1.4 Keywords and reserved words
+abi       alias     and       as        break     capability  choose
+const     continue  defer     else      export    fail      false
+for       foreign   give      gives     if        import    in
+is        let       loop      module    move      not       or
+own       public    raw       record    return_   routine   test
+true      try       unsafe    var       variant   when      where
+while     with      yield_
+return_ and yield_ are reserved for future use; give is the only return operation. Primitive type names (byte short int long ubyte ushort uint ulong float double bool char text size ssize void) and the library type names option result view span buffer array are predeclared identifiers, not keywords; they may be shadowed only in a module that explicitly writes import std.prelude as nothing (discouraged).
+1.5 Operators and punctuation
++  -  *  /  %  &  |  ^  ~  <<  >>
+==  !=  <  <=  >  >=
+=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=
+->  =>  .  ..  ..=  ,  :  ::  ?  @  (  )  [  ]  {  }
+and, or, not are the logical operators; &&, ||, ! do not exist. & and | are bitwise only.
+1.6 Layout algorithm
+The layout pass runs after lexing and before parsing.
+1. Each logical line has an indentation of 4k leading spaces. A line with any other leading-space count is a lexical error.
+2. Blank lines and comment-only lines produce no layout tokens.
+3. If a line's indentation is one level deeper than the previous significant line and the previous line ends in a block opener (a line ending in :-free header form: a declaration or statement header that takes a block), emit INDENT.
+4. If indentation decreases by n levels, emit n DEDENT tokens, then NEWLINE.
+5. Otherwise at equal indentation emit NEWLINE.
+6. Inside (…), […], {…} newlines and indentation are insignificant (line continuation). A line beginning with -> also continues the previous expression (pipeline continuation).
+7. A deeper indentation that does not follow a block opener is an error E0101: unexpected indent.
+A block is therefore NEWLINE INDENT statement { statement } DEDENT.
+Part 2. Syntactic grammar
+2.1 Compilation unit
+source_file   = [ module_decl NEWLINE ] { import_decl NEWLINE } { top_item NEWLINE } ;
+
+module_decl   = 'module' module_path ;
+module_path   = identifier { '.' identifier } ;
+
+import_decl   = 'import' module_path [ 'as' identifier ]
+              | 'import' module_path '.' '{' import_list '}'
+              | 'import' module_path '.' '*' ;          (* glob: only allowed for std.prelude-like modules *)
+import_list   = import_item { ',' import_item } ;
+import_item   = identifier [ 'as' identifier ] ;
+
+top_item      = { attribute NEWLINE } [ visibility ] item_body ;
+visibility    = 'public' | 'export' ;                   (* see 6.3 *)
+item_body     = routine_decl | record_decl | variant_decl | alias_decl
+              | const_decl | capability_decl | foreign_decl | test_decl
+              | static_decl ;
+
+attribute     = '@' identifier [ '(' [ attr_arg { ',' attr_arg } ] ')' ] ;
+attr_arg      = identifier [ '=' literal ] | literal ;
+2.2 Declarations
+routine_decl  = 'routine' identifier [ generic_params ] '(' [ param_list ] ')'
+                [ 'gives' type ] [ where_clause ] [ effects ] block ;
+param_list    = param { ',' param } [ ',' ] ;
+param         = [ param_mode ] identifier ':' type [ '=' const_expr ] ;
+param_mode    = 'own' | 'var' | 'raw' ;                  (* default: shared immutable borrow; see Part 4 *)
+effects       = 'with' effect { ',' effect } ;
+effect        = 'unsafe' | 'alloc' | 'io' | 'thread' | 'trap' | 'pure' ;
+
+generic_params= '<' generic_param { ',' generic_param } '>' ;
+generic_param = identifier | 'const' identifier ':' type ;
+where_clause  = 'where' constraint { ',' constraint } ;
+constraint    = type 'is' capability_ref { 'and' capability_ref } ;
+capability_ref= module_path [ type_args ] ;
+
+record_decl   = 'record' identifier [ generic_params ] [ where_clause ] NEWLINE INDENT
+                field { NEWLINE field } DEDENT ;
+field         = [ 'public' ] identifier ':' type [ '=' const_expr ] ;
+
+variant_decl  = 'variant' identifier [ generic_params ] [ where_clause ] NEWLINE INDENT
+                case { NEWLINE case } DEDENT ;
+case          = identifier [ '(' case_field { ',' case_field } ')' ] ;
+case_field    = [ identifier ':' ] type ;
+
+alias_decl    = 'alias' identifier [ generic_params ] '=' type ;
+const_decl    = 'const' identifier [ ':' type ] '=' const_expr ;
+static_decl   = 'var' 'static' identifier ':' type '=' const_expr ;   (* needs 'with unsafe' to access unless atomic *)
+
+capability_decl = 'capability' identifier generic_params NEWLINE INDENT
+                  capability_member { NEWLINE capability_member } DEDENT ;
+capability_member = 'routine' identifier '(' [ param_list ] ')' [ 'gives' type ] ;
+
+foreign_decl  = 'foreign' abi_name 'routine' identifier '(' [ param_list ] ')'
+                [ 'gives' type ] [ 'from' text_literal ] ;
+abi_name      = 'c' | 'msx64' ;
+
+test_decl     = 'test' text_literal block ;
+A record field with no default must be given a value at every construction. A routine with no gives clause gives void.
+2.3 Types
+type          = prim_type | path_type | generic_type | array_type
+              | tuple_type | routine_type | 'void' ;
+prim_type     = 'byte' | 'short' | 'int' | 'long' | 'ubyte' | 'ushort' | 'uint'
+              | 'ulong' | 'float' | 'double' | 'bool' | 'char' | 'text'
+              | 'size' | 'ssize' ;
+path_type     = module_path ;
+generic_type  = module_path type_args ;
+type_args     = '<' type_arg { ',' type_arg } '>' ;
+type_arg      = type | const_expr ;
+array_type    = 'array' '<' type ',' const_expr '>' ;      (* fixed length, inline storage *)
+tuple_type    = '(' type ',' type { ',' type } ')' ;
+routine_type  = 'routine' '(' [ type { ',' type } ] ')' [ 'gives' type ] ;
+Built-in generic types: option<T>, result<T,E>, view<T>, span<T>, buffer<T>, array<T,N>, raw<T> (raw pointer), atomic<T>. view and span are fat borrow types (pointer + count); routine_type values are plain function pointers with no captured environment (Paracine has no closures; [Decision] capture-free by design to keep the runtime non-managed).
+2.4 Statements
+block         = NEWLINE INDENT statement { statement } DEDENT ;
+statement     = ( let_stmt | var_stmt | assign_stmt | expr_stmt | give_stmt
+                | fail_stmt | if_stmt | choose_stmt | loop_stmt | while_stmt
+                | for_stmt | break_stmt | continue_stmt | defer_stmt
+                | unsafe_block ) NEWLINE ;
+
+let_stmt      = 'let' pattern [ ':' type ] '=' expr ;
+var_stmt      = 'var' identifier [ ':' type ] '=' expr ;
+assign_stmt   = place assign_op expr ;
+assign_op     = '=' | '+=' | '-=' | '*=' | '/=' | '%=' | '&=' | '|=' | '^=' | '<<=' | '>>=' ;
+place         = identifier | place '.' identifier | place '[' expr ']' | '*' primary ;
+expr_stmt     = expr ;
+give_stmt     = 'give' [ expr ] ;
+fail_stmt     = 'fail' expr ;
+break_stmt    = 'break' [ identifier ] ;
+continue_stmt = 'continue' [ identifier ] ;
+defer_stmt    = 'defer' ( expr | block ) ;
+unsafe_block  = 'unsafe' block ;
+
+if_stmt       = 'if' expr block { 'else' 'if' expr block } [ 'else' block ] ;
+loop_stmt     = [ label ':' ] 'loop' block ;
+while_stmt    = [ label ':' ] 'while' expr block ;
+for_stmt      = [ label ':' ] 'for' pattern 'in' expr block ;
+label         = '@' identifier ;
+
+choose_stmt   = 'choose' expr NEWLINE INDENT choose_arm { NEWLINE choose_arm } DEDENT ;
+choose_arm    = 'when' pattern [ 'if' expr ] ( block | 'then' expr )
+              | 'else' ( block | 'then' expr ) ;
+A choose over a variant, bool, option or result scrutinee must be exhaustive (see 5.7).
+2.5 Patterns
+pattern       = '_' | identifier | literal | literal '..' literal | literal '..=' literal
+              | module_path [ '(' [ pattern { ',' pattern } ] ')' ]     (* variant case *)
+              | module_path '{' [ field_pat { ',' field_pat } ] '}'     (* record *)
+              | '(' pattern ',' pattern { ',' pattern } ')'
+              | pattern 'or' pattern ;
+field_pat     = identifier [ ':' pattern ] ;
+some(p) and none are the cases of option; ok(p) and err(p) are the cases of result.
+2.6 Expressions
+Expressions are parsed by a Pratt parser. Binding power increases downward (higher binds tighter).
+Level
+Operators
+Assoc.
+1
+-> (pipeline)
+left
+2
+or
+left
+3
+and
+left
+4
+not (prefix)
+—
+5
+== != < <= > >=
+none (non-chaining)
+6
+|
+left
+7
+^
+left
+8
+&
+left
+9
+<< >>
+left
+10
+.. ..=
+none
+11
++ -
+left
+12
+* / %
+left
+13
+unary - ~ * (deref, raw only) & (borrow-of)
+prefix
+14
+as (conversion)
+left
+15
+postfix: call (), index [], field ., ?-free try
+left
+expr          = pipeline ;
+pipeline      = disjunction { '->' pipe_stage } ;
+pipe_stage    = path_expr [ '(' [ arg_list ] ')' ] ;       (* x -> f(a) means f(x, a) *)
+disjunction   = conjunction { 'or' conjunction } ;
+conjunction   = negation { 'and' negation } ;
+negation      = 'not' negation | comparison ;
+comparison    = bitor [ cmp_op bitor ] ;
+cmp_op        = '==' | '!=' | '<' | '<=' | '>' | '>=' ;
+bitor         = bitxor { '|' bitxor } ;
+bitxor        = bitand { '^' bitand } ;
+bitand        = shift { '&' shift } ;
+shift         = range { ( '<<' | '>>' ) range } ;
+range         = additive [ ( '..' | '..=' ) additive ] ;
+additive      = multiplicative { ( '+' | '-' ) multiplicative } ;
+multiplicative= unary { ( '*' | '/' | '%' ) unary } ;
+unary         = ( '-' | '~' | '*' | '&' ) unary | cast ;
+cast          = postfix { 'as' type } ;
+postfix       = primary { call_suffix | index_suffix | field_suffix } ;
+call_suffix   = '(' [ arg_list ] ')' ;
+arg_list      = arg { ',' arg } [ ',' ] ;
+arg           = [ identifier ':' ] [ 'move' | 'var' ] expr ;
+index_suffix  = '[' expr ']' ;
+field_suffix  = '.' identifier ;
+primary       = literal | path_expr | '(' expr ')' | tuple_expr | record_expr
+              | array_expr | try_expr | choose_expr | if_expr | unsafe_expr ;
+
+path_expr     = module_path [ '::' type_args ] ;            (* explicit instantiation: maximum::<int> *)
+tuple_expr    = '(' expr ',' expr { ',' expr } ')' ;
+record_expr   = module_path '{' [ field_init { ',' field_init } ] '}' ;
+field_init    = identifier [ ':' expr ] ;
+array_expr    = '[' [ expr { ',' expr } ] ']' | '[' expr ';' const_expr ']' ;
+try_expr      = 'try' unary ;
+if_expr       = 'if' expr 'then' expr 'else' expr ;
+choose_expr   = 'choose' expr NEWLINE INDENT expr_arm { NEWLINE expr_arm } DEDENT ;
+expr_arm      = 'when' pattern [ 'if' expr ] 'then' expr | 'else' 'then' expr ;
+unsafe_expr   = 'unsafe' '(' expr ')' ;
+literal       = int_literal | float_literal | bool_literal | char_literal
+              | text_literal | raw_text ;
+Disambiguation rules.
+1. a -> f(b) desugars to f(a, b) after parsing; f is resolved like any call.
+2. A comparison does not chain: a < b < c is E0210.
+3. try e binds like a prefix operator; try f(x).y parses as try (f(x).y)'s inner postfix first, i.e. try applies to the whole postfix expression.
+4. * and & as prefix are only valid on raw<T> values (dereference) and in &place (explicit borrow, used only at foreign and raw boundaries); ordinary borrowing is implicit (Part 4).
+5. A record_expr requires the name to resolve to a record type; otherwise { after a path is not parsed as a literal.
+Part 3. Types and the static type system
+3.1 Primitive types
+Type
+Size (bits)
+Domain
+Copyable
+Default value
+bool
+8
+false, true (only bit patterns 0 and 1 are valid)
+yes
+false
+char
+32
+Unicode scalar value (not a surrogate, ≤ U+10FFFF)
+yes
+'\0'
+byte, ubyte
+8
+two's-complement / unsigned
+yes
+0
+short, ushort
+16
+likewise
+yes
+0
+int, uint
+32
+likewise
+yes
+0
+long, ulong
+64
+likewise
+yes
+0
+size, ssize
+pointer width (64 on Tier-1)
+unsigned / signed object size
+yes
+0
+float, double
+32 / 64
+IEEE 754 binary32 / binary64
+yes
+0.0
+text
+2 × pointer width
+immutable UTF-8 view (pointer + byte count), always valid UTF-8
+yes
+""
+void
+0
+single value ()
+yes
+()
+[Decision] text is a borrowed, immutable string slice, not an owner. The owning string is std.text.string (a buffer<ubyte> with a UTF-8 invariant). String literals have type text and live in static storage.
+3.2 Composite types
+• Tuple (A, B, …): anonymous record with fields 0, 1, ….
+• Record: nominal product type. Field order is declaration order (see 3.6).
+• Variant: nominal sum type with named cases. Zero or more payload fields per case.
+• array<T,N>: N values of T inline, N a compile-time size.
+• option<T>: variant none | some(T). result<T,E>: variant ok(T) | err(E).
+• view<T>: { ptr: raw<T>, count: size }, a shared read-only borrow of count consecutive T.
+• span<T>: same shape, an exclusive mutable borrow.
+• buffer<T>: owning, growable contiguous storage { ptr, count, capacity }.
+• raw<T>: pointer carrying no ownership or borrow information (4.8). atomic<T>: T accessed only through atomic operations; T must be an integer, bool, raw<U> or a payload-free variant.
+• routine(A, B) gives R: pointer to a top-level routine; no environment.
+The overview's niche optimization for option<T> is a representation matter and must not be observable except through layout queries. The guaranteed niches are: option<view<T>>, option<span<T>>, option<text>, option<buffer<T>>, option<raw<T>> (null pointer) and option<bool>, option<char> (invalid bit patterns).
+3.3 Conversions
+[Decision] Paracine has no implicit numeric conversions. The only implicit typing steps are:
+1. Literal fitting. An unsuffixed literal takes the type demanded by context if its value is representable; otherwise E0301.
+2. Auto-borrow. A buffer<T>, array<T,N>, span<T> or string in an argument position expecting view<T> (or text) is borrowed implicitly as a shared view. A var place of those types in a position expecting span<T> is borrowed exclusively.
+3. Never-type coercion. fail, give, break, continue and calls to routines that cannot return have type never, which converts to any type.
+Explicit conversion is written e as T and is defined only in these cases:
+From → To
+Meaning
+integer → wider integer of same signedness
+exact
+integer → integer otherwise
+modular: result is e mod 2^w interpreted in the target type
+integer → float/double
+round-to-nearest-even
+float/double → integer
+truncate toward zero, saturating at the target range; NaN → 0
+float ↔ double
+round-to-nearest-even / exact
+char → uint
+scalar value
+uint → char
+not allowed; use std.text.char_from (returns option<char>)
+bool → integer
+0 or 1; the reverse is not allowed
+size ↔ ulong, ssize ↔ long
+identity on Tier-1 targets; integer rule elsewhere
+Anything else (text as int, buffer as view, …) is E0302. Checked and saturating alternatives live in std.num (7.4).
+3.4 Generics and capabilities
+Generics are monomorphized (as the overview requires): each generic definition is type-checked once against its where constraints, then each distinct instantiation is substituted and re-checked for code generation. A capability is a named set of routines a type must provide; it is Paracine's only abstraction mechanism for generics. There is no inheritance and no dynamic dispatch.
+capability ordered<T>
+    routine compare(a: T, b: T) gives ordering
+
+routine maximum<T>(a: T, b: T) gives T
+    where T is ordered
+    if compare(a, b) == ordering.less
+        give b
+    give a
+Capability satisfaction. A type T satisfies capability C if routines matching every member of C (with T substituted) are visible at the use site. Satisfaction is by name and signature; there are no separate impl blocks. [Decision] A member is looked up in (a) the module defining T, (b) the module defining C, (c) the current module, in that order; two candidates at the same level is E0340: ambiguous capability member.
+Built-in capabilities (defined in std.core, 7.2): equatable, ordered, hashable, copyable, defaultable, numeric, integer, floating, disposable, sendable, shareable. copyable, sendable and shareable are derived structurally by the compiler and cannot be hand-written; the rest are ordinary capabilities. numeric is satisfied by all integer and floating primitives.
+Const generics: routine fill<const N: size>(a: span<int>) is permitted; N must be a compile-time constant at every use site.
+3.5 Inference
+Inference is local and bidirectional:
+• let/var without annotation infer from the initializer. A literal initializer defaults to int/double.
+• Generic arguments are inferred from call arguments and the expected result type. If inference fails, write f::<T>(x).
+• Routine signatures, record fields and variant payloads are always fully annotated; there is no cross-routine inference.
+3.6 Layout
+Default layout: fields in declaration order, each at the next offset aligned to the field's natural alignment, with trailing padding to the record's alignment. [Decision] The compiler does not reorder fields. Attributes: @layout(c) (guaranteed identical to the C ABI struct), @packed(n) (maximum field alignment n), @align(n). A variant is laid out as a tag (the smallest unsigned integer that fits the case count, placed first) followed by a payload union aligned to its widest member, unless niche packing applies (3.2). Layout queries std.mem.size_of<T>, align_of<T> and offset_of<T>("field") are compile-time.
+Part 4. Ownership, borrowing and raw authority
+4.1 Vocabulary
+• A value occupies a place (a local, a field of a place, an element of an array, or storage reached through a buffer).
+• Every move-only value has exactly one owner place at any time.
+• A borrow is a temporary access path to a place: shared (read-only, many allowed) or exclusive (read-write, one allowed).
+• A region is the set of program points over which a borrow is live. Regions are computed by the compiler and are non-lexical: a borrow is live from creation until its last use. Paracine has no explicit lifetime parameters.
+4.2 Copy and move
+A type is copyable (structurally derived) iff it is a primitive, view<T>, raw<T> or a routine pointer, or a tuple, record, variant, array, option or result whose components are all copyable and which has no dispose routine. All other types are move-only: buffer<T>, span<T>, string, atomic<T>, any type with dispose, and any aggregate containing one.
+Using a copyable value copies it. Using a move-only value in a consuming position moves it. Consuming positions are: the right-hand side of let/var/assignment, an argument bound to an own parameter, give e, a record or variant constructor argument, an element of an array or tuple literal, and fail e. After a move the source place is uninitialized: reading it is E0401: use of moved value. A var place may be re-initialized by assignment. A move may be written explicitly (move x) for clarity; it is required only when passing to an own parameter while the same call also borrows the place elsewhere.
+Partial moves. A field of a local record may be moved out, leaving the record partially initialized. The record cannot then be used as a whole until the field is re-initialized, and it must not have a dispose routine (E0402).
+Conditional moves. Flow analysis tracks initialization per control-flow path. Where a place is moved on only some paths, the compiler allocates a hidden drop flag so cleanup runs exactly on the paths where the value is still owned.
+4.3 Parameter modes
+Declaration
+Mode
+Caller supplies
+Callee may
+x: T
+shared borrow
+any initialized place or rvalue
+read x; not move out, not mutate, not let the borrow outlive the call unless the result is tied (4.5)
+var x: T
+exclusive borrow
+a var place; the call site writes var place
+read and write x; the caller keeps ownership
+own x: T
+ownership transfer
+any value; move-only values are moved
+do anything; must dispose or move it onward before exit
+raw x: T
+raw authority
+an unsafe context
+use x as a raw pointer or raw-derived value
+For small copyable T a shared borrow may be passed by value. This is an implementation detail that cannot change semantics because the borrow is read-only.
+Results: gives T returns an owned value by move or copy. gives view<U> or gives span<U> returns a borrow (4.5).
+4.4 The aliasing rule
+For every place p at every program point:
+1. there may be any number of live shared borrows of p or exactly one live exclusive borrow of p, never both;
+2. while an exclusive borrow of p is live, p and its fields can be neither read nor written except through that borrow;
+3. while a shared borrow of p is live, p cannot be written, moved or re-initialized;
+4. borrowing a field borrows only that field (field-sensitive), but indexing is not: a[i] and a[j] are the same place unless range analysis proves i != j, or the program uses std.slice.split_at(var a, k) to obtain two disjoint spans.
+Violations: E0410: conflicting borrow, E0411: write while borrowed, E0412: move while borrowed.
+4.5 Returned borrows (region elision)
+A routine whose gives type is view<U>, span<U>, text, or a record/option/result containing one is borrow-returning. The returned borrow is tied to parameters by these rules, applied in order:
+1. If @from(p, q, …) appears on the routine, the result may borrow from exactly those parameters.
+2. Else if exactly one parameter is a borrow-mode parameter whose type is not a plain copyable scalar, the result borrows from it.
+3. Else if there is a first parameter named self, the result borrows from it.
+4. Else E0420: ambiguous borrow source; annotate with @from.
+A returned borrow stays live as long as its holder and must not outlive the owner of the borrowed place. A routine can never give a borrow of a local variable or own parameter (E0421).
+routine first_word(s: text) gives text        // rule 2: borrows from s
+    ...
+
+@from(a, b)
+routine pick(a: view<int>, b: view<int>) gives view<int>
+    ...
+4.6 Views, spans, slicing
+• x[a..b] has type view<T> in a shared context and span<T> in an exclusive context (an assignment target, a var argument, or a binding annotated span). Bounds are checked against x.count; failure traps (7.1) unless the compiler proves the range valid.
+• Creating a span from x requires an exclusive borrow of x (4.4 rule 1). A span is move-only, so it cannot be copied into two exclusive paths.
+• A buffer<T> operation that may reallocate (push, reserve, insert, clear, …) takes var buffer and therefore cannot be called while any view or span into that buffer is live (E0411). This eliminates iterator invalidation.
+4.7 Cleanup: disposable, defer, scope exit
+capability disposable<T>
+    routine dispose(var self: T)
+• A routine named dispose whose first parameter is var self: T and that gives void makes T disposable. dispose cannot fail.
+• Scope-exit actions run in reverse order of registration. Registration points are the initialization of a disposable local (schedules dispose) and each executed defer statement. Drop flags guard conditionally initialized or moved places.
+• For a record, dispose(self) runs first, then the fields are disposed in declaration order. For arrays and buffer, elements are disposed in index order, then storage is released.
+• Scope exit means any of: falling off the end of the block, give, fail, break, continue, or a propagating try. Cleanup runs after the returned value has been computed and moved into the return slot.
+• A trap (7.1) does not run cleanup.
+defer takes a single expression (defer close(h)) or an indented block. A deferred block may not use give, break, continue or try to leave itself. A deferred action sees variables as they are at scope exit, so a variable it uses must not have been moved away (E0431).
+4.8 Raw authority
+raw<T> is a machine pointer without ownership, borrow, bounds or lifetime. Its operations are unsafe except: copy, comparison, raw_null<T>(), is_null, and conversion to size.
+An unsafe block or an unsafe(expr) expression permits: dereference *p, indexed offset p[i], std.mem.read/write/copy/set, casts between raw<T> and raw<U>, taking &place as raw, calling foreign routines and with unsafe routines, reading and writing var static items, and std.mem.view_from_raw/span_from_raw.
+The unsafe contract. Within unsafe code the programmer guarantees: (a) validity: each read or write targets live storage of the correct size; (b) alignment: addresses satisfy the type's alignment (unless @packed); (c) initialization: reads see initialized bytes; (d) aliasing: a view/span created from raw authority obeys 4.4 for its lifetime; (e) provenance: a pointer is used only within the allocation it was derived from; (f) thread safety: no data races on non-atomic memory. A violation is erroneous execution: guarantees of this specification are lifted from that point. The compiler may assume the contract holds. All other Paracine behavior is fully defined; safe code has no undefined behavior.
+Safe encapsulation. A routine that contains unsafe blocks but whose signature has no with unsafe effect asserts that its callers cannot violate the contract through it. The compiler does not verify this claim. The standard library uses this to build buffer, string and atomics.
+4.9 Ownership and concurrency
+Two structurally derived capabilities govern threads:
+• sendable: a value of T may be moved to another thread. Copyable types are sendable except raw<T>, which is not unless the containing type carries @assert_sendable (an unsafe assertion). view<T> is sendable iff T is shareable; span<T> iff T is sendable. Records and variants are sendable iff all components are.
+• shareable: a shared borrow of T may be used by several threads at once. Primitives, atomic<T>, and immutable aggregates of shareable types are shareable; view<T> over shareable T is shareable; buffer<T> is shareable iff T is. Safe code has no non-atomic interior mutability, so no further rule is needed.
+A routine passed to std.thread.spawn is a routine pointer (no captures) and its arguments must be sendable. Borrows may cross threads only through std.thread.scope (7.9), whose structured join point guarantees every borrow is dead before the scope returns.
+4.10 Worked example
+record Packet
+    id: uint
+    body: buffer<ubyte>
+
+routine parse(input: view<ubyte>) gives result<Packet, parse_error>
+    if input.count < 4
+        fail parse_error.truncated
+    var body = std.mem.buffer_with_capacity<ubyte>(input.count - 4)
+    try body.push_all(input[4..input.count])
+    let id = read_u32_le(input[0..4])
+    give Packet { id: id, body: move body }
+
+routine consume(own p: Packet) gives uint
+    defer log_line("consumed")
+    give p.id          // p.body is disposed at scope exit
+body is moved into the Packet, so no drop runs for it in parse. p is owned by consume and disposed after the return value p.id has been copied out. If push_all fails, try returns the error and body is disposed by scope exit.
+Part 5. Formal semantics
+5.1 Judgment forms
+Let Γ be a typing environment mapping names to a type, a mode (let | var | own | borrow) and an initialization state. Let Σ be the table of routine signatures, record and variant definitions, and capability definitions. Let ρ be the routine result context (R) of the enclosing routine's declared gives type.
+Σ; Γ ⊢ e : T            expression e has type T
+Σ; Γ ⊢ s ⇝ Γ'          statement s is well-typed and yields environment Γ'
+Σ; Γ ⊢ p : T ⇝ Δ        pattern p matches type T, binding Δ
+Γ ⊢ place(e) : T, m     e is a place of type T accessible with mode m
+⊢ T copyable | T movable | T sendable | T shareable
+Rules are written premises / conclusion. "Fresh" and "live" regions are those of 4.1 and 4.4 and are checked by the borrow analysis, a separate pass over PCIR-before-optimization whose output is part of well-typedness.
+5.2 Typing rules (expressions)
+(T-Lit-Int)     literal n fits type T, T integer
+                --------------------------------
+                Γ ⊢ n : T
+
+(T-Var)         Γ(x) = (T, _, init)
+                --------------------------------
+                Γ ⊢ x : T
+
+(T-Arith)       Γ ⊢ a : T    Γ ⊢ b : T    T numeric    op ∈ {+,-,*,/,%}
+                -------------------------------------------------------
+                Γ ⊢ a op b : T
+
+(T-Bits)        Γ ⊢ a : T    Γ ⊢ b : T    T integer    op ∈ {&,|,^}
+                --------------------------------------------------------
+                Γ ⊢ a op b : T
+
+(T-Shift)       Γ ⊢ a : T    Γ ⊢ n : uint    T integer
+                --------------------------------------
+                Γ ⊢ a << n : T          (same for >>)
+
+(T-Cmp)         Γ ⊢ a : T    Γ ⊢ b : T    T is equatable (==, !=) or ordered (<, <=, >, >=)
+                ----------------------------------------------------------------------------
+                Γ ⊢ a cmp b : bool
+
+(T-Logic)       Γ ⊢ a : bool    Γ ⊢ b : bool
+                ------------------------------
+                Γ ⊢ a and b : bool          (likewise or; and Γ ⊢ not a : bool)
+
+(T-Cast)        cast (T → U) is in table 3.3
+                Γ ⊢ e : T
+                --------------------------------
+                Γ ⊢ e as U : U
+
+(T-Call)        Σ(f) = routine<α⃗>(m₁ x₁:T₁, …, mₙ xₙ:Tₙ) gives R where C
+                θ = unify(α⃗, args)    θ(α⃗) satisfy C
+                for each i: Γ ⊢ aᵢ : θ(Tᵢ) under mode mᵢ (4.3)
+                -------------------------------------------------------
+                Γ ⊢ f(a⃗) : θ(R)
+
+(T-Field)       Γ ⊢ e : S    S is record with field f : T    f visible (6.3)
+                -------------------------------------------------
+                Γ ⊢ e.f : T
+
+(T-Index)       Γ ⊢ e : X    X ∈ {array<T,N>, view<T>, span<T>, buffer<T>}    Γ ⊢ i : size
+                ----------------------------------------------------------------
+                Γ ⊢ e[i] : T
+
+(T-Slice)       as T-Index with i = a..b, a : size, b : size   ⇒   view<T> or span<T> by 4.6
+
+(T-Record)      S is record {f₁:T₁ … fₙ:Tₙ}    each fᵢ given exactly once or defaulted
+                Γ ⊢ eᵢ : Tᵢ
+                ---------------------------------------------------
+                Γ ⊢ S { fᵢ: eᵢ } : S
+
+(T-If-Expr)     Γ ⊢ c : bool    Γ ⊢ a : T    Γ ⊢ b : T
+                ------------------------------------------
+                Γ ⊢ if c then a else b : T
+
+(T-Choose)      Γ ⊢ s : S    for each arm (pᵢ [if gᵢ] then eᵢ):
+                Γ ⊢ pᵢ : S ⇝ Δᵢ,   Γ,Δᵢ ⊢ gᵢ : bool,   Γ,Δᵢ ⊢ eᵢ : T
+                arms are exhaustive (5.7)
+                ---------------------------------------------------
+                Γ ⊢ choose s { arms } : T
+
+(T-Pipe)        Γ ⊢ f(a, b⃗) : T          (a -> f(b⃗) is syntactic sugar, resolved before typing)
+
+(T-Try-Result)  Γ ⊢ e : result<T,E>    ρ = result<U,F>    conv(E → F)
+                -------------------------------------------------
+                Γ ⊢ try e : T          (effect: may exit with err(conv(e.err)))
+
+(T-Try-Option)  Γ ⊢ e : option<T>    ρ = option<U>
+                ----------------------------------
+                Γ ⊢ try e : T
+conv(E → F) holds iff E = F, or a routine from_error(e: E) gives F is visible at the try. try is a type error in a routine whose declared gives is neither result nor option (E0501).
+5.3 Typing rules (statements)
+(S-Let)         Γ ⊢ e : T    Γ ⊢ p : T ⇝ Δ    p irrefutable
+                --------------------------------------------
+                Γ ⊢ let p = e ⇝ Γ, Δ (all immutable)
+
+(S-Var)         Γ ⊢ e : T    x ∉ dom(Γ) in current scope
+                -------------------------------------
+                Γ ⊢ var x = e ⇝ Γ, x : (T, var, init)
+
+(S-Assign)      Γ ⊢ place(p) : T, var    Γ ⊢ e : T
+                ----------------------------------
+                Γ ⊢ p = e ⇝ Γ              (old value of p is disposed first, if disposable)
+
+(S-Give)        ρ = R    Γ ⊢ e : R'    wrap(R', R) holds   (5.5)
+                -------------------------------------------
+                Γ ⊢ give e ⇝ Γ⊥                (Γ⊥ = unreachable continuation)
+
+(S-Fail)        ρ = result<T,E>    Γ ⊢ e : E'    conv(E' → E)
+                ---------------------------------------------
+                Γ ⊢ fail e ⇝ Γ⊥
+
+(S-If)          Γ ⊢ c : bool    Γ ⊢ block₁ ⇝ Γ₁    Γ ⊢ block₂ ⇝ Γ₂
+                -----------------------------------------------
+                Γ ⊢ if c block₁ else block₂ ⇝ merge(Γ₁, Γ₂)
+
+(S-While)       Γ ⊢ c : bool    Γ ⊢ block ⇝ Γ'
+                -------------------------------
+                Γ ⊢ while c block ⇝ merge(Γ, Γ')
+
+(S-For)         Γ ⊢ e : X    X is iterable with item I (7.5)    Γ ⊢ p : I ⇝ Δ    Γ,Δ ⊢ block ⇝ Γ'
+                ---------------------------------------------------------------------------
+                Γ ⊢ for p in e block ⇝ merge(Γ, Γ')
+
+(S-Defer)       Γ ⊢ e : void (or any, discarded)
+                ---------------------------
+                Γ ⊢ defer e ⇝ Γ  and registers e on the scope-exit list
+
+(S-Unsafe)      Γ ⊢ block under unsafe ⇝ Γ'
+                -------------------------------
+                Γ ⊢ unsafe block ⇝ Γ'
+merge(Γ₁, Γ₂) takes, for each place, the less initialized state; a place moved in either branch is "maybe moved" and gets a drop flag (4.2). A routine body is well-typed only if every path ends in give, fail, a call of type never, or the routine gives void and falls off the end (implicit give). Falling off the end of a non-void routine is E0510.
+5.4 Operational semantics
+Machine state. A configuration is ⟨ σ, μ, κ, t ⟩ where σ is the store of locals (a map from variable-instance names to addresses), μ is the memory (a partial map from addresses to bytes, partitioned into stack, static, heap regions, each allocation having a unique id for provenance), κ is the continuation (a stack of frames and pending scope-exit actions) and t is the term being reduced (an expression or statement). Reduction is ⟨σ,μ,κ,t⟩ → ⟨σ',μ',κ',t'⟩ or terminates in one of done(v), trap(c) (with trap code c) or exit(n).
+Evaluation order. Evaluation is fully specified: operands and call arguments are evaluated strictly left to right; a place expression is evaluated to an address before the right-hand side of an assignment; a and b and a or b evaluate b only if needed; a choose evaluates the scrutinee once, then arms top to bottom, evaluating the guard only if the pattern matches. A pipeline a -> f(b) evaluates a before b.
+Representative rules (small-step, abbreviated notation e → e' under evaluation context E):
+(E-Ctx)      e → e'                    (E-Add)     n₁ + n₂  →  wrap_w(n₁ + n₂)
+             ---------------
+             E[e] → E[e']
+
+(E-Div)      n₂ ≠ 0           n₁ / n₂  →  wrap_w(trunc(n₁ ÷ n₂))
+             n₂ = 0           n₁ / n₂  →  trap(DivideByZero)
+
+(E-If)       if true  then a else b → a        if false then a else b → b
+
+(E-Let)      ⟨σ,μ,κ, let x = v; s⟩ → ⟨σ[x↦a], μ[a↦v], κ, s⟩     a fresh stack address
+
+(E-Call)     push frame(f, return address, scope-exit list = []),
+             bind each parameter per its mode:
+               shared / var: parameter = address of the argument place (or of a temporary)
+               own:          parameter = moved value (source place becomes uninitialized)
+
+(E-Give)     run scope-exit list of every enclosing scope of the frame in LIFO order,
+             then pop frame and deliver v (wrapped per 5.5)
+
+(E-Try-Ok)   try ok(v) → v
+(E-Try-Err)  try err(e) → fail conv(e)      (so scope-exit actions run, then the routine returns err)
+(E-Try-Some) try some(v) → v          (E-Try-None) try none → give none
+
+(E-Index)    0 ≤ i < count     a[i] → load(base(a) + i·sizeof(T))
+             otherwise          a[i] → trap(Bounds)
+The moves described by rule E-Call and E-Let are the point at which "source becomes uninitialized" (4.2) is realized; a conforming implementation may elide the physical copy but not the logical effect.
+5.5 Result and option wrapping
+In a routine whose declared type is result<T,E>:
+• give e with e : T produces ok(e); with e : result<T,E> it returns e unchanged. If both interpretations apply (when T = result<T,E>, impossible by finiteness) the program is ill-formed.
+• fail e with e : E (after conversion) produces err(e).
+• falling off the end is allowed only if T = void, and produces ok(()).
+In a routine whose declared type is option<T>: give e with e : T produces some(e); give none produces none; give of an option<T> value returns it unchanged.
+The predicate wrap(R', R) of S-Give holds iff R' = R, or R = result<R',E>, or R = option<R'>.
+5.6 Arithmetic, floating point and conversions
+For an integer type of width w and signedness s, write wrap_w(n) = ((n mod 2^w) interpreted as s).
+• + - * are modular: a op b = wrap_w(a op b) evaluated over the mathematical integers. This is the "defined two's-complement result" the Paracine overview requires; the signed and unsigned operations are bit-identical.
+• Unary - on T: wrap_w(0 - a); ~a is bitwise complement.
+• / truncates toward zero; a % b has the sign of a with a == (a / b) * b + a % b. b == 0 traps DivideByZero. For signed T, MIN / -1 = MIN and MIN % -1 = 0 (both defined, no trap).
+• << and >> use the shift count modulo w (n & (w-1)). >> is arithmetic for signed and logical for unsigned types.
+• Comparisons on integers are exact; on bool, false < true; on char, by scalar value.
+• float/double follow IEEE 754-2019 with round-to-nearest-even, no flush-to-zero, no contraction (a*b+c is never fused unless written with std.num.fused_mul_add) and no reassociation unless the routine or module carries @fastmath, in which case the compiler may assume no NaN/Inf and may reassociate. == on floats is IEEE equality (NaN != NaN). The ordered capability for floats uses the total order of std.num.total_cmp; the operator < uses IEEE comparison.
+• Conversions follow table 3.3.
+Compile-time evaluation of these operators must produce identical results to run-time evaluation (this is required for constant folding to be semantics-preserving).
+5.7 Pattern matching and exhaustiveness
+choose arms are tried top-to-bottom. Exhaustiveness is decided by the standard usefulness algorithm on the pattern matrix:
+1. Let P be the matrix of arm patterns for arms without guards (guarded arms are ignored for exhaustiveness, because a guard may be false).
+2. A wildcard row (_ ) is useful with respect to P if some value of the scrutinee type is matched by it but by no row of P.
+3. The choose is exhaustive iff the wildcard is not useful.
+4. Constructors: for a variant, one per case; for bool, true and false; for tuples/records, a single constructor; for option and result, their two cases; for integers and char, ranges (exhaustive only if the ranges cover the whole type; otherwise an else arm is required).
+5. An arm that is not useful (already covered by earlier arms) is W0520: unreachable arm and is not an error.
+A non-exhaustive expression-form choose is E0521; a non-exhaustive statement-form choose over a variant, option, result, or bool is also E0521; over integers, text or char without else, E0522.
+5.8 Constant evaluation
+const initializers, array lengths, const generic arguments, @align and similar contexts use const expressions: any expression using only literals, const items, calls of routines marked with pure that do not use unsafe, foreign, alloc, io, thread, or trap effects reachable from the call, and pure standard-library routines. Const evaluation is deterministic and obeys 5.6 exactly. A trap during const evaluation is a compile-time error E0530. A step limit (default 10⁷ reductions, overridable by @const_steps(n)) bounds the evaluation; exceeding it is E0531.
+5.9 Memory model
+• Safe code has no data races, by 4.9 and 4.4. Therefore a safe program is sequentially consistent per thread with respect to non-atomic memory, and the only cross-thread communication is through atomics, joins, channels and the other std.thread primitives.
+• Atomic operations carry an ordering from relaxed, acquire, release, acq_rel, seq_cst; the default for all std.atomic operations is seq_cst. The synchronizes-with, happens-before and coherence relations are those of the C++20 memory model; the Paracine backend is required to implement exactly that model, which is what makes the C++20 output backend's translation of atomics faithful.
+• Thread creation and join are release/acquire edges. Mutex unlock/lock pairs, channel send/receive pairs and std.thread.scope exit are likewise.
+• A data race on non-atomic memory (possible only via unsafe code) is erroneous execution (4.8).
+5.10 Traps
+A trap is a defined, deterministic abnormal termination. Trap codes: Bounds, DivideByZero, Overflow (only from explicit checked operations that choose to trap), Unreachable (std.core.unreachable()), Assertion, OutOfMemory (from infallible allocation), StackExhausted, InvalidEnum (reserved for foreign data). On a trap the runtime calls the trap handler (default: write a one-line diagnostic with the code and source location to the error stream, then terminate the process with exit code 0xC0000409 on Windows or abort-equivalent elsewhere). Handlers are replaceable (std.core.set_trap_handler) but must not return. Traps do not run defer/dispose actions: they are not exceptions.
+Precise traps. If an operation traps, all observable effects that precede it in the evaluation order have happened and none that follow it have. The optimizer may reorder or eliminate non-trapping pure operations, and may eliminate a trap only if it proves the trap condition false. It may not move an observable effect across a possible trap.
+5.11 Observable behavior and backend equivalence
+The observable behavior of a program is the sequence of: (a) calls to foreign routines and std.io/std.sys operations with their arguments, (b) reads and writes of volatile locations and std.mem.volatile_* operations, (c) atomic operations with their orderings, (d) the exit code or the trap code with its location, and (e) the final contents of any memory passed to or reachable from foreign code at each foreign call. A conforming implementation (any backend) must produce a program whose observable behavior is one of those permitted by 5.4 to 5.10 (the as-if rule). Differences allowed by the overview's phrase "explicitly documented target-platform properties" are limited to: pointer width, size range, endianness (little on Tier-1), the text of trap diagnostics, thread scheduling, and the values of std.mem.address_of results.
+Consequences for backends:
+• The C++20 backend must emit explicit sequencing wherever C++ leaves evaluation order unspecified (function arguments, operands), and must use unsigned arithmetic and explicit conversion helpers for 5.6.
+• Both backends must implement shift masking, saturating float-to-int casts, and MIN / -1 as defined here, even where the hardware or C++ would differ.
+• Floating-point contraction must be disabled in emitted C++ (#pragma STDC FP_CONTRACT OFF plus per-compiler flags documented in the emitted header) and in the native backend, unless @fastmath.
+5.12 Soundness statement
+Theorem (progress and preservation, safe subset). If ⊢ P : ok (the program type-checks and passes the borrow/init analysis) and contains no unsafe code outside the standard library, then for every reachable configuration, either the term is a value, or it can reduce, or it has trapped with a trap code from 5.10, or it has exited. Moreover, every reduction preserves typing, uniqueness of owners, and the aliasing rule 4.4; no reachable configuration has a read of uninitialized or moved memory, an out-of-bounds access, a double dispose, or a data race.
+Proof obligations (for a mechanized definition): (1) a substitution lemma for generic instantiation; (2) preservation of the initialization lattice under merge; (3) a borrow-region invariant: for every live borrow, its owner place is initialized and not mutated except through that borrow; (4) cleanup soundness: along every path each owned value is disposed at most once and exactly once if reachable at scope exit. These are stated here as the verification targets for the reference compiler's test suite and any formalization effort; this document does not contain the machine-checked proof.
+Part 6. The module system
+6.1 Units of organization
+Unit
+Definition
+File
+One .pcn source file. Exactly one module.
+Module
+A named namespace of items (routines, types, constants, capabilities, nested imports). Its name is declared by module a.b.c and must equal the file's path relative to the package source root: src/a/b/c.pcn.
+Package
+A tree of modules with a manifest paracine.toml. The unit of versioning, dependency, distribution and linking.
+Workspace
+A set of packages built together with one lockfile.
+A module a.b may have child modules a.b.c (file src/a/b/c.pcn). A child is an ordinary module; being nested grants it no special access to its parent's private items. [Decision] The module graph is a flat namespace tree for naming only; access is governed by 6.3, never by nesting.
+6.2 Name resolution
+Inside a module, an identifier is resolved by searching these scopes from innermost to outermost; the first scope that contains the name wins, and an ambiguity within one scope is E0602:
+1. local variables and parameters (innermost block first);
+2. generic parameters of the enclosing routine or type;
+3. items declared in the current module (item order is irrelevant: any item may be used before its declaration, in any module);
+4. names introduced by import ... .{ ... } or import ... as ...;
+5. the prelude: the names exported by std.prelude (7.2), implicitly imported into every module;
+6. otherwise E0603: unresolved name.
+A qualified name m.x resolves m first as a module alias or an imported module path, then x within it. A local variable may shadow an item or an import; two items in the same module with the same name are E0604 (routines may be overloaded by arity or distinct parameter types, but not by return type, and overload resolution is exact-match on the argument types after literal fitting and auto-borrow, with no ranking: zero matches is E0610, more than one is E0611).
+6.3 Visibility
+Every item has one of three visibilities:
+Spelling
+Visible to
+Appears in generated .hpp/.h, DLL export table
+(none)
+the declaring module only
+no
+public
+every module in the same package
+no
+export
+every module in the package and every dependent package
+yes
+export implies public. An export item may mention only export types in its signature (E0620); a public item may mention only public or export types. Record fields have their own modifier: a field without public is private to the declaring module. A record with any private field can be constructed with T { … } only inside its own module; elsewhere it must be built through that module's routines. A record whose fields are all public is transparent. Variants are always transparent to every module that can see them (pattern matching requires the cases to be visible). To hide a variant's structure, wrap it in a one-field record with a private field.
+@opaque on an exported record makes its size and layout unavailable to dependents: dependents may hold it only by raw<T>/view<T>/span<T> or through routines of its module. This is the stable-ABI mechanism for DLL boundaries.
+6.4 Imports and re-exports
+import std.text                       // use as text.join(...)
+import std.text as t                  // use as t.join(...)
+import std.collections.{map, set}     // use as map<...>, set<...>
+import std.collections.{map as dict}
+import std.num.*                      // glob; permitted only if the module is marked @glob_ok
+public import std.math                // re-export to package
+export import vendor.widgets.core     // re-export to dependents
+Grammar amendment (replaces the import_decl rule of 2.1):
+import_decl = [ visibility ] 'import' module_path [ 'as' identifier ]
+            | [ visibility ] 'import' module_path '.' '{' import_list '}'
+            | [ visibility ] 'import' module_path '.' '*' ;
+Imports are not transitive: importing a does not make a's own imports visible, except for names a re-exports. An import of a module that does not exist is E0605; importing an item that is not visible is E0606. Unused imports are W0607.
+Acyclicity. The graph of import edges between modules must be a DAG (E0608: import cycle, with the cycle printed). Mutually recursive items must live in the same module. This rule makes each module's interface (6.6) computable in dependency order and enables parallel, incremental compilation.
+6.5 Packages and the manifest
+[package]
+name     = "acme.net"            # globally unique, dotted
+version  = "1.4.2"               # semantic version
+edition  = "2026"                # language edition (6.9)
+kind     = "lib"                 # app | lib | dll | static
+root     = "src"
+
+[dependencies]
+"acme.bytes" = "^2.1"
+"vendor.zlib" = { version = "1.3", kind = "static", path = "../zlib" }
+
+[features]
+default = ["tls"]
+tls     = ["acme.crypto"]
+
+[target.windows-x86_64]
+linker_inputs = ["ws2_32.lib"]
+
+[profile.release]
+opt   = 3
+trap  = "abort"
+emit  = ["obj", "exe"]
+
+[profile.portable]
+emit  = ["cpp"]
+• Dependency resolution follows semantic versioning; the resolver picks the highest version satisfying all constraints and writes the full graph with content hashes to paracine.lock. Builds use the lockfile when present (this supplies the "library versions" field the overview requires for reproducible builds, 50).
+• Features are additive; enabling a feature enables the @feature("name")-guarded items and the optional dependencies it names. Features never change the meaning of an item that exists without them.
+• Kinds. app produces an executable (.exe) and has an entry point (6.7); lib produces .obj modules plus an interface bundle for Paracine clients; static additionally archives them as .lib; dll produces a PE image with an export table from export items and @export_name. Any kind may also emit cpp (with .hpp).
+• Build scripts do not exist. [Decision] Code generation happens through ordinary Paracine programs invoked by the build tool as explicit pipeline steps ([[step]] tables), never through arbitrary code in the compiler.
+6.6 Compilation units, interfaces and generics
+A module compiles to one object unit and one interface unit (.pci, a canonical binary or text file). The interface contains: all public and export declarations with their resolved types; the bodies of every generic item and of every routine marked @inline; capability definitions; constants; layout facts for non-@opaque records; and a hash of all of the above.
+• A dependent is recompiled only if the interface hash of something it imports changes (early cut-off).
+• Generic instantiation happens in the using unit (the generic body comes from the interface). The instance is emitted with COMDAT / linkonce semantics under a mangled name that includes the type arguments, so identical instances from different units fold at link time. This also guarantees that the textual (.cpp) backend, where each unit is a translation unit, can emit each instance as an inline function in a pcn_ namespace without ODR violations.
+• Whole-program optimization (--lto) merges PCIR of all modules in the package and its dependencies before optimization and may inline, specialize and remove dead public items. Exported items are always preserved.
+6.7 Symbols, linking, entry point
+Name mangling (for .obj and .exe): pcn$<package>$<module>$<item>[$<instance-hash>], with the signature hash included for overloaded routines. Packages and modules use . → $ replacement. @export_name("SomeName") on an export routine replaces the mangled name with a C-style unmangled one (required for foreign interop and DLL exports). Generated .hpp headers declare mangled routines inside namespace pcn and @export_name routines inside extern "C".
+Foreign declarations. foreign c routine puts(s: raw<ubyte>) gives int declares a routine with the Microsoft x64 C calling convention (c = the platform's C ABI; msx64 forces Microsoft x64 on any host). An optional from "kernel32.dll" clause records the import library/DLL for the PE import table. Calling a foreign routine requires unsafe; a safe wrapper is usually provided by the declaring module. Argument and result types must be C-compatible: integers, float, double, bool (as 8-bit), raw<T>, @layout(c) records of C-compatible fields, routine pointers.
+Entry point. An app package's root module main defines exactly one routine named main, with any of these signatures:
+routine main() gives int
+routine main() gives void
+routine main(args: view<text>) gives int
+routine main() gives result<void, E>      where E is printable
+int is the process exit code. void exits 0. result<void,E>: ok exits 0, err(e) prints e to the error stream and exits with 1. The runtime start-up sequence is: (1) initialize the standard streams and the argument view, (2) install the default trap handler, (3) call main, (4) flush standard streams, (5) exit. There is no dynamic initialization before main: var static initializers and constants are compile-time (5.8) and live in .data/.rdata.
+Linking inputs (7 of the overview, 57): Paracine .obj, compatible COFF .obj, static .lib, import .lib, and DLL imports. Symbol conflicts between a Paracine definition and a foreign one with the same final name are E0630 at link time. Unused sections are removed (--gc-sections default in release).
+6.8 Standard library as a package
+std is an implicit dependency of every package, versioned with the compiler (6.9), provided in four realizations (Paracine source, C++20 source, COFF objects, intrinsics), per the overview, 58. The same source defines all realizations; the build selects the realization appropriate to the output form. A package may opt out with no_std = true in the manifest, in which case only the core subset (7.2) and the types of 3.2 are available and nothing in the library may allocate or perform I/O (freestanding / kernel / embedded use).
+6.9 Editions, stability, deprecation
+• An edition ("2026") fixes the keywords, grammar and prelude. A package states its edition; the compiler can compile packages of different editions together because editions affect only front-end interpretation, and PCIR is edition-free.
+• std follows semantic versioning tied to the compiler release; items are marked @stable("1.0"), @unstable("feature"), or @deprecated("1.3", "use x instead"). An unstable item is usable only when the package enables the feature in its manifest.
+• A breaking change to the language requires a new edition. New library items and diagnostics may be added in minor releases.
+6.10 Tests and documentation
+test "name" blocks are removed from every build except pcn test. A test block can see its own module's private items. A test passes if it returns normally and fails if it traps or assert fails. /// doc comments attach to the following item; pcn doc generates a documentation site; code blocks in doc comments marked example are compiled and run by pcn test as doctests.
+6.11 Diagnostics summary for Part 6
+Code
+Meaning
+E0601
+module path does not match file location
+E0602
+ambiguous name
+E0603
+unresolved name
+E0604
+duplicate item
+E0605 / E0606
+missing module / invisible item
+E0608
+import cycle
+E0610 / E0611
+no matching / ambiguous overload
+E0620
+exported signature mentions non-exported type
+E0630
+duplicate symbol at link time
+Part 7. The standard library
+7.1 Organization and tiers
+The library is one package, std, in three tiers selected by manifest flags (6.8):
+Tier
+Modules
+Needs allocator
+Needs OS
+core
+std.core, std.prelude, std.mem (non-allocating part), std.num, std.math, std.slice, std.iter, std.atomic, std.hash, std.fmt (formatting to a caller-provided span), std.simd, std.text (text/char operations)
+no
+no
+alloc
+std.mem (allocators, arenas), std.buffer, std.text.string, std.collections, std.sort (stable)
+yes
+no
+std
+std.io, std.fs, std.path, std.env, std.time, std.thread, std.sync, std.process, std.random (OS entropy), std.win (Win32 bindings), std.test
+yes
+yes
+Conventions used throughout this part. Signatures are written in Paracine. self is the first parameter of an operation on a type and is written with its mode: self: view<T> is read-only, var self: T exclusive, own self: T consuming. A routine called with dot syntax x.f(a) is sugar for f(x, a) when f is declared in the module that defines the type of x or imported with it; there are no methods and no impl blocks. Growing operations are fallible and give result<void, alloc_error>; constructors that allocate eagerly (buffer_with_capacity, string_from) trap with OutOfMemory on failure and each has a try_ counterpart that gives a result. A single-element borrow is view<T> / span<T> with count == 1 and is aliased as ref<T> / mut<T> (read with r[0]).
+7.2 std.core and the prelude
+Prelude (implicitly imported). Types: all primitives, option, result, view, span, buffer, array, raw, atomic, string, ordering, alloc_error. Routines: print, println, eprint, eprintln, format, assert, assert_eq, unreachable, min, max, swap. Capabilities: equatable, ordered, hashable, defaultable, disposable, printable, copyable, sendable, shareable, iterator.
+Core capabilities.
+capability equatable<T>
+    routine equals(a: T, b: T) gives bool
+
+variant ordering
+    less
+    equal
+    greater
+
+capability ordered<T>
+    routine compare(a: T, b: T) gives ordering      // requires equatable<T> consistently
+
+capability hashable<T>
+    routine hash(v: T, var h: hasher)
+
+capability defaultable<T>
+    routine default() gives T
+
+capability printable<T>
+    routine format(v: T, var out: formatter) gives result<void, fmt_error>
+
+capability numeric<T>      // satisfied by all integer and floating primitives
+capability integer<T>      // integer primitives
+capability floating<T>     // float, double
+== and != on a type T call equals (and are built in for primitives, text, bool, char, and for tuples/records/variants whose components are equatable and which carry @derive(equatable)). Likewise < etc. call compare and @derive(ordered) compares fields lexicographically in declaration order (variant: by case index, then payload). @derive(hashable, printable, defaultable) are also available. There is no automatic derivation without the attribute, so equality is never silently structural.
+option<T> operations (module std.core):
+routine is_some(self: option<T>) gives bool
+routine is_none(self: option<T>) gives bool
+routine unwrap(own self: option<T>) gives T                    // traps Assertion on none
+routine expect(own self: option<T>, why: text) gives T         // traps with message
+routine unwrap_or(own self: option<T>, own fallback: T) gives T
+routine map<T, U>(own self: option<T>, f: routine(T) gives U) gives option<U>
+routine and_then<T, U>(own self: option<T>, f: routine(T) gives option<U>) gives option<U>
+routine ok_or<T, E>(own self: option<T>, own e: E) gives result<T, E>
+routine take(var self: option<T>) gives option<T>              // leaves none behind
+routine as_ref(self: option<T>) gives option<ref<T>>
+result<T,E> operations: is_ok, is_err, unwrap (traps if err), unwrap_err, unwrap_or, map, map_err, and_then, ok(own self) gives option<T>, err(own self) gives option<E>.
+Traps and assertions (module std.core):
+routine trap(code: trap_code)                gives never
+routine assert(cond: bool, why: text = "")   // traps Assertion if false; kept in all profiles
+routine debug_assert(cond: bool, why: text = "")  // removed when profile has debug = false
+routine unreachable()                        gives never
+routine set_trap_handler(h: routine(trap_code, text) gives never)
+Errors. Standard error types are small variants that satisfy printable: alloc_error, parse_error, fmt_error, io_error, bounds_error. io_error carries a stable kind (not_found, permission_denied, already_exists, interrupted, would_block, invalid_input, unexpected_eof, other) and an OS code (ulong).
+7.3 std.mem, std.buffer, std.slice
+Core memory routines.
+routine size_of<T>() gives size                      // compile-time
+routine align_of<T>() gives size
+routine offset_of<T>(field: text) gives size
+routine swap(var a: T, var b: T)                     // exchange two places
+routine replace(var dest: T, own value: T) gives T   // returns the old value
+routine take(var dest: T) gives T where T is defaultable
+routine forget(own v: T)                             // no dispose runs; safe but leaks
+routine read<T>(p: raw<T>) gives T                   with unsafe
+routine write<T>(p: raw<T>, own v: T)                with unsafe
+routine copy_bytes(dst: raw<ubyte>, src: raw<ubyte>, n: size)    with unsafe
+routine set_bytes(dst: raw<ubyte>, value: ubyte, n: size)        with unsafe
+routine view_from_raw<T>(p: raw<T>, n: size) gives view<T>       with unsafe
+routine span_from_raw<T>(p: raw<T>, n: size) gives span<T>       with unsafe
+routine volatile_read<T>(p: raw<T>) gives T                      with unsafe
+routine volatile_write<T>(p: raw<T>, own v: T)                   with unsafe
+Allocation. There is one replaceable global allocator; the default maps to HeapAlloc/HeapFree on Windows. The allocator capability is allocate(var a: A, size: size, align: size) gives raw<ubyte> (null on failure) and deallocate(var a: A, p: raw<ubyte>, size: size, align: size). Provided allocators: global_allocator, arena (bump allocation; reset(var a) frees everything; disposing the arena releases its blocks), pool<T> (fixed-size slots), stack_allocator<N> (inline storage). Containers take an optional allocator type parameter defaulting to global_allocator (e.g. buffer<T> is buffer_in<T, global_allocator>).
+buffer<T> (owning, contiguous, T any type; elements are disposed on removal):
+routine buffer_new<T>() gives buffer<T>                           // no allocation
+routine buffer_with_capacity<T>(n: size) gives buffer<T>          // traps on OOM
+routine try_buffer_with_capacity<T>(n: size) gives result<buffer<T>, alloc_error>
+routine buffer_from<T>(items: view<T>) gives buffer<T>  where T is copyable
+routine count(self: buffer<T>) gives size
+routine capacity(self: buffer<T>) gives size
+routine is_empty(self: buffer<T>) gives bool
+routine as_view(self: buffer<T>) gives view<T>                    // @from(self)
+routine as_span(var self: buffer<T>) gives span<T>                // @from(self)
+routine push(var self: buffer<T>, own x: T) gives result<void, alloc_error>
+routine push_all(var self: buffer<T>, xs: view<T>) gives result<void, alloc_error>   where T is copyable
+routine pop(var self: buffer<T>) gives option<T>
+routine insert(var self: buffer<T>, at: size, own x: T) gives result<void, alloc_error>
+routine remove(var self: buffer<T>, at: size) gives T            // traps Bounds if out of range
+routine truncate(var self: buffer<T>, n: size)
+routine clear(var self: buffer<T>)
+routine reserve(var self: buffer<T>, extra: size) gives result<void, alloc_error>
+routine shrink_to_fit(var self: buffer<T>)
+Growth uses the factor 2 policy and is amortized O(1). buffer<T> indexes with b[i] (bounds-checked) and slices with b[a..b] as in 4.6.
+Slices (std.slice, operating on view<T>/span<T>):
+routine count(self: view<T>) gives size
+routine first(self: view<T>) gives option<ref<T>>     // @from(self)
+routine last(self: view<T>) gives option<ref<T>>
+routine split_at(self: view<T>, k: size) gives (view<T>, view<T>)
+routine split_at(var self: span<T>, k: size) gives (span<T>, span<T>)   // the disjoint-span primitive (4.4)
+routine chunks(self: view<T>, n: size) gives chunk_iter<T>
+routine windows(self: view<T>, n: size) gives window_iter<T>
+routine contains(self: view<T>, x: T) gives bool        where T is equatable
+routine find(self: view<T>, x: T) gives option<size>    where T is equatable
+routine copy_from(var dst: span<T>, src: view<T>)       // counts must match, else traps Bounds
+routine fill(var dst: span<T>, x: T)                    where T is copyable
+routine reverse(var s: span<T>)
+routine swap_at(var s: span<T>, i: size, j: size)
+routine binary_search(self: view<T>, x: T) gives result<size, size>   where T is ordered
+7.4 std.num and std.math
+For every integer type T (with T replaced accordingly):
+routine checked_add(a: T, b: T) gives option<T>      // also sub, mul, div, rem, neg, shl, shr, pow
+routine wrapping_add(a: T, b: T) gives T             // identical to the + operator; provided for clarity
+routine saturating_add(a: T, b: T) gives T           // also sub, mul
+routine overflowing_add(a: T, b: T) gives (T, bool)  // wrapped result and overflow flag
+routine abs(a: T) gives T                            // signed: MIN stays MIN
+routine abs_diff(a: T, b: T) gives (unsigned counterpart of T)
+routine min(a: T, b: T) gives T                      // max, clamp(x, lo, hi)
+routine pow(a: T, e: uint) gives T                   // wrapping
+routine gcd(a: T, b: T) gives T
+routine count_ones(a: T) gives uint                  // also count_zeros, leading_zeros, trailing_zeros
+routine rotate_left(a: T, n: uint) gives T           // also rotate_right
+routine swap_bytes(a: T) gives T                     // also to_le/to_be/from_le/from_be
+routine is_power_of_two(a: T) gives bool             // unsigned only; next_power_of_two
+routine parse<T>(s: text, radix: uint = 10) gives result<T, parse_error>
+For float and double: sqrt floor ceil round trunc abs copysign is_nan is_inf is_finite min max clamp, fused_mul_add(a,b,c), total_cmp(a,b) gives ordering, to_bits/from_bits, and the constants PI, E, TAU, EPSILON, MAX, MIN_POSITIVE, INFINITY, NAN. std.math adds sin cos tan asin acos atan atan2 sinh cosh tanh exp exp2 log log2 log10 pow cbrt hypot, correctly rounded for sqrt and within 1 ulp for the others (the exact algorithms are part of the library version so that results are identical in every backend: the library supplies its own implementations rather than calling the host C library, to satisfy the equivalence requirement of 5.11).
+The +, -, * operators are the wrapping operations (5.6). Code that must detect overflow uses the checked_* family; there is no "overflow trap" mode that changes +, so program meaning never depends on a build profile.
+7.5 Iteration and pipelines (std.iter)
+capability iterator<I, T>
+    routine next(var it: I) gives option<T>
+For a capability with several parameters, the first parameter is the constrained subject and the rest are written in the constraint: where I is iterator<T> means I satisfies iterator<I, T>.
+The for statement. for p in e block is defined by desugaring:
+1. If e : view<T>, array<T,N> (by view), or buffer<T> (by view): iterate positions 0..count, binding p to a read-only borrow of the element (a copy for scalars).
+2. If e : span<T> and the loop is written for var x in e: binds x as an exclusive borrow of each element in turn. Exclusive borrows of different elements do not overlap since each is dead before the next begins.
+3. If e : range (from a..b or a..=b on any integer type): yields integers.
+4. If e : I where I is iterator<T>: var it = e; loop { choose next(var it) { when some(p) then block; when none then break } }.
+Because the loop holds a borrow on e for its entire duration, the aliasing rule 4.4 forbids growing or clearing a buffer while iterating it.
+Adapters. Every adapter is an ordinary generic routine that consumes an iterator and gives a new concrete iterator type. Parameters that would be closures are routine pointers (no captures); extra context is passed via an explicit state argument.
+routine iter(self: view<T>) gives view_iter<T>
+routine map<I, T, U>(own it: I, f: routine(T) gives U) gives map_iter<I, T, U>   where I is iterator<T>
+routine filter<I, T>(own it: I, f: routine(view<T>) gives bool) gives filter_iter<I, T>
+routine take(own it: I, n: size) gives take_iter<I>        // also skip, step_by, chain, zip, enumerate, rev (double-ended only), peekable
+routine fold<I, T, A>(own it: I, own init: A, f: routine(A, T) gives A) gives A
+routine sum(own it: I) gives T            where T is numeric
+routine count(own it: I) gives size
+routine any(own it: I, f: routine(T) gives bool) gives bool    // also all, find, position
+routine min_by_key / max_by_key(...)
+routine collect<I, T>(own it: I) gives result<buffer<T>, alloc_error>
+routine collect_into(own it: I, var out: buffer<T>) gives result<void, alloc_error>
+Pipelines. x -> f(a) means f(x, a) (2.6). Thus:
+let total = numbers
+    -> iter()
+    -> filter(is_even)
+    -> map(square)
+    -> sum()
+Fusion guarantee. Adapter chains over built-in sources are semantically a sequence of next calls, and every adapter is @inline. PCIR is required to fuse a chain whose adapters are all from std.iter and whose final consumer is sum, count, fold, any, all, find, collect_into or a for loop into a single loop with no intermediate storage; this is the "pipeline fusion" the overview refers to, and conformance tests check that the emitted code for such chains contains no allocation and no per-element call.
+7.6 Text, characters and formatting (std.text, std.fmt)
+Model. text is immutable valid UTF-8; string is the owning, growable counterpart (record string wrapping a buffer<ubyte> with the UTF-8 invariant, private field). Offsets are byte offsets and must fall on scalar boundaries, otherwise the operation traps Bounds. There is no implicit indexing by character.
+routine count_bytes(self: text) gives size            // `count` is reserved for slices; text has count_bytes / count_chars
+routine count_chars(self: text) gives size            // O(n)
+routine is_empty(self: text) gives bool
+routine slice(self: text, a: size, b: size) gives text    // @from(self); traps on non-boundary
+routine starts_with(self: text, p: text) gives bool       // also ends_with, contains
+routine find(self: text, p: text) gives option<size>      // byte offset; also rfind
+routine split(self: text, sep: text) gives split_iter     // iterator<split_iter, text>
+routine lines(self: text) gives lines_iter
+routine chars(self: text) gives char_iter                 // iterator<char_iter, char>
+routine trim(self: text) gives text                       // also trim_start, trim_end
+routine eq_ignore_case(a: text, b: text) gives bool       // ASCII case folding
+routine to_upper / to_lower(self: text) gives result<string, alloc_error>   // full Unicode simple mapping
+routine char_from(u: uint) gives option<char>
+routine encode_utf8(c: char, out: span<ubyte>) gives size   // writes 1..4 bytes
+routine decode_utf8(bytes: view<ubyte>) gives option<(char, size)>
+routine validate_utf8(bytes: view<ubyte>) gives bool
+routine text_from_utf8(bytes: view<ubyte>) gives option<text>      // @from(bytes)
+char predicates: is_digit(radix), is_alpha, is_alnum, is_whitespace, is_upper, is_lower, to_digit(radix) gives option<uint>, len_utf8. string operations: string_new, string_from(text), try_string_from, as_text(self: string) gives text (@from self), push_text(var, text) and push_char(var, char) (fallible), clear, truncate(at), reserve, join(parts: view<text>, sep: text) gives result<string, alloc_error>.
+Where a string appears where text is expected, auto-borrow (3.3 item 2) applies.
+Formatting. format, print, println, eprint, eprintln are compiler intrinsics with a literal first argument:
+println("point = ({}, {}), hex = {:08x}", p.x, p.y, flags)
+let s = format("{:>10.3}", ratio)      // gives result<string, alloc_error>
+• The format text must be a literal (E0701 otherwise); the number and types of arguments are checked at compile time (E0702). Every argument type must satisfy printable.
+• Placeholders: {} default; {:spec} with [[fill]align][sign][#][0][width][.precision][type]; align < ^ >; type x X o b e E for numbers, ? for debug form (types with @derive(printable)). {{ and }} are literal braces. Arguments are evaluated once, left to right.
+• println appends LF. Console output on Windows is converted to the console code page UTF-16 via WriteConsoleW or passed raw UTF-8 if the stream is redirected; the bytes written to a redirected stream are always UTF-8.
+• Float printing is shortest round-trip (Ryu-class) by default so output is identical across backends; {:.N} is correctly rounded.
+• Under no_std, only std.fmt.write_to(out: span<ubyte>, ...) gives result<size, fmt_error> is available.
+7.7 Collections (std.collections)
+All collections own their elements, are move-only, are disposable, and take an optional allocator parameter. Mutating operations that may reallocate take var self and are therefore excluded while borrows into the collection are live (4.6). Lookups return option<ref<V>> / option<mut<V>> borrows tied to the collection.
+Type
+Structure
+Complexity
+Notes
+buffer<T>
+dynamic array
+push O(1) amortized, insert/remove O(n)
+in prelude
+deque<T>
+ring buffer
+push/pop both ends O(1)
+front, back, push_front, push_back, pop_front, pop_back, indexing
+map<K,V>
+open-addressing hash table
+O(1) expected
+K is hashable and equatable
+set<T>
+hash set
+O(1) expected
+union, intersect, difference gives iterators
+sorted_map<K,V>
+B-tree
+O(log n)
+K is ordered; in-order iteration, range queries range(lo, hi)
+sorted_set<T>
+B-tree
+O(log n)
+likewise
+heap<T>
+binary heap
+push/pop O(log n)
+T is ordered; max-heap, peek gives option<ref<T>>
+bitset<N>
+inline bits
+O(1) per bit
+set, clear, test, count_ones, iter_ones
+map representative API:
+routine map_new<K, V>() gives map<K, V>
+routine count(self: map<K, V>) gives size
+routine insert(var self: map<K, V>, own k: K, own v: V) gives result<option<V>, alloc_error>   // old value if replaced
+routine get(self: map<K, V>, k: K) gives option<ref<V>>
+routine get_mut(var self: map<K, V>, k: K) gives option<mut<V>>
+routine contains_key(self: map<K, V>, k: K) gives bool
+routine remove(var self: map<K, V>, k: K) gives option<V>
+routine entry(var self: map<K, V>, own k: K) gives entry<K, V>      // for insert-or-update: entry_or_insert(own e, own v) gives result<mut<V>, alloc_error>
+routine keys(self: map<K, V>) gives key_iter<K, V>
+routine values(self: map<K, V>) gives value_iter<K, V>
+routine iter(self: map<K, V>) gives map_iter<K, V>                 // yields (ref<K>, ref<V>)
+routine clear(var self: map<K, V>)
+routine reserve(var self: map<K, V>, extra: size) gives result<void, alloc_error>
+Determinism. The default hasher is a fixed-seed SipHash-1-3 so that iteration order of map/set is unspecified but identical for identical insertion histories on every backend and every run. A program that wants HashDoS resistance constructs map_with_hasher(random_state()), which seeds from OS entropy and therefore gives a different iteration order per run.
+7.8 I/O, files, time, process (std.io, std.fs, std.path, std.env, std.time, std.process)
+Streams. Two small capabilities abstract byte I/O:
+capability reader<R>
+    routine read(var r: R, dst: span<ubyte>) gives result<size, io_error>   // 0 means end of stream
+
+capability writer<W>
+    routine write(var w: W, src: view<ubyte>) gives result<size, io_error>
+    routine flush(var w: W) gives result<void, io_error>
+Provided: stdin(), stdout(), stderr() (process-wide handles; stdout is line-buffered on a console and block-buffered when redirected; flushed at exit and before a trap diagnostic), file, memory_reader(view<ubyte>), memory_writer(var buffer<ubyte>), buffered_reader<R>, buffered_writer<W>. Helpers: read_exact, read_to_end(var r, var out: buffer<ubyte>), read_line(var r, var out: string), write_all, copy(var r, var w).
+Files.
+variant open_mode
+    read
+    write            // create or truncate
+    append
+    read_write
+    create_new       // fail if exists
+
+routine open(path: text, mode: open_mode) gives result<file, io_error>
+routine seek(var f: file, from: seek_from, offset: long) gives result<ulong, io_error>
+routine size(f: file) gives result<ulong, io_error>
+routine read_file(path: text) gives result<buffer<ubyte>, io_error>      // whole file
+routine read_text_file(path: text) gives result<string, io_error>        // validates UTF-8
+routine write_file(path: text, data: view<ubyte>) gives result<void, io_error>
+routine exists(path: text) gives bool
+routine create_dir_all(path: text) gives result<void, io_error>
+routine remove_file(path: text) gives result<void, io_error>
+routine list_dir(path: text) gives result<dir_iter, io_error>
+file is disposable (dispose closes the handle and ignores close errors; call close(own f) gives result<void, io_error> to observe them). On Windows these map to CreateFileW, ReadFile, WriteFile, SetFilePointerEx, GetFileSizeEx, FindFirstFileW and so on, via foreign msx64 declarations in std.win.kernel32, with paths converted from UTF-8 to UTF-16 using a stack buffer for paths up to 260 units and the heap beyond, and the \\?\ prefix applied for long paths.
+Paths (std.path): join(a, b), parent, file_name, extension, with_extension, is_absolute, normalize, all on text and returning text borrows or string. Separators / and \ are both accepted on Windows; output uses \.
+Environment and process. std.env.args() gives view<text>, std.env.var(name: text) gives option<string>, current_dir(), std.process.exit(code: int) gives never (flushes streams, does not run pending defers), std.process.spawn(cmd: text, args: view<text>) gives result<child, io_error>, wait(var child) gives result<int, io_error>.
+Time. instant (monotonic, now(), elapsed(self)), duration (nanos as long; seconds(n), millis(n), as_secs_f64), system_time (wall clock: now(), unix_seconds). sleep(d: duration). On Windows: QueryPerformanceCounter/Frequency, GetSystemTimePreciseAsFileTime.
+7.9 Concurrency (std.thread, std.sync, std.atomic)
+Threads.
+routine spawn<A, R>(f: routine(A) gives R, own arg: A) gives result<join_handle<R>, io_error>
+    where A is sendable, R is sendable
+routine join(own h: join_handle<R>) gives result<R, thread_panic>
+routine scope(f: routine(var s: thread_scope)) gives void
+routine spawn_scoped<A, R>(var s: thread_scope, f: routine(A) gives R, own arg: A) gives scoped_handle<R>
+routine sleep(d: duration)          routine yield_now()
+routine available_parallelism() gives size
+routine current_id() gives thread_id
+Dropping (disposing) a join_handle detaches the thread; thread_panic is returned if the thread ended with a trap and the program installed a thread-local trap handler that returns control to the join point via std.thread.on_trap(recover) (otherwise any trap terminates the whole process, 5.10). scope blocks until every thread spawned through its thread_scope has finished; this is the one place where arguments of a spawned thread may be borrows of the parent's data, since all of them are dead before scope returns (4.9). In spawn_scoped, A need only be sendable as a bundle of borrows (view<T> with T: shareable, or one span<T> per disjoint region).
+Synchronization.
+Type
+Operations
+mutex<T>
+mutex_new(own v: T), lock(self: mutex<T>) gives guard<T>, try_lock(self) gives option<guard<T>>. guard<T> is disposable (unlock on dispose); value(var g: guard<T>) gives mut<T> (@from g). Poisoning does not exist: a trap terminates the process.
+rwlock<T>
+read(self) gives read_guard<T>, write(self) gives guard<T>
+condvar
+wait(self, var g: guard<T>), wait_timeout(...), notify_one, notify_all
+once<T>
+get_or_init(self, f: routine() gives T) gives ref<T>
+barrier
+wait(self)
+channel<T>
+channel_new<T>(capacity: size) gives (sender<T>, receiver<T>), send(self: sender<T>, own v: T) gives result<void, send_error<T>>, recv(self: receiver<T>) gives result<T, recv_error>, try_recv, recv_timeout; senders are copyable by clone_sender (explicit); closing is by disposing all senders. MPMC, bounded (capacity 0 = rendezvous) or unbounded when capacity is size.MAX.
+A mutex<T> takes self by shared borrow (it is shareable when T is sendable); the guard is how mutation of the protected value becomes legal without an exclusive borrow of the mutex itself. This is a library invariant implemented with unsafe code inside std.sync and is the canonical example of safe encapsulation (4.8).
+Atomics.
+variant order
+    relaxed
+    acquire
+    release
+    acq_rel
+    seq_cst
+
+routine load(self: atomic<T>, o: order = order.seq_cst) gives T
+routine store(self: atomic<T>, v: T, o: order = order.seq_cst)
+routine exchange(self: atomic<T>, v: T, o: order = order.seq_cst) gives T
+routine compare_exchange(self: atomic<T>, expected: T, desired: T,
+                         success: order = order.seq_cst, failure: order = order.seq_cst) gives result<T, T>
+routine fetch_add / fetch_sub / fetch_and / fetch_or / fetch_xor / fetch_min / fetch_max(self: atomic<T>, v: T, o: order = order.seq_cst) gives T   // integers; wrapping
+routine fence(o: order)
+Atomic operations take self by shared borrow: atomics are shareable and are the only mutation permitted through a shared borrow in safe code. Lock-free guarantees: atomic<T> is lock-free for T of size 1, 2, 4, 8 on Tier-1 (is_lock_free<T>() is a compile-time query); larger T is not permitted. Requesting an invalid combination of orders (e.g. release for a load) is E0710.
+Data-parallel helper. std.thread.parallel_for(range: range, f: routine(size, ctx: view<C>), ctx: view<C>) where C is shareable, with a work-stealing pool sized by available_parallelism(), used for loops whose iterations are independent. parallel_for is not inserted automatically by the compiler.
+7.10 Hashing, sorting, random numbers, SIMD, testing, Windows bindings
+std.hash. hasher (SipHash-1-3, 64-bit output; write_bytes, write_u64, finish(self) gives ulong), hash_of<T>(v) gives ulong where T is hashable, fnv1a(bytes), crc32(bytes), xxh3_64(bytes). Hash values are stable across backends and library patch releases within an edition.
+std.sort.
+routine sort(var s: span<T>)                        where T is ordered      // unstable, introsort, O(n log n) worst-case
+routine stable_sort(var s: span<T>) gives result<void, alloc_error>   where T is ordered   // merge sort, needs scratch
+routine sort_by_key(var s: span<T>, key: routine(view<T>) gives K)     where K is ordered
+routine is_sorted(self: view<T>) gives bool         where T is ordered
+routine select_nth(var s: span<T>, n: size)         where T is ordered
+Comparators are routine pointers or the ordered capability; there are no capturing comparators. A comparator that is not a strict weak ordering cannot cause memory unsafety but makes the resulting order unspecified.
+std.random. rng capability: next_u64(var r: R) gives ulong. Provided generators: pcg64, xoshiro256pp, splitmix64 (all seedable, fully specified, identical output on every backend) and os_rng (BCryptGenRandom on Windows). Helpers: uniform_u64(var r, lo, hi) (unbiased), uniform_f64(var r) in [0,1), shuffle(var r, var s: span<T>), fill_bytes(var r, dst: span<ubyte>).
+std.simd. vec<T, N> is a built-in fixed-width numeric vector (T numeric; N in {2, 4, 8, 16, 32, 64} with total width ≤ 512 bits). It is a copyable value type. [Decision] Although general operator overloading does not exist in Paracine, vec<T,N> is a compiler built-in type and the arithmetic operators + - * / and bitwise & | ^, comparisons (giving mask<N>), and unary - apply lane-wise, with the scalar semantics of 5.6 per lane. Library routines: splat, load(view<T>), store(var span<T>, v), select(mask, a, b), shuffle<const idx: array<uint,N>>, reduce_add / reduce_min / reduce_max, fused_mul_add, sqrt, abs, any(mask), all(mask). If the target lacks a vector width, the backend lowers lane-wise to scalar code; the result is identical. "Automatic" vectorization of scalar loops (overview, profile table) is an optimization and never changes observable behavior; in particular it must preserve 5.6 for floating-point reductions, so floating-point sum reductions are vectorized only in @fastmath scope.
+std.test. assert_eq(a, b) (requires equatable and printable, prints both on failure), assert_ne, assert_lt, assert_close(a, b, tol), expect_trap(f: routine(), code: trap_code) (runs f in a child process with a recovering trap handler), and bench(name, f: routine()) used by pcn bench.
+std.win (Windows x86-64 only; every item is foreign msx64, wrapped by safe routines in the higher-level modules): kernel32 (file, process, thread, time, memory, console), ntdll (minimal), bcrypt (random), user32/gdi32 (window creation, message pump; optional feature gui), ws2_32 (sockets, feature net). Types: handle (@opaque raw<void>), hresult, last_error().
+7.11 Library realizations and the backend contract
+Per overview section 58, each library routine has up to four realizations; the semantics are those of the Paracine source and the others must match them exactly:
+Realization
+Used by
+Content
+Paracine source (.pcn + .pci)
+all backends before PCIR optimization
+the reference definition
+Intrinsic
+both backends
+trap, size_of, fused_mul_add, atomics, volatile_*, vec ops, format expansion, unreachable
+COFF object (std.lib)
+native .obj/.exe
+precompiled non-generic routines and runtime support (heap, console I/O, thread start, trap handler, start-up code)
+C++20 helper header (pcn_runtime.hpp)
+.cpp backend
+pcn_wrap_* arithmetic helpers (5.6), pcn_trap, pcn_shl/shr with masking, pcn_f2i_sat, buffer/allocator support, atomics via <atomic> with explicit orders, threads via <thread>
+Conformance rule for realizations. For every non-intrinsic library routine, the test suite runs the Paracine source, the COFF object and the C++20 helper on the same inputs and requires identical results (this is the library-level form of the differential validation of overview section 51). Library routines that depend on OS behavior (file, time, threads) are specified by their observable calls (5.11) rather than by identical timing.
+7.12 What is deliberately absent
+• No garbage collector, no implicit allocation: every allocation is visible as a call that mentions buffer, string, arena, box-like containers, or format/join.
+• No exceptions, RTTI, reflection, or dynamic dispatch (no dyn/virtual); polymorphism is generic and monomorphized.
+• No closures or captured environments (routine pointers carry no state); stateful callbacks pass an explicit context argument.
+• No global mutable state in safe code outside atomics and std.sync types; var static requires unsafe unless of type atomic<T>.
+• No user-defined operators (except the built-in vec and numeric operators), no implicit conversions, no function overloading by return type.
+Part 8. Conformance, open issues and decisions to confirm
+8.1 What "conforming" means
+An implementation conforms to this specification if it (a) accepts exactly the programs that satisfy Parts 1–6 and rejects the rest with the diagnostics named there (the code numbers are normative for the class of error, not for message text), (b) executes accepted programs as specified by Part 5, and (c) provides the library of Part 7 with the stated semantics. Each output form (.cpp, .obj, .exe) is a separate realization and must individually meet (b) and (c); equivalence between them is judged by 5.11.
+8.2 Required test suites (normative targets for the reference compiler)
+1. Grammar suite: every production in Part 2 with positive and negative cases; layout algorithm edge cases (dedent chains, continuation lines, -> continuation).
+2. Type suite: each typing rule of 5.2 and 5.3, each conversion of table 3.3, capability resolution and its ambiguity rule.
+3. Ownership suite: every E04xx diagnostic; moves in branches and loops (drop-flag correctness); region elision cases of 4.5; unsafe encapsulation tests with a checking allocator.
+4. Arithmetic suite: exhaustive 8- and 16-bit tables for every integer operator; randomized 32/64-bit tests against an arbitrary-precision oracle; float conversions at saturation and NaN.
+5. Cross-backend differential suite: every program in suites 1–4 and the library suite compiled to .cpp (built by at least MSVC and Clang) and to .exe, outputs and exit codes compared.
+6. Library suite: per-routine tests, the realization-equivalence tests of 7.11, concurrency stress tests (with a race detector on the C++20 build).
+7. Fusion suite: the code-shape tests of 7.5 (no allocation or per-element call for fused chains).
+8.3 Open issues that should be settled before a 1.0 freeze
+These are genuine gaps or tensions; I list them rather than hide them.
+1. Closures. Capture-free routine pointers keep the runtime non-managed, but they make adapters like map and filter less convenient and force explicit context passing. Alternatives: (a) keep as is; (b) allow non-escaping capturing closures that are monomorphized and inlined as generic parameters (zero allocation, no heap closures); this is the usual way to recover ergonomics without a runtime. Option (b) would add a closure expression to 2.6 and a callable capability.
+2. Interior mutability and the borrow checker's reach. Rule 4.4 is conservative for indexing (same place for all indices). Range analysis helps, but algorithms such as in-place partitioning need split_at. A more precise index-disjointness analysis is possible but increases checker complexity.
+3. Associated types. iterator<I, T> uses a second type parameter because capabilities have no associated types. This works but makes constraints such as where I is iterator<T> appear in many generic signatures. Associated types would simplify at the cost of a more complex type-checker.
+4. Trap vs. unwinding. Traps never run defer/dispose (5.10). Systems that need cleanup on failure (e.g. flushing a log) must install a trap handler that does it explicitly. A "cleanup on trap" mode is not specified.
+5. Macros / compile-time code generation. 6.5 deliberately excludes build scripts and macros; @derive is the only generative mechanism, and only for the built-in capabilities. User-level derive, or compile-time reflection, is out of scope for 1.0.
+6. Async. The overview excludes a mandatory scheduler. Structured concurrency is provided by threads and scope; an async surface language would need to be designed on top of that and is not specified.
+7. Other targets. Parts of this specification mention Tier-1 (Windows x86-64) properties (pointer width, default trap exit code, std.win). Targets reached through the .cpp backend inherit those parts of the library that do not use std.win; a platform abstraction layer (std.sys) with Linux and macOS realizations is still to be written.
+8.4 Decision log (everything I chose where the overview was silent)
+#
+Decision
+Where
+D1
+Exactly four spaces per indentation level; tabs forbidden
+1.2
+D2
+text is a borrowed immutable UTF-8 slice; string is owning
+3.1
+D3
+Routine pointers carry no environment (no closures)
+2.3
+D4
+No implicit numeric conversions; as is the only conversion
+3.3
+D5
+Capabilities are satisfied by name and signature, with a fixed lookup order
+3.4
+D6
+Records are never reordered; @layout(c) and @packed available
+3.6
+D7
+Wrapping + - * for all integers; shifts mask the count; MIN / -1 = MIN
+5.6
+D8
+Default parameter mode is a shared borrow; var exclusive; own moves
+4.3
+D9
+No lifetime parameters; region elision rules with @from
+4.5
+D10
+Traps terminate; they do not unwind or run cleanup
+5.10
+D11
+give e auto-wraps into ok / some; fail e auto-wraps into err
+5.5
+D12
+Float contraction and reassociation off unless @fastmath
+5.6
+D13
+std function-like collections use fixed-seed SipHash; deterministic order
+7.7
+D14
+Growth operations are fallible; eager constructors trap on OOM and have try_ forms
+7.1
+D15
+import graph is acyclic; items within a module are order-independent
+6.2, 6.4
+D16
+Three visibilities: private, public (package), export (dependents, ABI)
+6.3
+D17
+Built-in vec<T,N> is the only type with operator semantics beyond primitives
+7.10
+D18
+One module per file, path equals module name
+6.1
+Any of these can be reversed; several (D3, D10, D11, D14) have visible consequences for how the language feels and are the ones most worth reviewing first.
+8.5 Relationship to the overview
+Nothing here changes the overview's output forms, architecture, ABI or optimization pipeline. The spec adds the grammar (Part 2), type rules (Part 3), ownership rules (Part 4), semantics that the optimizer and both backends must preserve (Part 5), the module and package system (Part 6) and the library (Part 7). The overview's claims that go beyond what is specified here (for example, details of PMIR, register allocation, the PE writer, or the exact "Path Compression" optimization) remain to be specified in separate documents: a PCIR specification, a PMIR and ABI-lowering specification, and a COFF/PE writer specification.
+
+
+## *** ##
+
+
