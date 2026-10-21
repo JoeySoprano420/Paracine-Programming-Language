@@ -3020,3 +3020,876 @@ Nothing here changes the overview's output forms, architecture, ABI or optimizat
 ## *** ##
 
 
+Paracine Backend Specifications
+Companion to the Paracine Language Specification (normative draft 1.0)
+Contents. Part A: PCIR, the semantic intermediate representation and optimizer. Part B: Paracine Machine IR (PMIR) and the Microsoft x64 ABI lowering. Part C: the COFF object writer, the PE32+ image writer and the native linker.
+Status note. The overview names these components and their pipeline stages but defines none of their internals, and it does not define "Path Compression" or "SSA Reduction" beyond the names. Everything below is a proposed normative definition consistent with the language specification, in particular its rules for arithmetic (5.6), traps (5.10), evaluation order and observable behavior (5.11), and ownership (Part 4). Choices I made where the sources were silent are marked [Decision]. Numeric facts about the Windows ABI, COFF and PE formats follow the public Microsoft documentation as I know it; items I am less than certain of are marked [Verify] and should be checked against the current Microsoft PE/COFF and x64 ABI documents before implementation.
+Part A. PCIR: the semantic intermediate representation
+A.1 Role and design goals
+PCIR is the single representation on which all semantic optimization happens and from which every output form is produced (overview §34). It must satisfy five requirements:
+1. Fully typed and monomorphic. No generics, capabilities, or overloads remain. Every value has a concrete PCIR type.
+2. Exact semantics. Every instruction has the arithmetic, trap and ordering behavior of language spec Part 5; no instruction has undefined behavior. (Exception: instructions that originate in unsafe code are marked !unsafe and may be assumed to obey the unsafe contract, 4.8.)
+3. Retains source-level facts that machine IRs normally lose: ownership/aliasing, value ranges, alignment, proven bounds, lifetimes of cleanup obligations.
+4. Retains enough structure to reconstruct structured C++20 control flow without a general goto-elimination algorithm.
+5. Serializable and versioned, so a build can record the PCIR version (overview §50) and so pcn ir output can be parsed back.
+A.2 Program structure
+module      := global* function* extern*
+global      := @name : type [= constant] attrs      (* static storage: rdata / data / bss class *)
+extern      := declare @name (types) -> type  abi(c|msx64|pcn)  [import("dll")]
+function    := func @name (params) -> type attrs { block+ }
+block       := label (block-params): instruction* terminator
+A function has one entry block with no predecessors. A block carries typed block parameters instead of phi nodes [Decision]: edges pass values explicitly (br L(%a, %b)), which keeps SSA construction local, simplifies the verifier, and makes critical-edge splitting trivial. A terminator is the last instruction of a block: br, condbr, switch, ret, trap, unreachable, or tailcall.
+Globals are constants (.rdata), initialized mutable (.data), or zero-initialized (.bss), matching const items, var static items and string literals of the source.
+A.3 Type system
+PCIR type
+Meaning
+i1
+boolean in SSA values (stored as i8)
+i8 i16 i32 i64
+signless integers; signedness is carried by the operation, not the type
+f32 f64
+IEEE binary32 / binary64
+ptr
+machine pointer (64-bit on Tier-1), untyped; accesses carry their own type
+{t1, t2, ...}
+struct (SSA aggregate value) with explicit layout (A.3.1)
+[n x t]
+fixed array
+<n x t>
+vector (from vec<T,N> and from auto-vectorization)
+void, never
+no value / does not return
+Signed and unsigned source types map onto the same integer type: int and uint are both i32. char is i32; bool is i1 in registers and i8 in memory; size/ssize are i64 on Tier-1 (target-dependent width otherwise, resolved at PCIR construction); view<T>, span<T>, text are {ptr, i64}; buffer<T> is {ptr, i64, i64}; routine pointers are ptr.
+A.3.1 Layout. PCIR construction runs a layout pass that assigns every record and variant its size, alignment and field offsets by the rules of language spec 3.6, including niche selection for option<T> (3.2). The result is recorded on the type and is the definition used by both backends, so the C++20 backend can emit alignas and static_assert(offsetof(...)) checks against it and the native backend can use the numbers directly. A variant is {iN tag, [k x i8] payload} aligned to its widest member; a niche-packed option is the payload type itself with the niche value meaning none.
+A.4 Values, SSA and memory
+Values. Every instruction that produces a result defines exactly one SSA value (%name); the definition dominates all uses. Constants are written inline: 42:i32, 3.5:f64, null. There is no undef; uninitialized memory is modeled by alloca without a store, and reading it before a store is rejected by the verifier in safe code (language spec 4.2).
+Memory. Memory is accessed only by load, store, atomics, call and the memcpy/memset intrinsics. Local variables start as alloca slots; the mem2reg pass (A.11) promotes every slot whose address never escapes into SSA values. Each memory instruction carries attributes:
+• !align n (a power of two);
+• !volatile (observable, never removed or reordered with other volatile or foreign effects);
+• !atomic order for relaxed | acquire | release | acq_rel | seq_cst;
+• !own K where K is excl(region), shared(region), or raw: the access goes through an exclusive borrow, a shared borrow, or raw authority (language spec Part 4), with a region id naming the borrow;
+• !nonnull, !range(lo, hi) on loaded integers, !dereferenceable n.
+Alias model. Two memory accesses may alias unless: (a) one has !own excl(R) and the other is not derived from R's borrow chain, or (b) both are shared(R) loads, or (c) they address provably disjoint allocas or globals, or (d) offsets within the same base are provably disjoint. Ownership-derived noalias is the main way PCIR retains the language's aliasing guarantees (4.4). The alias analysis is sound because the borrow checker already enforced rule 4.4; !own raw accesses use the conservative model "may alias anything with raw provenance in the same allocation".
+A.5 Instruction set
+Notation: T is an integer type of width w, F a float type.
+A.5.1 Integer arithmetic (all total, no UB)
+Instruction
+Semantics (language spec 5.6)
+add T a, b; sub; mul
+wrap_w result
+neg T a; not T a
+modular negate; bitwise complement
+sdiv T a, b; srem
+truncated; traps DivideByZero if b = 0; MIN/-1 = MIN, MIN%-1 = 0
+udiv T a, b; urem
+traps DivideByZero if b = 0
+and T, or, xor
+bitwise
+shl T a, n; lshr; ashr
+count taken as n & (w-1); n has type T
+rotl T, rotr T
+rotate; count masked
+popcnt, clz, ctz, bswap, bitrev
+clz/ctz of 0 give w
+add.ovf.s T a, b → {T, i1}; sub.ovf; mul.ovf; .u variants
+exact wrapped result and overflow flag, for checked_*
+icmp pred T a, b → i1
+eq ne slt sle sgt sge ult ule ugt uge
+select i1 c, a, b
+no short-circuit (both operands already evaluated)
+A.5.2 Floating point
+fadd fsub fmul fdiv frem fneg fabs sqrt fma copysign; fcmp pred with oeq one olt ole ogt oge ord uno ueq une ult ule ugt uge. Each may carry the flag !fast (a @fastmath scope: reassociation allowed, NaN/Inf assumed absent, A.8); otherwise strict IEEE with no contraction (5.6). fma exists only when the source writes fused_mul_add or in !fast scope.
+A.5.3 Conversions
+zext, sext, trunc; sitofp, uitofp (round-to-nearest-even); fptosi.sat, fptoui.sat (truncate toward zero, saturate, NaN → 0: exactly language spec 3.3); fpext, fptrunc; bitcast (same-size reinterpret between integers, floats, vectors); ptrtoint, inttoptr (marked !unsafe).
+A.5.4 Aggregates and addressing
+%x  = extract {t...} %agg, k             // static field/element index
+%y  = insert  {t...} %agg, %v, k
+%a  = gep.field %p, @layout, k           // pointer + static field offset
+%a  = gep.elem  %p, %i, T                // pointer + i * sizeof(T), no bounds check
+      boundscheck %i, %n                 // traps Bounds unless 0 <= i < n (unsigned compare)
+boundscheck is a separate instruction with effect "may trap", so that bounds-check elimination (A.11) has a precise target. gep never traps; overflow in address computation cannot occur for in-range indices, and raw use is covered by the unsafe contract.
+A.5.5 Memory and atomics
+load T, %p [attrs], store T %v, %p [attrs], memcpy %dst, %src, %n !align, memmove, memset; alloca T [, count] !align (frame allocation, with optional lifetime.start/end markers around scopes to allow stack-slot sharing); atomic.load, atomic.store, atomic.rmw op (xchg add sub and or xor min max), atomic.cmpxchg → {T, i1}, fence order.
+A.5.6 Calls and effects
+call @f(args) [abi], call.indirect %fp(args) sig, tailcall (terminator; guaranteed only when @tail is requested, otherwise an optimization), call.foreign (an extern call; effect io). Calling-convention lowering is not done in PCIR: arguments and results are SSA values (possibly aggregates). ABI lowering belongs to PMIR (Part B).
+A.5.7 Intrinsics
+trap code, loc; unreachable (terminator; reaching it is trap Unreachable); assume %c (!unsafe code only); likely/unlikely as branch weights; prefetch; cpu.pause; readcyclecounter; vector operations (vadd, vshuffle, vreduce.add, vselect, vload/vstore, vmask); stacksave/stackrestore (not used by safe source).
+A.5.8 Control flow
+br L(%a, %b)                         // unconditional with block arguments
+condbr %c, L1(args), L2(args) !weight(a, b)
+switch T %v, default L0(args), [k1 -> L1(args), ...]
+ret %v | ret
+trap CODE                            // terminator form
+unreachable
+A.6 Control flow structure and regions
+PCIR is a CFG (basic blocks and edges) with an optional region tree attached as metadata. The region tree records the source structure from which each block came: seq, if(cond, then, else), switch, loop(header, latch, exits), scope(cleanup_chain), try_exit.
+• Reducibility invariant. The CFG is always reducible (every cycle has a single entry), because the front end generates only structured control flow (if, choose, loop, while, for, break, continue, labeled break/continue, give/fail/try). Every pass must preserve reducibility. A pass that would break it (e.g. unrestricted jump threading into a loop) must not run, or must re-establish it by node splitting under a cost bound.
+• Region validity. A pass that changes the CFG must update or drop the affected regions. A dropped region is legal (the C++20 backend then uses its general structuring algorithm, A.13); a stale region is a verifier error. [Decision] The C++20 backend does not require regions; they make its output nicer and cheaper to produce.
+Cleanup edges. Scope-exit actions (dispose, defer; language spec 4.7) appear in PCIR as ordinary blocks reached by explicit edges, never as implicit unwinding. A scope with cleanup has a cleanup chain of blocks in LIFO registration order; every exit edge of the scope (fall-through, give, fail, break, continue, propagating try) is routed through the chain to its destination, with block parameters carrying the pending return value or error. Drop flags (4.2) are alloca i1 slots promoted to SSA where possible; a flag known true or false on an edge folds the corresponding cleanup block away, which is the main source of cleanup-code elimination.
+A.7 Effects and the ordering model
+Every instruction has an effect summary from this lattice:
+Effect
+Examples
+pure
+arithmetic without division, compares, select, extract, gep, fptosi.sat
+trap (pure + may trap)
+sdiv, udiv, urem, srem, boundscheck
+read(M)
+non-volatile loads from memory class M
+write(M)
+non-volatile stores, memcpy
+sync
+atomics, fences
+io
+volatile accesses, call.foreign, calls to routines with io effect, process exit
+diverge
+non-terminating call (never result)
+Memory class M is derived from provenance: a specific alloca or global, a region id, or any.
+Ordering rules. An optimizer may reorder or delete instructions only if the result preserves: (1) data dependencies (SSA edges and the memory dependencies of the alias model); (2) the relative order of any two instructions that are sync or io, and of each of them with respect to any instruction that may trap, so that precise traps (language spec 5.10) hold: all earlier observable effects have happened and none later; (3) the cleanup-edge structure. A trap-effect instruction may be deleted only if its trap condition is proven false (e.g. by range facts) and may be hoisted only if it is speculation-safe, which for traps means never, unless dominated by an equivalent earlier check.
+A.8 Metadata carried on IR
+Values and instructions may carry: !range(lo, hi) (integer facts from types, option niches, bounds proofs), !knownbits(mask, value), !align, !nonnull, !dereferenceable, !own (A.4), !loc (source span, always preserved for trap diagnostics), !weight, !inline (always | never | hint), !fast, !unsafe, !noreturn, !fusible (marks an iterator next chain from std.iter for the fusion pass, A.11), !origin (module and routine name for diagnostics and pcn explain).
+Metadata is advisory except !volatile, !atomic, !unsafe, !loc on trapping instructions, and !own where the alias model uses it. These are semantic and must be preserved, or soundly weakened, by every transformation.
+A.9 Verifier rules
+The verifier runs after construction and after every pass in debug builds (after each stage in release builds). A violation is a compiler bug (ICE-Pxxxx). Rules:
+1. Well-formed CFG: one entry block; every block reachable or deleted; each block ends in exactly one terminator; branch arguments match target block parameter types and count.
+2. SSA: each value defined once; each use dominated by its definition (block parameters dominate the block body).
+3. Types: operand types match the instruction signature; no implicit conversion; pointer operands are ptr; integer widths agree.
+4. Memory: every alloca read on every path is preceded by a store on that path (non-!unsafe code); alignments are powers of two and at most 4096; atomics use an integer or pointer type of size 1, 2, 4 or 8.
+5. Effects: no pure instruction has side effects; every trap or io instruction keeps its !loc.
+6. Regions: each region's blocks are connected as declared; a loop header dominates the region's blocks; every exit edge of a scope region passes through its cleanup chain; no stale region (A.6).
+7. Ownership metadata: each !own excl(R) access has an access chain through the borrow that defines R; live excl(R) and shared(R) regions over the same place do not overlap (re-checks language spec 4.4 on the IR, as a defense against optimizer bugs).
+8. Constants: every constant fits its type. Division by constant zero is allowed (it traps at run time) and produces warning W-Pdiv0.
+9. Calls: callee signature matches arguments; a never-returning callee is followed by unreachable; tailcall caller and callee return types agree.
+10. Monomorphic: no unresolved generic or capability reference.
+A.10 Construction: from typed AST to PCIR
+Construction takes the monomorphized, borrow-checked program and emits PCIR by these rules. Each rule preserves the evaluation order of language spec 5.4.
+Source construct
+PCIR
+let x = e, var x = e
+alloca slot + store, or directly an SSA value if x is never borrowed mutably or address-taken (mem2reg finishes the job)
+x = e
+store; if the old value is disposable, its dispose call is emitted first (5.3 S-Assign)
+Shared borrow x as argument
+pointer to the place (ptr) with !own shared(R) on callee loads; small copyable scalars are passed as values
+var x argument
+pointer with !own excl(R)
+own x argument / move
+memcpy (or SSA aggregate copy) into the callee's value, then the drop flag of the source is cleared (store i1 0)
+give e
+evaluate e, wrap per 5.5 (ok/some), br into the enclosing scope's cleanup chain with the value as block argument, ending in ret
+fail e, try e
+fail: wrap in err, route through cleanup chain, ret. try: switch tag on the result/option; success edge continues with the payload, failure edge converts and goes to the fail path
+if, if expression
+condbr; expression form joins through a block parameter
+choose
+decision tree compiled from the pattern matrix (5.7): switch on variant tags and integer ranges, guards as condbr, arms in source order for equal-priority tests
+loop, while, for, break, continue
+loop region: header block with parameters for loop-carried values, latch, exit blocks; labeled forms jump to the labeled region's exits with scope cleanup in between
+Indexing a[i]
+boundscheck %i, %count then gep.elem then load/store; slicing emits one range check 0 <= a <= b <= count (two compares) and builds the {ptr, i64} result
++ - * / % << >>, comparisons, as
+the instructions of A.5 with exactly the semantics of 5.6 and table 3.3; / and % emit their trap forms
+and, or
+condbr (short-circuit) joining through a block parameter of type i1
+defer, dispose at scope exit
+cleanup chain blocks (A.6), guarded by drop flags where the value may have been moved
+unsafe code
+same instructions marked !unsafe, accesses marked !own raw
+foreign call
+call.foreign
+format(...)/print(...)
+expanded at construction into calls to formatting routines with constant format pieces; the number and types of arguments were already checked
+Atomic operations
+the matching atomic.* with the stated order
+The result is non-optimized but valid PCIR: correct SSA, all checks present, all cleanup edges explicit.
+A.11 The optimization pipeline
+Optimization is a fixed sequence of passes grouped into stages, repeated at most N times (N = 2 at opt=2, 3 at opt=3) until a fixed point of the cheap cleanups. All passes consume and produce valid PCIR (A.9). The pass names below are normative so that pcn explain and pcn ir --after=<pass> have a stable vocabulary.
+Stage 1: simplification.
+1. fold: constant folding and algebraic simplification. Rule: folding must use the same evaluator as language spec 5.8 and the library's arithmetic (pcn_arith); the compile-time and run-time results must be bit-identical, including trap conditions (a foldable sdiv x, 0 is not folded: it stays a trap).
+2. sccp: sparse conditional constant propagation.
+3. simplifycfg: merge straight-line blocks, remove empty blocks, fold branches on constants, remove unreachable blocks; updates regions.
+4. mem2reg: promote non-escaping alloca slots (including drop flags) to SSA values, with block parameters at joins.
+5. sroa: scalar replacement of aggregates; splits {ptr, i64} views and small records into scalars so they live in registers.
+Stage 2: inlining and specialization.
+6. inline: bottom-up call-graph order. Always inline !inline always; never inline !inline never or recursive cycles; otherwise inline by a cost model (instruction count after substitution, call-site frequency from !weight, callee known-constant arguments reduce cost). Because generics are already monomorphic, inlining crosses generic boundaries without special handling. Inlined routines retain !origin for pcn explain.
+7. specialize: clone a routine for call sites that pass constants or exact ranges for parameters when the cloned body shrinks by a threshold (the "Resolve what is known" of the overview's optimization law).
+Stage 3: redundancy removal.
+8. gvn: global value numbering and CSE for pure instructions; also redundant-load elimination using the alias model.
+9. range: forward range analysis producing !range/!knownbits; propagates facts from loads with !range and from option niches, and from dominating compares and boundschecks.
+10. bce: bounds-check elimination. A boundscheck %i, %n is removed if range analysis proves 0 <= %i < %n. Loop-aware: for a counted loop with induction variable %i and bound %n where the array count %n' equals %n (same SSA value or proven equal), the checks inside the body are removed. Checks whose failure is certain become trap Bounds.
+11. dse: dead-store elimination (with alias model); dce: dead code elimination of pure and read instructions with no uses.
+Stage 4: loop optimization.
+12. licm: hoist loop-invariant pure and read instructions (never trap-effect ones unless dominated by an equivalent preceding check, A.7).
+13. indvars: canonicalize induction variables; strength reduction of address computation.
+14. unroll: full unroll for small constant trip counts; partial unroll for heuristics at opt>=2.
+15. fuse: pipeline fusion (below).
+16. vectorize: loop and SLP vectorization into <n x t> operations. Integer loops are vectorized whenever dependence analysis proves legality; floating-point reductions only under !fast (language spec 7.10). Trap-effect instructions in the loop body either prevent vectorization or are converted into a vector precheck.
+Stage 5: compression and reduction.
+17. pathcomp: Path Compression (defined below).
+18. ssared: SSA Reduction (defined below).
+19. tailcall: turn call; ret into tailcall when the callee ABI permits (or when @tail was requested; failure to satisfy @tail is an error).
+20. finalize: remove dead regions, renumber, assign final block order by weights (hot path fall-through), run the full verifier, then hand off to the backend (A.13).
+A.11.1 Pipeline fusion
+When a value of iterator type is produced by std.iter adapters and consumed by a !fusible consumer (sum, count, fold, any, all, find, collect_into, or a for loop), and all intermediate iterators are non-escaping allocas or SSA aggregates after inline and sroa, fuse rewrites the chain into one loop:
+1. each adapter's next has been inlined, so the chain is a nest of switch on option tags;
+2. fuse merges the producer loop and each adapter's state update into a single loop header with all state as block parameters;
+3. none branches are threaded directly to the loop exit (this uses pathcomp's jump-threading primitive);
+4. intermediate option<T> values never materialize because their tag tests were resolved on the path.
+The pass is required to succeed (language spec 7.5 conformance) for chains of adapters from std.iter over built-in sources; for user-defined iterators it applies when next is inlinable. If it fails, results are unchanged: fusion affects speed only.
+A.11.2 Path Compression (definition) [Decision]
+The overview names this optimization without defining it. Paracine defines it as follows.
+A path is a sequence of blocks connected by unconditional or provably-determined branches. Path Compression replaces each path of blocks whose intermediate decisions are determined by known values with a single shorter path, duplicating or merging blocks as needed, without changing observable behavior.
+Concretely it comprises four transformations, applied to a fixed point per function under a code-size growth cap (default 25% of the original function):
+1. Branch-to-branch collapse. br L1 where L1 is an empty block ending in br L2 becomes br L2; likewise for condbr whose target is a block that immediately branches on the same or a constant-determined condition.
+2. Known-value jump threading. If a predecessor P of block B passes a block argument whose value fixes the outcome of B's terminating condbr/switch (a constant, or a value with a !range that decides the test), redirect P directly to the chosen successor with the appropriate arguments, duplicating B's non-terminator instructions into a new block if B is entered from other paths. This is how option/result tag tests that were just constructed disappear.
+3. Cleanup-path trimming. An edge into a cleanup chain whose drop flags are known (constants on that edge) is rewritten to enter the chain at the first cleanup block that actually runs, skipping blocks whose guards are false.
+4. Tail merging. Identical suffixes of sibling blocks ending in the same terminator are merged (only for non-trap/io instructions with the same !loc-insensitive semantics), with the divergence carried in block parameters.
+It must not cross an effect-ordering boundary (A.7), must preserve reducibility (A.6), and must leave every !loc on a trapping instruction intact.
+A.11.3 SSA Reduction (definition) [Decision]
+SSA Reduction minimizes the number of SSA values and block parameters without changing meaning.
+1. Redundant parameter removal. A block parameter that receives the same value (or itself) along every incoming edge is replaced by that value (the SSA analogue of removing trivial phis).
+2. Copy and extract/insert folding. extract(insert(a, v, k), k) → v; chains of insert into the same aggregate become one construction; bitcast pairs cancel.
+3. Parameter narrowing. A parameter whose every incoming value comes from zext/sext of a narrower value is narrowed, with the extension moved after the block entry (or removed if all uses tolerate the narrow type by range facts).
+4. Live-range shortening. Instructions with a single use are sunk toward that use when this does not move a trap/io/sync instruction or increase register pressure estimates.
+5. Dead parameter removal. Parameters with no uses are removed from the block and from all incoming edges.
+SSA Reduction runs last in stage 5 so that the backend sees the smallest value graph.
+A.11.4 Pass legality summary
+Pass class
+May change
+Must not change
+Arithmetic (fold, sccp, gvn, range)
+which instruction computes a value
+the wrap/trap/saturation semantics of 5.6; floating results outside !fast
+CFG (simplifycfg, pathcomp, unroll)
+block structure and duplication
+effect order (A.7); reducibility; trap !loc
+Memory (mem2reg, sroa, dse, licm)
+which accesses exist
+!volatile, !atomic, !unsafe accesses; alias-model soundness
+Cleanup
+which cleanup blocks exist
+that every owned value is disposed exactly once on every path (4.7)
+Parallel (vectorize)
+lane structure
+semantics per lane; trap order for the first trapping lane in source order
+A.12 Textual form (example)
+Source:
+routine sum(xs: view<int>) gives int
+    var acc = 0
+    for x in xs
+        acc += x
+    give acc
+PCIR after construction (abridged):
+func @sum(%xs: {ptr, i64}) -> i32 {
+entry:
+  %p = extract %xs, 0
+  %n = extract %xs, 1
+  br loop(0:i64, 0:i32)
+loop(%i: i64, %acc: i32):
+  %c = icmp ult i64 %i, %n
+  condbr %c, body, exit(%acc)
+body:
+  boundscheck %i, %n                       !loc(sum.pcn:3)
+  %a = gep.elem %p, %i, i32
+  %v = load i32, %a !align 4 !own shared(R1)
+  %acc2 = add i32 %acc, %v
+  %i2 = add i64 %i, 1:i64
+  br loop(%i2, %acc2)
+exit(%r: i32):
+  ret %r
+}
+After range and bce, the boundscheck is removed because the loop condition %i < %n dominates it. After vectorize at opt=3, the loop is replaced by a vector loop plus scalar epilogue; integer add reassociation is legal because integer addition is exactly associative under wrapping semantics (5.6), which is why integer reductions vectorize without @fastmath.
+A.13 Interface to the backends
+Common contract. After finalize, PCIR is verifier-clean, monomorphic, and carries layout (A.3.1). Backends may read all metadata and may not modify PCIR; each runs on a private copy (this is how the three outputs of one build share one optimization result, overview §49).
+C++20 backend (backend/cxx20). Pipeline per overview §36: structured-region reconstruction → type translation → helper selection → expression/statement lowering → scope reconstruction → formatting.
+• Structuring. If the function has a complete, valid region tree, emit it directly: if, switch, while/for(;;) with break/continue. Otherwise run a restructuring algorithm for reducible CFGs (dominator-tree-based, with loop headers as for(;;) and exit-blocks as labeled breaks via a state variable only where required). Gotos are not emitted.
+• Values. Block parameters become local variables assigned before each branch. SSA values with one use are inlined into expressions; others become const locals with deterministic names.
+• Semantics. Every operation is emitted through helpers (pcn_add_i32, pcn_shl_i32, pcn_sdiv_i32, pcn_f2i_sat) or inline sequences that realize A.5 exactly; evaluation order is explicit (one operation per statement when order matters). Traps are pcn_trap(code, file, line) marked [[noreturn]].
+• Metadata. !align becomes alignas/__builtin_assume_aligned guarded by a feature macro; !own excl may become __restrict on parameters; !range/!nonnull become [[assume(...)]] only when the build opts into --cxx-assume.
+• Layout. Types are emitted with static_assert(sizeof(T) == N && alignof(T) == A) and one static_assert(offsetof(...)) per field from A.3.1.
+Native backend (backend/native, Part B). Takes the CFG (regions ignored), runs target legalization into PMIR, and does the rest. It uses !range, !align, !own, !weight, branch probabilities and !knownbits for instruction selection and scheduling.
+Serialization and versioning. PCIR has a canonical text form (as above, with a stable grammar) and a compact binary form (.pcir, used for LTO and for inter-process caching). Both start with pcir <major>.<minor>. A change that alters semantics of an existing instruction increments major; adding instructions or metadata increments minor. A compiler may read any file with the same major and equal or lower minor. The PCIR version is recorded in the reproducibility manifest (overview §50).
+A.14 Testing PCIR
+1. Verifier fuzzing: randomly generated PCIR checked against an independent reference interpreter.
+2. Reference interpreter: a direct small-step interpreter of A.5 following language spec 5.4 exactly, used as an oracle; every pass is tested by running the same input before and after it.
+3. Translation validation in CI: for sampled functions, symbolic equivalence of pre/post-pass PCIR using an SMT solver for integer and bit-vector operations.
+4. Golden tests for pcn ir --after=<pass> on a curated corpus, including the sum example above (bounds check gone; loop vectorized) and fusion cases of language spec 7.5.
+5. Differential end-to-end tests across .cpp and .exe (language spec 8.2 suite 5).
+Part B. Paracine Machine IR (PMIR) and Microsoft x64 lowering
+B.1 Role and stage order
+PMIR is the machine-level representation used by the direct-native backend for both .obj and .exe output (overview §6, §7, §37). It starts as a direct, one-to-few translation of PCIR into x86-64 machine instructions over virtual registers and ends as a sequence of encoded bytes with relocations.
+The overview lists the stages as: legalization, PMIR, instruction selection, scheduling, register allocation, frame construction, ABI lowering, encoding. In practice ABI lowering cannot wait until after register allocation, because argument and return registers constrain allocation. [Decision] ABI lowering therefore has two phases that together are the overview's "ABI lowering" stage:
+Phase
+When
+Does
+B-ABI-1 (call and entry lowering)
+during legalization
+assigns each parameter, argument, and result to a physical register or stack slot; inserts copies to/from pre-colored virtual registers; materializes by-reference copies and hidden return pointers
+B-ABI-2 (frame finalization)
+after register allocation
+chooses the final frame layout, emits prologue/epilogue, shadow space, saves of non-volatile registers, stack probes, and the unwind records
+Stage order used by this specification:
+PCIR (final)
+  -> target legalization (+ B-ABI-1)
+  -> PMIR in SSA form (virtual registers)
+  -> instruction selection
+  -> pre-RA scheduling
+  -> SSA destruction (parallel-copy sequentialization)
+  -> register allocation (+ spill code)
+  -> post-RA scheduling and peepholes
+  -> frame construction (B-ABI-2) and unwind-record construction
+  -> branch relaxation and encoding
+  -> sections + relocations (handed to Part C)
+B.2 Target profiles
+A target profile names OS, architecture, ABI, and CPU feature level. The Tier-1 profile is windows-x86_64-msx64.
+CPU level
+Required features
+Notes
+x86-64 (default)
+SSE2, CMPXCHG16B not assumed
+runs on every x86-64 Windows machine
+x86-64-v2
++ SSE4.2, POPCNT, SSSE3
+popcnt, pblendv, roundsd available
+x86-64-v3
++ AVX, AVX2, BMI1/2, FMA, LZCNT, MOVBE
+vfmadd, shlx, lzcnt, tzcnt, 256-bit vectors
+x86-64-v4
++ AVX-512 F/BW/DQ/VL/CD
+masks, 512-bit vectors
+[Decision] The CPU level is chosen at build time (cpu = "x86-64-v3" in the profile, or --cpu=). The compiler does not emit runtime feature dispatch by itself; a routine may carry @multiversion("x86-64", "x86-64-v3"), which emits one body per level plus a resolver run once at start-up (through a cpuid probe in pcn_start) that fills a function-pointer slot. Code compiled for a level the machine lacks is a configuration error, not an emulated case. An optional tune = "<name>" selects the scheduling model (default: a generic modern-core model).
+Tier-1 invariants: 64-bit pointers; little-endian; size is 64-bit; the x87 FPU is never used; the MXCSR rounding mode is assumed to be round-to-nearest-even with flush-to-zero and denormals-are-zero both off (this is the Windows process default, and is required by language spec 5.6). Foreign code that changes these must restore them before returning (E-ABI documentation requirement, not enforced).
+B.3 PMIR structure
+machine_function  := name, abi, frame_info, machine_block+
+machine_block     := label, preds, succs (with probabilities), instr*, live_in*
+instr             := opcode  def_operands  use_operands  [implicit defs/uses]  flags
+operand           := vreg | physreg | imm | frame_index | symbol(+offset) | mem | label | cond_code
+mem               := base(vreg|rip|frame_index), index(vreg)*scale, disp(imm|symbol), segment?, size
+• Register classes: GR8 GR16 GR32 GR64, FR32 FR64 (scalar float in XMM), VR128 VR256 VR512, VK (AVX-512 mask), FLAGS (a single pseudo-register for EFLAGS, def/used implicitly by arithmetic and conditional instructions).
+• SSA in PMIR. Until SSA destruction, each virtual register has one definition; block parameters of PCIR become PMIR PHI pseudo-instructions. Tied operands express x86 two-address form: ADD32rr %d(tied-def), %a(tied-use), %b, where %d and %a must receive the same physical register; the allocator inserts a copy when %a is live after.
+• Opcodes are target instructions named by mnemonic and operand form (ADD32rr, ADD32rm, ADD32ri8, IMUL64rri32, MOVZX32rm8, LEA64r, CMOV32rr, JCC, SETCC, MOVSDrm, VFMADD231PDrr...). Every opcode record states: operand classes, implicit defs/uses (flags, RAX, RDX), side-effect class from PCIR's lattice (A.7), encoding templates, latency and throughput per tuning model, and whether it is commutable or foldable (memory-operand folding).
+• Memory operands carry the PCIR alias metadata (!own, alias class, !align, !volatile, !atomic) so scheduling and peephole passes keep using the sound alias model.
+• Frame indexes name stack objects (locals, spill slots, outgoing-argument area, incoming-argument area) until B-ABI-2 assigns offsets.
+B.4 Legalization
+Legalization rewrites PCIR into forms the target can select directly:
+1. Integer widths. i1 becomes an 8-bit register value (0 or 1) or a flags-resident condition when immediately consumed by a branch or select. i8/i16 arithmetic is performed in 32-bit registers with explicit zero- or sign-extension only where a later use needs defined upper bits (instruction selection tracks "known extended" facts to remove redundant extensions). Operations on i128 (not source-visible; arises only from mul.ovf.u64 lowering) are expanded to two-register sequences.
+2. Division and remainder. sdiv/srem and udiv/urem get explicit guards; see B.5.
+3. Shifts and rotates. The x86 shift count is masked to 5 bits for 8/16/32-bit operands and 6 bits for 64-bit. PCIR requires n & (w-1). Therefore: for i32 and i64, a variable shift maps directly (and SHLX/SHRX/SARX under BMI2 avoid the CL constraint); for i8 and i16 the legalizer inserts AND ecx, w-1 (or promotes to 32 bits with a prior mask and later narrowing).
+4. Aggregates. Struct-typed SSA values are split into scalars; aggregates in memory use field offsets from the PCIR layout (A.3.1). memcpy/memset of constant small size expands to moves.
+5. Floating point. f32/f64 map to scalar SSE (ADDSS, ADDSD, ...); fabs is ANDPS with a constant mask, fneg is XORPS with the sign mask, fcopysign combines the two; sqrt is SQRTSS/SD; fma is VFMADD* when the CPU level has FMA, otherwise a call to pcn_fma_f64/_f32 (a correctly rounded software implementation) so results never differ between levels.
+6. Conversions. Detailed in B.5.
+7. Constants. Integer immediates that do not fit the instruction form (e.g. 64-bit constants in ALU instructions) are materialized with MOV64ri. Floating constants live in .rdata and are loaded RIP-relative; 0.0 is XORPS reg, reg; all-ones masks use PCMPEQD.
+8. Vectors. <n x t> wider than the CPU level supports are split; masks (<n x i1>) become XMM/YMM lane masks (pre-AVX-512) or VK registers.
+9. ABI phase 1 (B.8).
+B.5 Instruction selection
+Selection works per block on a dependency DAG built from PMIR-ready PCIR, using declarative pattern tables (cost-ordered). A pattern replaces a DAG fragment with one or more machine instructions and states constraints (CPU feature, operand ranges, flag liveness). The covering algorithm is greedy by cost with tie-break on code size. Patterns must preserve PCIR semantics exactly, including at the extremes; the table below lists the non-obvious ones.
+PCIR
+x86-64 lowering
+Notes
+add/sub T
+ADD/SUB; LEA for 3-operand add or add-imm into a different register; INC/DEC not used (partial flags)
+wrapping is native
+mul T
+IMUL r, r/m (low half identical for signed and unsigned); LEA/shift for constants 2^k, 3, 5, 9 and sums
+
+sdiv i32 a, b
+see below
+exact semantics
+udiv i32 a, b
+TEST b,b; JE trap_div0; XOR edx,edx; DIV b
+skip test if !range(b) excludes 0
+shl/lshr/ashr
+SHL/SHR/SAR r, imm (imm masked at compile time) or by CL; BMI2 SHLX/SHRX/SARX
+B.4 item 3
+rotl/rotr
+ROL/ROR (RORX under BMI2)
+
+popcnt/clz/ctz
+POPCNT, LZCNT/TZCNT (v3); otherwise BSR/BSF plus a zero-input fixup so that clz(0)=w, ctz(0)=w; POPCNT absent at x86-64 becomes a table-free bit-twiddling sequence
+exact semantics at 0
+icmp + condbr
+CMP/TEST + Jcc; macro-fusion adjacency preserved
+
+select
+CMOVcc when both arms are already computed and cheap; branchy form if one arm would trap or has high latency
+
+add.ovf.s
+ADD + SETO; .u: ADD + SETC
+one flag read
+mul.ovf.u64
+MUL + SETO
+RDX:RAX
+boundscheck i, n
+CMP i, n; JAE trap_bounds_k
+unsigned compare also rejects negative i; one shared cold stub per (function, loc)
+sitofp
+CVTSI2SD/SS with a preceding XORPS to break the false dependency
+
+uitofp i32
+zero-extend to 64 then CVTSI2SD; uitofp i64: branch on sign bit (halve-with-sticky-bit, convert, double), or VCVTUSI2SD at v4
+exact round-to-nearest-even
+fptosi.sat
+see below
+exact saturating semantics
+fcmp
+UCOMISD/SS then flags decode, with parity check for oeq/une/ordered predicates; ord/uno via UCOMISD x,x-style parity test
+see below
+atomic.load (any order)
+plain MOV
+x86-TSO provides acquire; seq_cst loads need no fence when stores are made strong
+atomic.store relaxed/release
+plain MOV
+
+atomic.store seq_cst
+XCHG [m], r
+implies LOCK
+atomic.rmw add/sub
+LOCK XADD (value needed) or LOCK ADD/SUB (value unused)
+
+atomic.rmw and/or/xor
+LOCK AND/OR/XOR if old value unused; else CAS loop
+
+atomic.rmw xchg
+XCHG [m], r
+
+atomic.rmw min/max
+CMPXCHG loop
+
+atomic.cmpxchg
+LOCK CMPXCHG (CMPXCHG16B only with an explicit 16-byte feature, not default)
+RAX pre-colored
+fence seq_cst
+LOCK OR dword ptr [rsp], 0 or MFENCE (profile choice; default LOCK OR)
+
+fence acquire/release/acq_rel
+no instruction (compiler barrier only)
+
+memcpy n (known small)
+MOV pairs / MOVUPS / VMOVDQU
+
+memcpy n (large or unknown)
+REP MOVSB when ERMS is assumed (v3+ default off; profile flag) else call pcn_rt_memcpy
+
+trap code
+MOV ecx, code; LEA rdx, [rip+loc]; CALL pcn_rt_trap then UD2
+pcn_rt_trap is noreturn
+Signed division (exact semantics: trap on 0, MIN / -1 = MIN, MIN % -1 = 0). x86 IDIV raises #DE both for a zero divisor and for MIN / -1, so both must be handled before the instruction:
+    test   ecx, ecx
+    je     .Ltrap_div0
+    cmp    ecx, -1
+    je     .Lneg            ; divisor is -1: result = -a (wraps: MIN stays MIN); remainder = 0
+    cdq
+    idiv   ecx
+    jmp    .Ldone
+.Lneg:
+    neg    eax               ; quotient
+    xor    edx, edx          ; remainder
+.Ldone:
+Both guards are omitted when range facts exclude the case (!range of the divisor excludes 0 and/or -1, or the divisor is a constant other than 0, -1). Division by a constant power of two uses a shift sequence with sign correction; division by other constants uses the multiply-high reciprocal method with correction, verified at compile time against the exact definition.
+Saturating float-to-int (fptosi.sat.i32 from f64 in XMM0, result EAX), with MIN=-2^31, MAX=2^31-1:
+    cvttsd2si eax, xmm0          ; yields 0x80000000 on NaN or out-of-range
+    ucomisd   xmm0, [rip+.Lmaxf]  ; compare with 2147483647.0
+    jae       .Lsat_max           ; x >= MAX  -> 0x7FFFFFFF  (unordered sets CF=1,PF=1,ZF=1; handled next)
+    ucomisd   xmm0, xmm0
+    jp        .Lnan               ; NaN -> 0
+    jmp       .Ldone              ; otherwise cvttsd2si result is right (MIN included)
+.Lsat_max: mov eax, 0x7FFFFFFF
+    jmp .Ldone
+.Lnan:    xor eax, eax
+.Ldone:
+The jae after UCOMISD is taken for unordered operands as well (CF=1 means below or unordered on Intel/AMD, so JAE is not taken when CF=1; the sequence tests unordered next via JP). The exact flag logic is generated from a table and checked by exhaustive tests over all f32 bit patterns for the 32-bit case and by randomized plus edge-case testing for f64 and 64-bit targets. At v4, VCVTTSD2SI with embedded rounding and VFIXUPIMMSD can implement the same semantics branch-free.
+Float comparison. With UCOMISD a, b: unordered sets ZF=PF=CF=1; a<b sets CF=1; a>b clears all; a=b sets ZF=1. Hence: ogt = ja; oge = jae (CF=0, which is false when unordered because CF=1); olt/ole swap the operands and use ja/jae; oeq = jne .false; jp .false; une = jne .true; jp .true; one = jne with jnp; ord = jnp; uno = jp. All other predicates derive from these by inversion.
+B.6 Scheduling and peepholes
+• Pre-RA scheduling is a per-block list scheduler on the dependency DAG with latencies from the tuning model. It respects PCIR's effect order (A.7), keeps compare/branch pairs adjacent for macro-fusion, and bounds register-pressure growth by switching to a pressure-reducing heuristic when the estimated live count nears the allocatable set size.
+• Post-RA scheduling runs once spilled code exists, limited to local reordering of independent loads and stores and to hiding load-use latency.
+• Peepholes (run after RA and again after relaxation): MOV r,0 → XOR r32,r32 (when flags are dead); CMP r,0 → TEST r,r; use 32-bit forms where the upper half is dead (smaller encoding, zero-extends implicitly); remove MOV r,r copies; fold a load into the consuming ALU instruction (ADD r, [m]) when the loaded register is otherwise dead and the memory effect order allows; convert LEA chains; branch inversion to favor fall-through using block weights; JMP to JMP.
+• Alignment. Loop headers of hot loops (by !weight) are aligned to 16 bytes with multi-byte NOPs; function entries are aligned to 16 bytes; a jump-heavy block never starts within the last 1 byte of a 32-byte window if the tuning model reports the JCC erratum penalty (opt-in tune).
+• AVX hygiene. Any function that executes a 256- or 512-bit VEX/EVEX instruction emits VZEROUPPER before every CALL to non-Paracine code and before RET (this avoids the SSE/AVX transition penalty in callers that use legacy SSE).
+B.7 Register allocation
+Registers. Allocatable GPRs: RAX RCX RDX RBX RSI RDI R8 R9 R10 R11 R12 R13 R14 R15 (and RBP when no frame pointer is required; RSP never). Allocatable vector registers: XMM0-15 (XMM16-31 at v4). Reserved: RSP; RBP when it is the frame pointer. No register is reserved for a thread or runtime pointer (thread data is reached through GS: segment accesses to the TEB, used only by runtime routines).
+Class
+Volatile (caller-saved)
+Non-volatile (callee-saved)
+GPR
+RAX RCX RDX R8 R9 R10 R11
+RBX RBP RDI RSI RSP R12 R13 R14 R15
+XMM (low 128 bits)
+XMM0-XMM5
+XMM6-XMM15
+YMM upper halves, ZMM, XMM16-31, K masks
+all volatile
+none
+Flags
+DF must be clear at calls and returns; arithmetic flags volatile
+
+Algorithm. A split-greedy allocator, in the style of linear-scan-with-splitting but driven by priority: (1) compute live intervals over SSA-destructed PMIR; (2) assign priorities by spill weight (loop-depth-weighted use density from !weight); (3) process intervals highest priority first, choose a free register honoring hints (copy partners, tied operands, ABI pre-colors); (4) if none, try eviction of lower-weight intervals, then splitting around loop boundaries and calls (intervals live across a call prefer non-volatile registers; if none are available the interval is split around the call), then spilling; (5) after assignment, rewrite virtual registers, insert spill/reload code with rematerialization where cheap (constants, addresses of globals and frame objects, loads from .rdata), then coalesce remaining copies. At opt=1 the allocator is replaced by a faster linear-scan variant with no splitting; both obey the same constraints, so behavior is identical.
+Constraints modeled as pre-colored registers or register hints: IDIV/DIV and MUL use RAX/RDX; variable shifts use CL (unless BMI2); CMPXCHG uses RAX; string moves use RSI/RDI/RCX; calls clobber the volatile set (modeled as a regmask on the CALL); two-address instructions use tied operands (B.3); 8-bit register operands must avoid AH/BH/CH/DH conflicts with REX-requiring registers (the allocator never uses the high-byte registers).
+Spill slots are frame indexes sized and aligned by class (8 bytes GPR, 16 bytes vector, 32/64 for wider). Slots whose live ranges do not overlap are shared (stack coloring), using PCIR's lifetime.start/end markers and the allocator's own intervals.
+B.8 Microsoft x64 ABI lowering (B-ABI-1)
+This section states the rules the backend implements for every routine and call that crosses the external boundary (exported routines, foreign declarations, routine pointers whose address escapes, and the entry point). It follows the public Microsoft x64 calling convention as I know it; [Verify] every item against the current Microsoft documentation before implementation.
+B.8.1 Argument passing
+• Arguments are assigned by position, left to right. Position i (0-based, first four) uses the i-th register of the integer sequence RCX, RDX, R8, R9 if the argument is an integer, pointer, or small aggregate, or the i-th register of XMM0, XMM1, XMM2, XMM3 if it is float or double. The two sequences share the same position counter: a double as the second argument occupies XMM1, and RDX is then unused.
+• Arguments after the fourth go on the stack, each in its own 8-byte slot at [RSP + 32 + 8*(i-4)] relative to the caller's RSP at the call instruction (above the 32-byte shadow space).
+• Integers narrower than 64 bits are passed in the low bits of the register; the upper bits are unspecified (callee must not assume extension) and the callee extends as needed. Paracine as a caller always passes bool, char, byte, short, int values with defined zero/sign extension to 32 bits (harmless, helps some foreign callees), and as a callee never relies on the upper bits of such arguments.
+• Aggregates (records, tuples, views, spans, text): if the size is exactly 1, 2, 4 or 8 bytes the value is passed in a register as if it were an integer of that size (even if its fields are floating point). For every other size (including 3, 5, 6, 7 and anything above 8 bytes, e.g. a view<T> or text at 16 bytes) the caller makes a copy in its own frame and passes a pointer to the copy in the integer register or stack slot. The callee owns that copy for the duration of the call, so it may modify it.
+• Vector values (vec<T,N>, 128-bit and larger) are passed by reference like other large aggregates under the plain Microsoft x64 convention.
+• Shadow space: the caller always reserves 32 bytes immediately above the return address's slot (at [RSP .. RSP+31] at the call), whether or not the callee has four register parameters. The callee may use it to spill RCX, RDX, R8, R9 (their "home" slots) or as scratch. A leaf routine that makes no calls need not reserve shadow space for its own callees, but must still treat the area its caller provided as writable by itself.
+• Variadic calls (foreign c routine printf(fmt: raw<ubyte>, ...); this requires the small grammar amendment param_list = param { ',' param } [ ',' '...' ] in foreign_decl only): floating-point arguments among the first four positions are passed in the XMM register and duplicated in the corresponding integer register. The callee's argument-spill logic depends on this.
+B.8.2 Return values
+Result type
+Location
+integer or pointer up to 64 bits, bool, char
+RAX (upper bits unspecified for narrow types)
+float, double
+XMM0
+aggregate of size exactly 1, 2, 4 or 8
+RAX
+any other aggregate (including views and text)
+hidden pointer: the caller passes the address of a result buffer as an extra first argument in RCX (shifting all other arguments by one position), and the callee returns that same address in RAX
+128-bit vector
+XMM0
+void, never
+none
+B.8.3 Registers across calls
+See the table in B.7. In addition: the direction flag is clear on entry to and return from every routine; the stack pointer is 16-byte aligned at the call instruction (so RSP is 8 mod 16 on entry to a callee); the callee must restore every non-volatile register it modifies; the caller cleans up all stack arguments (in practice the frame reserves the outgoing area once). There is no red zone: nothing may be stored below RSP.
+B.8.4 The internal convention [Decision]
+The plain convention passes 16-byte views by reference through memory, which costs stores and loads on every call of the very common view<T>/text routines. Because the language never exposes machine addresses of non-exported routines, the backend may use a faster convention for them without changing observable behavior (language spec 5.11).
+A routine uses the internal convention (pcn) iff it is not exported, its address is never taken, and it is not called through a routine pointer or from foreign code. Otherwise it uses msx64. The internal convention is enabled at opt >= 2:
+• Integer-class arguments (including each 8-byte half of a larger aggregate, split by field boundaries; so a view<T> is two registers) use, in order, RCX, RDX, R8, R9, R10, R11, RAX-free subset: RCX RDX R8 R9 R10 R11. Float-class arguments use XMM0–XMM5. Position is not shared; each class counts separately. Any remaining arguments go on the stack at [RSP + 8*k] with no shadow space.
+• Aggregates up to 32 bytes are passed split into scalars; larger ones by reference to a caller-owned copy.
+• Results: up to two integer-class values in RAX, RDX; up to two float-class values in XMM0, XMM1; larger results through a hidden pointer in RAX-less form: the pointer is the first integer argument in RCX, and the callee does not need to return it.
+• Volatile/non-volatile sets are identical to the Microsoft x64 convention, so an internal routine can be called from an msx64 stub and vice versa without extra saves.
+• The stack alignment rule is the same. Every routine, internal or not, has full Windows unwind data (B.9).
+When an exported routine has an internal body (it takes a view or returns a record, say), the compiler emits the body with the internal convention and an ABI thunk with the msx64 signature that loads the by-reference arguments into registers and tail-jumps to the body. If the body is small, it is inlined into the thunk.
+B.9 Frame construction and unwind data (B-ABI-2)
+B.9.1 Layout
+higher addresses
+  +------------------------------+
+  |  caller's frame / its outgoing|  <- includes the shadow space + stack args
+  |  argument area                |
+  +------------------------------+
+  |  return address               |  <- RSP at function entry (8 mod 16)
+  +------------------------------+
+  |  pushed non-volatile GPRs     |  (push in a fixed order: RBP, RBX, RSI, RDI, R12-R15)
+  +------------------------------+
+  |  alignment padding            |
+  +------------------------------+
+  |  saved non-volatile XMM regs  |  (16-aligned, via MOVAPS)
+  +------------------------------+
+  |  locals, spill slots, allocas |
+  +------------------------------+
+  |  outgoing argument area       |  shadow space (32 B) + stack args; 16-aligned at its end
+  +------------------------------+  <- RSP after the prologue
+lower addresses
+Rules. (1) All stack adjustment happens in the prologue: RSP is constant throughout the body (no push/pop inside the body), so every address is RSP-relative and unwind data is static. (2) The frame size is chosen so that RSP is 16-byte aligned after the prologue. (3) The outgoing-argument area is sized for the maximum number of stack arguments over all calls in the routine plus 32 bytes of shadow space, omitted if the routine is a leaf. (4) A frame pointer (RBP) is established only if the routine uses alloca with a dynamic count, has an object aligned above 16 bytes, or carries @frame_pointer; then LEA RBP, [RSP + off] (with off a multiple of 16 and at most 240) follows the allocation, and all locals are RBP-relative or RSP-relative as the unwind data allows. (5) A stack probe is required for frames of 4096 bytes or more: the prologue calls __chkstk (provided by the runtime object pcn_rt with the Windows-compatible contract: RAX = frame size in bytes; it touches each page in descending order and preserves all registers except R10, R11 and the flags) before SUB RSP, RAX. [Verify] the exact __chkstk contract. (6) Large frames also set SizeOfProlog and the unwind codes accordingly.
+B.9.2 Prologue and epilogue shapes required by Windows unwinding
+Windows x64 requires that the prologue and epilogue be one of a small set of recognizable shapes, because the unwinder interprets the epilogue by pattern when it must unwind from inside it.
+Prologue, in this order:
+1. optional PUSH of non-volatile GPRs (any order, recorded in the unwind codes);
+2. one stack allocation: SUB RSP, imm (or LEA RSP, [RSP-imm], or the __chkstk form);
+3. optional LEA RBP, [RSP+off] (frame pointer);
+4. optional MOV [RSP+off], reg for non-volatile GPR saves (SAVE_NONVOL) and MOVAPS [RSP+off], XMMn for XMM saves (SAVE_XMM128);
+5. then the body.
+Epilogue (every return path):
+1. ADD RSP, imm or LEA RSP, [RBP+imm] (undoes step 2 and 3 of the prologue);
+2. POP of the pushed registers in reverse order;
+3. RET, or a tail JMP (JMP rel32, JMP [rip+disp32], or REX.W JMP r/m64).
+No other instruction may appear between the first epilogue instruction and the RET, except the register restores that are recognized as part of the epilogue. Tail calls are implemented as epilogue + JMP, so they are also unwindable.
+B.9.3 Unwind records
+For every function the frame builder produces an abstract unwind record: the code offset ranges, the prologue size, the frame register (if any), and the ordered list of codes. Part C serializes them into .xdata/.pdata. Summary of the unwind operations used by Paracine (numbers per the Windows x64 unwind format, [Verify]):
+Code
+Value
+Used for
+UWOP_PUSH_NONVOL
+0
+PUSH of a non-volatile GPR
+UWOP_ALLOC_LARGE
+1
+SUB RSP, imm with size 136 bytes to 512K−8 (16-bit form) or up to 4GB−8 (32-bit form)
+UWOP_ALLOC_SMALL
+2
+SUB RSP, imm of 8 to 128 bytes
+UWOP_SET_FPREG
+3
+establishing the frame register
+UWOP_SAVE_NONVOL / _FAR
+4 / 5
+MOV [RSP+off], reg (near/far offsets)
+UWOP_SAVE_XMM128 / _FAR
+8 / 9
+MOVAPS [RSP+off], XMMn
+UWOP_PUSH_MACHFRAME
+10
+not generated by Paracine (hardware-interrupt frames)
+Paracine has no exceptions in the language, so unwind data exists for three purposes: (1) stack walks by debuggers, profilers, and crash handlers; (2) correct behavior of the Windows structured-exception machinery when a hardware fault (access violation, stack overflow, illegal instruction from UD2 after a trap stub) propagates out of the program; (3) interop with foreign code that expects to walk Paracine frames. The runtime installs a vectored exception handler in pcn_start that maps stack-overflow and UD2 faults to the StackExhausted and Unreachable traps (language spec 5.10) and then calls the program's trap handler.
+B.10 Code model, addressing and relocations
+• Small code model. All code and data of an image lie within 2 GiB, so code addresses data and other code RIP-relatively with 32-bit displacements. Direct calls are CALL rel32; data references are [rip + sym].
+• Imports. A call to an imported function is CALL [rip + __imp_Name] (an indirect call through the import address table); LEA of an imported function's address loads from the same slot. Delay-load is a linker option (Part C).
+• Image base independence. Executables default to DYNAMICBASE with high-entropy ASLR, so the code is position-independent: no absolute 32-bit address appears in code. Absolute 64-bit addresses appear only in data (tables of routine pointers, relocated by base relocations, Part C).
+• Switch tables. switch with at least 5 dense cases lowers to a jump table in .rdata of 32-bit image-relative offsets (ADDR32NB relocations): LEA rdx, [rip+table]; MOV eax, [rdx+idx*4]; LEA rcx, [rip+__ImageBase]; ADD rax, rcx; JMP rax. Sparse cases lower to a binary search of compares.
+• Relocation kinds used (COFF IMAGE_REL_AMD64_*, Part C): REL32 (call/branch/RIP-relative data), ADDR64 (64-bit data pointers), ADDR32NB (image-relative RVAs in tables and unwind data), SECTION/SECREL (debug info), REL32_n forms are not used (the compiler computes the trailing-immediate adjustment itself, or uses REL32 plus an addend).
+• Alignment of data: .rdata constants are aligned to their natural alignment, vector constants to 16 bytes.
+B.11 Branch relaxation and encoding
+• Branch relaxation. Every branch starts as the short form (rel8) if the target is in the same function and the distance is not yet known to exceed 127 bytes; layout then iterates: assign offsets, convert out-of-range short branches to rel32, repeat until no branch changes (monotone, so it terminates). Cross-function and cross-section references always use rel32 with a relocation.
+• Encoder. Table-driven: for each opcode form, a template (legacy prefixes, REX, VEX/EVEX, opcode map, ModRM and SIB rules, displacement and immediate sizes). Selection among equivalent encodings prefers: shortest; disp8 when the displacement fits; no REX when no extended or 64-bit operand; RIP-relative with disp32 always for symbols. Addressing special cases (RSP/R12 as base need a SIB; RBP/R13 as base with no displacement need disp8 = 0) are covered by table tests.
+• Integrated disassembly. pcn asm and pcn obj --listing print assembly decoded from the final bytes (a separate decoder), not from PMIR, so a mismatch between intended and encoded instructions is visible. The encoder and the decoder are tested against each other for every opcode form with randomized operands.
+• Relocations. Each fixup is recorded as (section, offset, symbol, type, addend) and handed to Part C.
+B.12 Textual PMIR and a complete example
+For the sum routine of the PCIR example (language spec routine sum(xs: view<int>) gives int), if the routine is not exported (internal convention; the view arrives in RCX, RDX):
+machine_function @sum  abi=pcn  frame={leaf}
+bb0:
+  %p:gr64   = COPY $rcx
+  %n:gr64   = COPY $rdx
+  %i:gr64   = MOV64r0               ; zero idiom
+  %acc:gr32 = MOV32r0
+  JMP bb1
+bb1:                                  ; loop header, weight 1000
+  %i1:gr64 = PHI [%i, bb0], [%i2, bb2]
+  %a1:gr32 = PHI [%acc, bb0], [%a2, bb2]
+  CMP64rr %i1, %n, implicit-def $eflags
+  JCC cond=ae, bb3, implicit $eflags
+bb2:
+  %a2:gr32 = ADD32rm %a1(tied), %p, scale=4, index=%i1, disp=0   ; load folded, !own shared
+  %i2:gr64 = ADD64ri8 %i1(tied), 1
+  JMP bb1
+bb3:
+  $eax = COPY %a1
+  RET implicit $eax
+Final code after register allocation and encoding (generic CPU level):
+sum:
+    xor   eax, eax            ; acc
+    xor   r8d, r8d            ; i
+    jmp   .Lcheck
+    align 16
+.Lbody:
+    add   eax, dword ptr [rcx+r8*4]
+    inc   r8                  ; (ADD r8, 1 where flags/stall policy forbids INC)
+.Lcheck:
+    cmp   r8, rdx
+    jb    .Lbody
+    ret
+If the same routine is exported, the thunk with the plain Microsoft x64 convention (the view arrives by reference in RCX) is:
+sum:                              ; msx64 thunk
+    mov   rdx, qword ptr [rcx+8]  ; count
+    mov   rcx, qword ptr [rcx]    ; pointer
+    jmp   sum$body                ; body uses the internal convention
+B.13 Debug information
+The native backend emits CodeView records (.debug$S symbols and line tables, .debug$T types) in objects and produces a .pdb through Paracine's own PDB writer (MSF container with DBI, TPI, IPI and symbol streams). Variable locations are derived from final register assignments and spill slots, with location ranges per live range. The PDB writer's file-format details are outside this document and need a separate specification. -g0 omits all debug data; -g1 emits line tables only; -g2 emits full variable information.
+B.14 Machine verification and testing
+1. Machine verifier (runs after every PMIR phase in debug builds): operand register classes valid; each tied pair assigned identical registers after RA; every use dominated by a def (pre-RA SSA) or reached by a live def (post-RA); EFLAGS not live across an instruction that clobbers it; frame indexes resolved after B-ABI-2; stack alignment is 16 bytes at every CALL; callee-saved registers restored on every RET path; prologue and epilogue match the shapes of B.9.2; unwind codes reproduce the prologue effect when simulated.
+2. Semantic tests. Every PCIR test program (Part A, A.14) is run through the native backend and compared with the PCIR reference interpreter. Operator tables of B.5 are tested exhaustively on small widths and by random plus edge sampling on wide ones (including MIN / -1, shifts by 0 and by ≥ w, NaN, ±0, saturation boundaries).
+3. ABI conformance. A matrix of C and C++ test programs compiled with MSVC and Clang-cl calls Paracine exports and is called by them across all argument-class combinations of B.8 (sizes 1–32 bytes, floats in mixed positions, 5+ arguments, variadics, hidden-pointer returns, large aggregates), checking values and register preservation.
+4. Unwinder tests. RtlVirtualUnwind on frames captured at every instruction of generated prologues/epilogues, comparing the recovered RSP/RIP with the expected values; tests with huge frames, frame pointers, XMM saves, and tail calls.
+5. Allocator stress. Randomized programs with up to thousands of live values, checked against the PCIR interpreter; forced-spill mode (artificially few registers) must produce identical results.
+6. Cross-platform CI. On non-Windows CI hosts the produced code is executed under an x86-64 emulator using a Windows-ABI shim; this validates codegen but not OS interaction.
+Part C. COFF object writer, archives, linker and PE32+ writer
+C.1 Components and data flow
+PMIR encoder output
+   (sections, symbols, relocations, unwind records, debug records)
+        |
+        v
+  in-memory object model  ---------------------->  COFF writer  ---->  program.obj
+        |
+        |  (for .exe / .dll builds, the same object model, plus inputs read from disk)
+        v
+  linker: load inputs -> resolve -> COMDAT -> GC -> merge -> layout
+          -> imports/exports -> relocate -> base relocs -> unwind table -> headers
+        |
+        v
+    PE32+ writer  ------------------------------>  program.exe / program.dll
+The object model is the single interchange structure inside the compiler: the .obj path serializes it, the .exe path links it directly without a round trip through disk (although --save-temps can write the intermediate .obj for inspection, and the result must be identical). Standalone pcn link reads .obj and .lib files from disk into the same model, so the two paths use the same code.
+Numeric constants in this part follow the published Microsoft PE/COFF specification as I know it; values marked [Verify] deserve a check against the current document. Everything is little-endian.
+C.2 The in-memory object model
+object   := name, machine, sections[], symbols[], directives[], flags
+section  := name, characteristics, alignment, data (bytes | zero-fill size),
+            relocations[], comdat?, associated_with?, order_key
+symbol   := name, section | undefined | absolute | debug, value (offset), type (function | data),
+            storage (external | static | weak_external | label | file | section),
+            aux (section_def | weak_ext | file_name)
+reloc    := offset_in_section, symbol, type, addend
+comdat   := selection (any | same_size | exact_match | largest | no_duplicates | associative), leader_symbol
+Addends are kept explicit in the model (reloc.addend). COFF stores addends in the section bytes, not in the relocation record, so the writer patches the addend into the bytes at the fixup position when it serializes (and the reader extracts them back).
+C.3 COFF object file format
+C.3.1 Layout of an .obj file
++-----------------------------+
+| COFF file header (20 bytes) |
++-----------------------------+
+| section headers (40 each)   |
++-----------------------------+
+| section raw data            |   (each aligned as the writer chooses; 4-byte alignment recommended)
+| relocations (10 each)       |   (immediately after each section's data)
++-----------------------------+
+| COFF symbol table (18 each) |
++-----------------------------+
+| string table                |   (first 4 bytes = total size including these 4 bytes)
++-----------------------------+
+File header (20 bytes): Machine u16 = 0x8664 (AMD64); NumberOfSections u16; TimeDateStamp u32 = 0 (reproducibility, C.12); PointerToSymbolTable u32; NumberOfSymbols u32; SizeOfOptionalHeader u16 = 0; Characteristics u16 = 0.
+Section header (40 bytes): Name[8] (names longer than 8 bytes are written as /n with n the decimal offset into the string table); VirtualSize u32 = 0; VirtualAddress u32 = 0; SizeOfRawData u32; PointerToRawData u32 (0 for zero-fill sections); PointerToRelocations u32; PointerToLinenumbers u32 = 0; NumberOfRelocations u16; NumberOfLinenumbers u16 = 0; Characteristics u32.
+Section characteristics used (bit values, [Verify]):
+Flag
+Value
+Meaning
+IMAGE_SCN_CNT_CODE
+0x00000020
+contains code
+IMAGE_SCN_CNT_INITIALIZED_DATA
+0x00000040
+initialized data
+IMAGE_SCN_CNT_UNINITIALIZED_DATA
+0x00000080
+zero-fill
+IMAGE_SCN_LNK_INFO
+0x00000200
+linker directives (.drectve)
+IMAGE_SCN_LNK_REMOVE
+0x00000800
+not copied to the image
+IMAGE_SCN_LNK_COMDAT
+0x00001000
+COMDAT section
+IMAGE_SCN_ALIGN_{1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192}BYTES
+0x00100000 ... 0x00E00000 (in steps of 0x00100000)
+alignment 2^(n-1)
+IMAGE_SCN_LNK_NRELOC_OVFL
+0x01000000
+more than 65,535 relocations (count held in first reloc)
+IMAGE_SCN_MEM_DISCARDABLE
+0x02000000
+may be discarded after load
+IMAGE_SCN_MEM_EXECUTE
+0x20000000
+executable
+IMAGE_SCN_MEM_READ
+0x40000000
+readable
+IMAGE_SCN_MEM_WRITE
+0x80000000
+writable
+Standard Paracine sections:
+Section
+Content
+Flags
+.text$mn
+hot code (per-function COMDAT sections at opt >= 1)
+code, exec, read, align 16
+.text$x
+cold stubs: trap stubs, rarely executed paths
+code, exec, read, align 16
+.text$thunk
+ABI thunks and import thunks
+code, exec, read, align 16
+.rdata, .rdata$str
+constants, string literals, jump tables, float constants
+init data, read, align per constant
+.data
+initialized mutable statics
+init data, read, write
+.bss
+zero-initialized statics
+uninit data, read, write
+.pdata
+RUNTIME_FUNCTION entries
+init data, read, align 4
+.xdata
+UNWIND_INFO blobs
+init data, read, align 4
+.tls$
+thread-local template data
+init data, read, write
+.drectve
+linker directives (text)
+`LNK_INFO
+.debug$S, .debug$T
+CodeView symbols and types
+init data, read, discardable, align 1
+Typical full flag words: .text = 0x60500020; .rdata = 0x40300040/0x40400040; .data = 0xC0400040; .bss = 0xC0400080; .pdata/.xdata = 0x40300040; .drectve = 0x00100A00; .debug$S = 0x42100040 (with the alignment bits chosen per section). [Verify]
+C.3.2 Relocations
+10-byte records: VirtualAddress u32 (offset of the fixup within the section), SymbolTableIndex u32, Type u16. Types used by Paracine for AMD64 ([Verify]):
+Type
+Value
+Computation (S = symbol address, A = addend in bytes, P = fixup address)
+Used for
+IMAGE_REL_AMD64_ABSOLUTE
+0
+ignored
+padding
+IMAGE_REL_AMD64_ADDR64
+1
+64-bit S + A (virtual address)
+pointers in data
+IMAGE_REL_AMD64_ADDR32
+2
+32-bit VA (not used: not PIC)
+not emitted
+IMAGE_REL_AMD64_ADDR32NB
+3
+32-bit S + A - ImageBase (RVA)
+.pdata, .xdata, switch tables
+IMAGE_REL_AMD64_REL32
+4
+32-bit S + A - (P + 4)
+calls, jumps, RIP-relative data
+IMAGE_REL_AMD64_REL32_1 ... _5
+5-9
+S + A - (P + 4 + n)
+RIP-relative with n trailing immediate bytes (Paracine instead emits REL32 with an adjusted addend)
+IMAGE_REL_AMD64_SECTION
+10
+16-bit section index of S
+debug info
+IMAGE_REL_AMD64_SECREL
+11
+32-bit offset of S within its section
+debug info, TLS offsets
+A section with more than 65,535 relocations sets LNK_NRELOC_OVFL, stores the real count in the first relocation's VirtualAddress field, and the writer sets NumberOfRelocations = 0xFFFF.
+C.3.3 Symbol table
+Each entry is 18 bytes: Name[8] (if the name is at most 8 bytes it is inline, zero-padded; otherwise the first 4 bytes are zero and the next 4 bytes are an offset into the string table); Value u32; SectionNumber i16 (1-based index; 0 = undefined external; -1 = absolute; -2 = debug); Type u16 (0x20 for functions, 0 otherwise); StorageClass u8; NumberOfAuxSymbols u8.
+Storage classes used: IMAGE_SYM_CLASS_EXTERNAL (2), STATIC (3), LABEL (6), FILE (103), WEAK_EXTERNAL (105). [Verify]
+Symbol-table order (deterministic): (1) the .file symbol with one auxiliary record holding the source name; (2) for every section, in section order, a section symbol (STATIC, name = section name, one aux record: Length, NumberOfRelocations, NumberOfLinenumbers, CheckSum, Number, Selection); (3) defined external symbols in section order then by offset; (4) defined static (module-private) symbols that relocations need; (5) undefined externals in first-use order; (6) absolute symbols. Auxiliary section records carry the CRC-32 CheckSum of the section contents for COMDAT sections whose selection is any/same_size/exact_match (this is what lets the linker detect mismatched duplicates), and for associative COMDATs the Number field holds the section number of the leader and Selection = 5.
+COMDAT. A COMDAT section sets LNK_COMDAT; its leader symbol is the first symbol defined in it, EXTERNAL, and the section-symbol aux record carries the selection kind: NODUPLICATES = 1, ANY = 2, SAME_SIZE = 3, EXACT_MATCH = 4, ASSOCIATIVE = 5, LARGEST = 6. Paracine uses: ANY for monomorphized generic instances (language spec 6.6; identical bodies by construction); ASSOCIATIVE for each function's .pdata and .xdata entry (tied to the function's code section so they live and die together); NODUPLICATES for ordinary exported routines at opt >= 1 (one COMDAT section per function, so --gc-sections can remove unused functions); LARGEST is reserved for tentative-definition-like merging and unused by the compiler.
+String table. Starts with a u32 length (including itself); strings are NUL-terminated and appended in first-use order, without deduplication of suffixes (keeps output deterministic and simple). Section names longer than 8 bytes are written as /<decimal offset>.
+Big objects. If an object would exceed 65,279 sections (a heavily generic module with per-function sections), the writer switches to the bigobj variant (an ANON_OBJECT_HEADER_BIGOBJ with 32-bit section numbering and 20-byte symbol records). [Verify] layout details. The reader accepts both.
+C.3.4 .drectve
+A section of ASCII/UTF-8 text of space-separated linker directives, e.g. /DEFAULTLIB:"kernel32" /EXPORT:Add=pcn$acme$net$add /INCLUDE:pcn_start /MERGE:.xdata=.rdata. Paracine writes /DEFAULTLIB for each from "x.dll" import library named by foreign declarations, /EXPORT for export items that need a DLL export, and /INCLUDE for symbols that must be kept alive (e.g. runtime hooks). The linker (C.8) processes directives from every input.
+C.3.5 Unwind sections
+For each function in .text$mn$<fn> the writer emits:
+.xdata$<fn>:  UNWIND_INFO                       (associative COMDAT -> .text$mn$<fn>)
+   byte 0   : Version (bits 0-2) = 1 | Flags (bits 3-7) = 0 (no handler, no chain)
+   byte 1   : SizeOfProlog (offset of the end of the prologue, in bytes)
+   byte 2   : CountOfUnwindCodes (slots, including operand slots)
+   byte 3   : FrameRegister (low 4 bits; 0 if none, 5 = RBP) | FrameOffset/16 (high 4 bits)
+   then CountOfUnwindCodes 16-bit slots, in REVERSE order of prologue execution,
+   padded to an even number of slots
+
+.pdata$<fn>:  RUNTIME_FUNCTION  (12 bytes, associative COMDAT -> .text$mn$<fn>)
+   BeginAddress   u32  : ADDR32NB reloc -> <fn> symbol + 0
+   EndAddress     u32  : ADDR32NB reloc -> <fn> symbol + code size
+   UnwindInfo     u32  : ADDR32NB reloc -> the .xdata$<fn> symbol
+UNWIND_CODE slot (16 bits): byte 0 = CodeOffset (offset in the prologue after the instruction that performed the operation), byte 1 = UnwindOp (low 4 bits) | OpInfo (high 4 bits). Encodings of the operations of B.9.3 ([Verify]):
+• PUSH_NONVOL (0): OpInfo = register number (RAX=0, RCX=1, RDX=2, RBX=3, RSP=4, RBP=5, RSI=6, RDI=7, R8..R15 = 8..15).
+• ALLOC_SMALL (2): OpInfo = (size - 8) / 8 for sizes 8..128.
+• ALLOC_LARGE (1): OpInfo = 0: one extra slot holds size / 8 (sizes 136 .. 512K-8); OpInfo = 1: two extra slots hold the 32-bit size.
+• SET_FPREG (3): no operand; the register and scaled offset are in the header bytes.
+• SAVE_NONVOL (4): OpInfo = register; one extra slot holds the RSP-relative offset / 8; SAVE_NONVOL_FAR (5): two extra slots hold the 32-bit offset.
+• SAVE_XMM128 (8): OpInfo = XMM register; one extra slot holds the offset / 16; SAVE_XMM128_FAR (9): 32-bit offset.
+The writer simulates each function's unwind codes against its prologue bytes and compares the resulting stack-pointer and register state with the frame builder's intent (a compile-time self-check, B.14).
+C.4 COFF writer algorithm
+1. Normalize the model. Order sections by order_key (fixed priority: .text$mn*, .text$x, .text$thunk, .rdata*, .data, .bss, .xdata*, .pdata*, .tls$*, .drectve, .debug$*), preserving the order functions were compiled (module order, then source order). COMDAT functions keep this order.
+2. Assign numbers. Section numbers 1..N; collect symbols in the order of C.3.3; assign symbol indexes (auxiliary records occupy index slots).
+3. Resolve names. Names over 8 bytes go to the string table in order of first use.
+4. Patch addends into section bytes at each relocation offset (for REL32: addend A is stored minus nothing: the stored 32-bit value is A, where the instruction-relative -4 adjustment is implicit in the relocation type). The encoder (B.11) supplies A consistent with that convention.
+5. Compute file offsets: headers; section data in order, each aligned to 4 bytes in the file; after each section its relocations; then symbol table; then string table.
+6. Emit in a single pass with a byte buffer; PointerToRawData = 0 for zero-fill; SizeOfRawData = size.
+7. Self-verify (in debug and CI builds): read the produced bytes back with the independent reader and compare to the model.
+The writer never emits non-deterministic data: timestamp 0, no absolute paths in the .file symbol unless --embed-paths, no uninitialized padding (padding bytes are 0, or 0xCC in code sections for debug-friendliness).
+C.5 Interoperating with foreign toolchains
+A Paracine object must link with Microsoft link.exe and LLVM lld-link, and Paracine's linker must accept their objects. Requirements: use only standard COFF features above; define __ImageBase usage through the linker-provided symbol; supply __chkstk and the runtime entry in pcn_rt.lib when a foreign linker is used (the foreign linker needs /ENTRY:pcn_start /SUBSYSTEM:CONSOLE /NODEFAULTLIB); never require the C runtime. Objects produced by MSVC that reference the CRT (mainCRTStartup, __security_cookie, _fltused, etc.) require the CRT .libs when linked by Paracine's linker; they are simply additional inputs.
+C.6 Archives and import libraries
+Static library .lib (Unix ar format as used by Windows): signature !<arch>\n; then members, each with a 60-byte header (Name[16], Date[12], UID[6], GID[6], Mode[8], Size[10], EndHeader[2] = "\n"), data padded to even length. Special members, in order: (1) **first linker member** /: big-endian count and big-endian offsets of members, followed by the symbol-name strings; (2) **second linker member** /: little-endian member offset table, a sorted array of symbol-to-member indexes, and the strings (this is the one modern linkers use for fast lookup); (3) **longnames member** //for member names over 15 bytes; then the object members. Paracine'spcn lib` writes both linker members with sorted, deterministic symbol tables; member timestamps are 0.
+Import library (.lib made for a DLL). Each import is a short import member rather than a full object: IMPORT_OBJECT_HEADER (Sig1 u16 = 0, Sig2 u16 = 0xFFFF, Version u16, Machine u16 = 0x8664, TimeDateStamp u32, SizeOfData u32, Ordinal/Hint u16, Type:2 | NameType:3 | Reserved:11 u16) followed by the NUL-terminated import name and then the NUL-terminated DLL name. The linker expands each short import into the symbols __imp_<name> (pointing at the IAT slot) and <name> (a small jmp [__imp_<name>] thunk, only materialized if referenced). Type is 0 for code, 1 for data, 2 for const; NameType is 0 for import by ordinal, 1 by name, 2 with prefix removed, 3 undecorated. [Verify]
+pcn lib creates import libraries for Paracine DLLs from their export lists, and reads the import libraries of the Windows SDK as inputs.
+
+
+## *** ##
+
+
