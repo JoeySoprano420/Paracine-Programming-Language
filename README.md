@@ -1,3895 +1,3916 @@
 PARACINE — ".pcn"
 
-Fully Mature, Hardened, Industry-Grade Native Programming Language
+Final Normative Resolution and Production Completion Standard
 
 Edition: Ultimate Multi-Output Production Standard
-Status: Finalized, stable, production-hardened
-Language class: Native general-purpose, systems, performance, application, numerical, infrastructure, and real-time programming language
-Compilation: Ahead-of-time native compilation
+Language edition: 2026
+Specification level: 1.0 Final
+Status: Frozen production definition
 Canonical compiler implementation: C++23
+Canonical textual output: C++20
+Canonical native object output: COFF ".obj"
+Canonical native executable output: PE32+ ".exe"
+Canonical Tier-1 target: Windows x86-64
+Canonical external ABI: Microsoft x64 ABI
+Canonical semantic IR: PCIR
+Canonical machine IR: PMIR
 
-Canonical output targets
+This document completes and freezes the Paracine Language Specification and Paracine Backend Specifications.
 
-C++20 source text     → .cpp
-COFF native object    → .obj
-PE32+ executable      → .exe
+Where this document conflicts with an earlier "[Decision]", "[Verify]", open issue, tentative statement, or incomplete backend clause, this document is authoritative.
 
-Canonical textual backend: Standards-conforming C++20 source generation
-Canonical native backend: Independent Paracine direct-native backend
-Canonical Tier-1 native target: Windows x86-64
-Canonical ABI: Microsoft x64 ABI
-Canonical object format: COFF ".obj"
-Canonical executable format: PE32+ ".exe"
-Semantic optimization model: PCIR
-Native machine representation: Paracine Machine IR
-Runtime model: Minimal, non-managed, demand-linked
-Memory model: Native value semantics + explicit ownership + views + raw authority
-Concurrency model: Native threads, atomics, structured-library concurrency
-Error model: Explicit result semantics
-Interop: Native C ABI, Microsoft x64 ABI, Windows native libraries, C++20 textual interoperability
-Primary design objective: Maximum readable semantic clarity with minimum surviving machine work
+All earlier provisions not changed here remain in force.
 
-Governing principle
-
-«Make the program obvious to the reader and unsurprising to the machine.»
-
-Optimization law
-
-«Resolve what is known. Remove what is unnecessary. Represent what remains directly.»
-
-Implementation law
-
-«Every language feature has complete, deterministic, testable lowering into every supported output form.»
-
-Production law
-
-«Runtime contains only work that remains semantically necessary after compilation.»
-
-Multi-output law
-
-«One Paracine program may be materialized as portable C++20 text, native COFF objects, or finished PE executables without changing its language semantics.»
-
-Official motto
-
-PARACINE
-
-Clear to people. Obvious to machines.
+No "[Decision]", "[Verify]", “open issue,” “future specification,” or unspecified mandatory production component remains in Paracine 1.0.
 
 ---
 
-1. Definitive Language Identity
+1. Final Language Identity
 
-Paracine is a statically typed, ahead-of-time compiled native programming language engineered around semantic straightness.
+Paracine is a statically typed, ahead-of-time compiled, native general-purpose and systems programming language built around one semantic program and multiple exact realizations.
 
-Its source is readable.
+The canonical production equation is:
 
-Its type system is exact.
+                    .pcn
+                      ↓
+           normalization + frontend
+                      ↓
+            semantic resolution
+                      ↓
+           ownership/effect analysis
+                      ↓
+                    PCIR
+                      ↓
+           semantic optimization
+                      ↓
+          ┌───────────┼───────────┐
+          ↓           ↓           ↓
+       C++20         PMIR        PMIR
+          ↓           ↓           ↓
+        .cpp       x86-64       x86-64
+                      ↓           ↓
+                    COFF        native link
+                      ↓           ↓
+                    .obj        PE32+
+                                  ↓
+                                 .exe
 
-Its runtime model is direct.
+The following statements are final:
 
-Its optimizer is aggressive.
+C++23  = implementation language of the Paracine compiler
+C++20  = portable textual output
+PCIR   = semantic optimization representation
+PMIR   = machine representation
+COFF   = canonical native object format
+PE32+  = canonical native executable format
 
-Its native representation is predictable.
+C++20 is never a mandatory intermediate representation for native compilation.
 
-Its compiler supports both:
-
-portable textual realization
-
-and:
-
-direct native realization
-
-from the same semantic program.
-
-A ".pcn" source file may therefore produce:
-
-program.cpp
-program.obj
-program.exe
-
-depending on the selected output mode.
-
-The C++20 output is a genuine textual backend.
-
-The COFF and PE outputs are generated by Paracine's independent native backend.
-
-The direct-native compiler does not require the generated C++20 file as an intermediate stage.
-
-This distinction is permanent.
-
----
-
-2. The Three Canonical Output Forms
-
-Paracine defines three primary production outputs.
-
-2.1 C++20 textual output
-
-program.pcn
-    ↓
-program.cpp
-
-This produces semantically equivalent, standards-oriented C++20 source.
-
-Its purposes include:
-
-- portability;
-- integration;
-- inspection;
-- auditing;
-- bootstrapping;
-- foreign build-system integration;
-- environments without the Paracine native backend;
-- comparative compiler testing.
-
-2.2 COFF object output
-
-program.pcn
-    ↓
-program.obj
-
-This produces native Windows COFF object code directly.
-
-No generated C++ is required.
-
-2.3 PE executable output
-
-program.pcn
-    ↓
-program.exe
-
-This produces a complete Windows PE32+ executable using Paracine's native machine backend and linker.
-
----
-
-3. Output Modes Are Semantically Equivalent
-
-The language semantics do not change according to output target.
-
-Given:
-
-routine add(a: int, b: int) gives int
-    give a + b
-
-the compiler may materialize that routine as:
-
-C++20 source
-
-or:
-
-native x86-64 machine code
-
-but both represent the same Paracine operation.
-
-Observable behavior must remain equivalent subject only to explicitly documented target-platform properties.
-
-The backend does not redefine the language.
-
-The language defines the backend.
-
----
-
-4. Canonical Compilation Architecture
-
-The common frontend is:
-
-.pcn source
-     ↓
-canonical normalization
-     ↓
-lexer
-     ↓
-layout tokenization
-     ↓
-recursive-descent parser
-     +
-Pratt expression parser
-     ↓
-typed syntax representation
-     ↓
-semantic resolution
-     ↓
-generic specialization
-     ↓
-ownership / lifetime / effect resolution
-     ↓
-PCIR construction
-     ↓
-PCIR verification
-     ↓
-semantic optimization
-
-After optimized PCIR, compilation branches.
-
----
-
-5. C++20 Output Path
-
-The textual path is:
-
-optimized PCIR
-     ↓
-C++20 legalization
-     ↓
-C++20 type lowering
-     ↓
-C++20 control-flow reconstruction
-     ↓
-C++20 ownership/runtime mapping
-     ↓
-C++20 source emitter
-     ↓
-formatted standards-oriented C++20
-     ↓
-.cpp
-
-The output can then be consumed by an external C++20 compiler if the user chooses.
-
-Examples include:
+The direct-native compiler does not depend upon:
 
 MSVC
 Clang
 GCC
+LLVM
+an external assembler
+an external linker
 
-but those compilers are not part of Paracine's direct-native architecture.
-
----
-
-6. Direct-Native Object Path
-
-The native object path is:
-
-optimized PCIR
-     ↓
-target legalization
-     ↓
-Paracine Machine IR
-     ↓
-instruction selection
-     ↓
-machine scheduling
-     ↓
-register allocation
-     ↓
-frame construction
-     ↓
-ABI lowering
-     ↓
-machine encoding
-     ↓
-COFF writer
-     ↓
-.obj
-
-No C++20 translation occurs.
+for Tier-1 ".obj" or ".exe" production.
 
 ---
 
-7. Direct-Native Executable Path
+2. Final Resolution Ledger
 
-The executable path is:
+Every former design question is resolved as follows.
 
-optimized PCIR
-     ↓
-target legalization
-     ↓
-Paracine Machine IR
-     ↓
-instruction selection
-     ↓
-register allocation
-     ↓
-machine encoding
-     ↓
-native sections
-     ↓
-COFF/native linker state
-     ↓
-symbol resolution
-     ↓
-import construction
-     ↓
-PE section layout
-     ↓
-relocation construction
-     ↓
-entry-point construction
-     ↓
-PE32+ image
-     ↓
-.exe
+ID| Final resolution
+R1| Indentation is exactly four spaces. Tabs remain forbidden for structural indentation.
+R2| Layout tokenization is purely lexical and no longer depends on parser knowledge.
+R3| "text" is an immutable borrowed UTF-8 slice. "string" is its owning counterpart.
+R4| Paracine 1.0 does support zero-allocation capturing closures, but only as statically typed, monomorphized closure values. There is no managed closure object or dynamic closure runtime.
+R5| Ordinary routine pointers remain environment-free. A noncapturing closure may coerce to a routine pointer.
+R6| There are no implicit numeric conversions. Contextual literal fitting remains allowed.
+R7| Capability satisfaction remains structural by name/signature according to deterministic lookup. Associated types are not part of edition 2026.
+R8| Record fields remain declaration ordered. The compiler never silently reorders them.
+R9| Integer "+", "-", "*", and unary negation use defined modular two’s-complement semantics.
+R10| Shift counts are reduced modulo the operand width.
+R11| Signed "MIN / -1 = MIN"; "MIN % -1 = 0".
+R12| Default routine parameters are shared borrows; "var" means exclusive borrow; "own" transfers ownership.
+R13| Explicit lifetime parameters do not exist in edition 2026. Borrow regions are inferred and nonlexical.
+R14| "@from(...)" remains the explicit returned-borrow disambiguator.
+R15| Traps terminate the current process. They do not perform language cleanup and are not catchable exceptions.
+R16| Thread traps obey the same rule. The former recoverable "thread_panic" model is removed.
+R17| "give" automatically wraps values in "ok" or "some" when required by the declared result type.
+R18| "fail" automatically produces "err".
+R19| Floating contraction and reassociation remain disabled except in "@fastmath".
+R20| Default hash-map construction is now hardened against HashDoS with a process-randomized key. Stable deterministic hashing remains separately available.
+R21| Allocating growth operations are fallible. Convenience constructors may trap on OOM and retain "try_" alternatives.
+R22| The import graph remains acyclic.
+R23| Visibility remains private / public / export.
+R24| "vec<T,N>" remains a compiler-defined operator-capable built-in exception to the no-user-operator rule.
+R25| One source file defines one module and its path must match the module path.
+R26| General textual/preprocessor macros do not exist in edition 2026.
+R27| User procedural macros do not exist in edition 2026. Built-in "@derive" remains the only declaration generator.
+R28| Async/await is not a language construct in edition 2026. Structured native threads, channels and synchronization are the concurrency model.
+R29| Windows x86-64 is the only mandatory direct-native 1.0 target. Other platforms are reached through C++20 unless and until a native Paracine target profile is implemented.
+R30| Index disjointness remains conservative unless proved by static range analysis or established by a library primitive such as "split_at".
+R31| Capability associated types are deliberately excluded rather than left undecided. Multi-parameter capabilities are canonical.
+R32| Trap cleanup is deliberately absent rather than unspecified. Recoverable failures use "result<T,E>".
+R33| Build-time metaprogramming uses ordinary const evaluation and explicit build-tool steps, not compiler-executed arbitrary scripts.
+R34| Nullable "raw<T>" is not niche-optimized as "option<raw<T>>".
+R35| Safe "view", "span", "text", and empty "buffer" representations use a canonical non-null sentinel, permitting their guaranteed null niche for "option".
+R36| "raw" as a parameter mode is legal only where raw authority actually exists in the declared parameter type.
+R37| Native Tier-1 unwind metadata uses the classic Windows x64 unwind representation supported by the Paracine frame generator.
+R38| PDB emission is a canonical toolchain feature but not part of language semantic equivalence.
+R39| Default executable hardening includes ASLR-compatible relocations, high-entropy VA support and NX compatibility.
+R40| Control Flow Guard is emitted when enabled by the selected production profile and only when complete guard metadata is generated.
+R41| Reproducible builds contain no wall-clock timestamps unless the user explicitly requests stamped output.
+R42| Native executable linking is complete inside Paracine; no unresolved linker stage remains.
 
-Again, C++20 output is not required.
-
----
-
-8. Canonical Multi-Output Diagram
-
-The mature architecture is:
-
-                           ┌──────────────────────┐
-                           │      .pcn source     │
-                           └──────────┬───────────┘
-                                      ↓
-                           ┌──────────────────────┐
-                           │ frontend + semantics │
-                           └──────────┬───────────┘
-                                      ↓
-                           ┌──────────────────────┐
-                           │        PCIR          │
-                           └──────────┬───────────┘
-                                      ↓
-                           semantic optimization
-                                      ↓
-               ┌──────────────────────┼──────────────────────┐
-               ↓                      ↓                      ↓
-        C++20 backend          Native object backend   Native PE backend
-               ↓                      ↓                      ↓
-        C++20 source              machine code            machine code
-               ↓                      ↓                      ↓
-          program.cpp             program.obj             PE linker
-                                                             ↓
-                                                         program.exe
-
-This is the definitive Paracine production architecture.
+These resolutions are frozen for the 2026 edition.
 
 ---
 
-9. C++23 Compiler Implementation
+3. Corrected Lexical and Layout Definition
 
-Paracine's compiler is canonically implemented in C++23.
+3.1 Source normalization
 
-That is separate from the C++20 output mode.
+Before lexical analysis:
+
+1. input is decoded as UTF-8;
+2. a leading UTF-8 BOM is discarded;
+3. CRLF and CR become LF;
+4. Unicode is normalized to NFC outside raw byte-oriented compiler internals;
+5. a missing final LF is conceptually appended;
+6. trailing horizontal whitespace outside literals is ignored.
+
+Tabs remain legal inside:
+
+text literals
+raw text
+character literals where escaped
+comments
+
+Tabs are illegal in indentation.
+
+---
+
+4. Final Layout Algorithm
+
+The old requirement that the lexer know whether the previous line was a grammatical “block opener” is removed.
+
+That requirement improperly mixed lexical and syntactic phases.
+
+The final algorithm is purely lexical.
+
+Let the current indentation stack initially contain:
+
+[0]
+
+For each significant physical line not enclosed by "()", "[]", or "{}":
+
+indent = number of leading ASCII space characters
+
+The indent count must be divisible by four.
+
+Otherwise:
+
+E0100 invalid indentation width
+
+Let:
+
+current = top(indent_stack)
+
+Then:
+
+Equal indentation
+
+If:
+
+indent == current
+
+emit:
+
+NEWLINE
+
+before the next line's first token.
+
+One-level or multi-level increase
+
+If:
+
+indent > current
+
+then the increase must be exactly four spaces.
+
+A source line may not jump by more than one indentation level.
 
 Therefore:
 
-C++23
+indent == current + 4
 
-describes:
+is required.
 
-what the Paracine compiler itself is implemented in
+Emit:
 
-while:
+NEWLINE
+INDENT
 
-C++20
+and push "indent".
 
-describes:
+Anything larger is:
 
-one source-output format the compiler can emit
+E0101 indentation skips a structural level
 
-These must not be confused.
+Whether the parser legally expected a block at that point is decided during parsing.
 
----
+An unexpected "INDENT" becomes:
 
-10. Compiler Implementation versus Generated Output
+E0201 unexpected block
 
-The relationship is:
+Decrease
 
-C++23
-    ↓
-implements pcn compiler
+If:
 
-while:
+indent < current
 
-.pcn
-    ↓
-pcn compiler
-    ├──→ .cpp   C++20 textual output
-    ├──→ .obj   direct COFF object output
-    └──→ .exe   direct PE32+ executable output
+the value must already occur in the indentation stack.
 
-A Paracine installation therefore does not need a C++ compiler to produce ".obj" or ".exe".
+Emit:
 
-A C++ compiler is required only when the user deliberately chooses to compile generated ".cpp" output through a foreign C++ toolchain.
+NEWLINE
+DEDENT...
 
----
+until it becomes the top value.
 
-11. Why C++20 Output Exists
+If no stack entry equals it:
 
-The C++20 backend is valuable because C++ remains one of the most universally deployed native-language compilation targets.
+E0102 inconsistent dedent
 
-C++20 output gives Paracine:
+Continuations
 
-- portability beyond native backends;
-- immediate access to existing C++ build environments;
-- easier language bootstrapping;
-- semantic differential testing;
-- human-readable backend inspection;
-- vendor-toolchain compatibility;
-- embedded-toolchain reach;
-- foreign platform reach;
-- integration into existing native applications.
+Inside:
 
-Paracine therefore obtains portability without making C++ its mandatory internal execution path.
+(...)
+[...]
+{...}
+
+physical newlines are whitespace.
+
+A physical line beginning with "->" after whitespace continues the preceding pipeline expression and does not start a new statement.
+
+No other implicit backslash continuation exists.
+
+At EOF, emit one final "NEWLINE" when required, then enough "DEDENT" tokens to return to zero.
 
 ---
 
-12. C++20 Output Philosophy
+5. Final Reserved Vocabulary
 
-Generated C++20 is intentionally conservative.
+The complete keyword set for edition 2026 is:
 
-It prioritizes:
+abi
+alias
+alloc
+and
+as
+break
+capability
+choose
+const
+continue
+defer
+else
+export
+fail
+false
+for
+foreign
+from
+give
+gives
+if
+import
+in
+io
+is
+let
+loop
+module
+move
+not
+nothing
+or
+own
+public
+pure
+raw
+record
+return_
+routine
+static
+test
+then
+thread
+trap
+true
+try
+unsafe
+var
+variant
+when
+where
+while
+with
+yield_
 
-correctness
-predictability
-portability
-machine friendliness
-readability
+"return_" and "yield_" remain reserved for future editions.
 
-rather than stylistic imitation of handwritten application C++.
+They have no edition-2026 semantics.
 
-The output avoids unnecessary:
+The following are predeclared identifiers rather than keywords:
 
-- inheritance;
-- RTTI;
-- exceptions;
-- virtual methods;
-- "std::function";
-- dynamic polymorphism;
-- template metaprogramming;
-- elaborate operator overloading.
+byte short int long
+ubyte ushort uint ulong
+float double
+bool char text
+size ssize
+void never
+option result
+view span ref mut
+buffer array
+raw atomic string
+ordering
 
-It is deliberately boring.
+The old "import std.prelude as nothing" mechanism is removed.
 
-That is a feature.
+Prelude suppression is controlled by:
+
+no_prelude = true
+
+in the package manifest or by "no_std = true".
 
 ---
 
-13. C++20 Type Mapping
+6. Completed Punctuation
 
-Canonical integer mapping:
+Edition 2026 recognizes:
 
-Paracine| C++20
-"byte"| "std::int8_t"
-"ubyte"| "std::uint8_t"
-"short"| "std::int16_t"
-"ushort"| "std::uint16_t"
-"int"| "std::int32_t"
-"uint"| "std::uint32_t"
-"long"| "std::int64_t"
-"ulong"| "std::uint64_t"
-"size"| "std::size_t"
-"float"| suitable 32-bit floating representation
-"double"| suitable 64-bit floating representation
++ - * / % & | ^ ~ << >>
+== != < <= > >=
+= += -= *= /= %= &= |= ^= <<= >>=
+-> => ... . .. ..=
+, : :: ? @
+( ) [ ] { }
 
-Paracine semantics always remain authoritative.
+"..." is legal only:
+
+1. in a "foreign" variadic declaration;
+2. in future-edition-reserved parser positions.
+
+Using it elsewhere is E0208.
 
 ---
 
-14. Defined Signed Arithmetic in C++20 Output
+7. Corrected Statement Grammar
 
-Paracine's defined signed-overflow behavior cannot rely directly on C++ signed overflow.
+The former statement grammar mixed newline-consuming simple statements with block-bearing compound statements.
 
-Therefore generated C++20 preserves Paracine semantics explicitly.
+The final distinction is:
+
+statement =
+      simple_statement NEWLINE
+    | compound_statement
+    ;
+
+simple_statement =
+      let_stmt
+    | var_stmt
+    | assign_stmt
+    | expr_stmt
+    | give_stmt
+    | fail_stmt
+    | break_stmt
+    | continue_stmt
+    ;
+
+compound_statement =
+      if_stmt
+    | choose_stmt
+    | loop_stmt
+    | while_stmt
+    | for_stmt
+    | defer_block
+    | unsafe_block
+    ;
+
+block =
+    NEWLINE INDENT statement { statement } DEDENT
+    ;
+
+defer_stmt =
+    'defer' expr
+    ;
+
+defer_block =
+    'defer' block
+    ;
+
+label =
+    '@' identifier
+    ;
+
+break_stmt =
+    'break' [ label ]
+    ;
+
+continue_stmt =
+    'continue' [ label ]
+    ;
+
+loop_stmt =
+    [ label ':' ] 'loop' block
+    ;
+
+while_stmt =
+    [ label ':' ] 'while' expr block
+    ;
+
+for_stmt =
+    [ label ':' ] 'for' [ 'var' ] pattern 'in' expr block
+    ;
+
+A labeled jump therefore uses:
+
+break @outer
+continue @scan
+
+rather than an unadorned identifier.
+
+---
+
+8. Completed Top-Level Grammar
+
+The final top-level item set is:
+
+item_body =
+      routine_decl
+    | record_decl
+    | variant_decl
+    | alias_decl
+    | const_decl
+    | static_decl
+    | thread_static_decl
+    | capability_decl
+    | foreign_decl
+    | test_decl
+    ;
+
+static_decl =
+    'var' 'static' identifier ':' type '=' const_expr
+    ;
+
+thread_static_decl =
+    'thread' 'var' identifier ':' type '=' const_expr
+    ;
+
+A "thread var" value:
+
+1. has one instance per native thread;
+2. must have a const-evaluable initializer;
+3. must be trivially disposable in edition 2026;
+4. may be read and written in safe code because it cannot be concurrently accessed by a different thread through the same instance;
+5. may not be borrowed across a thread boundary;
+6. may not appear in a DLL ABI-visible layout.
+
+Nontrivial thread-local destructors are deliberately excluded from edition 2026.
+
+This keeps native TLS initialization deterministic and prevents hidden destruction order.
+
+---
+
+9. Final Closure Model
+
+The former “no closures” rule is replaced.
+
+Paracine supports zero-runtime, statically typed closures.
+
+There is still:
+
+no GC closure
+no boxed closure by default
+no dynamic dispatch
+no hidden heap allocation
+
+9.1 Syntax
+
+A closure expression is:
+
+closure_expr =
+    'routine' '(' [ closure_param_list ] ')'
+    [ 'gives' type ]
+    ( '=>' expr | block )
+    ;
+
+closure_param_list =
+    closure_param { ',' closure_param } [ ',' ]
+    ;
+
+closure_param =
+    [ param_mode ] identifier [ ':' type ]
+    ;
+
+Examples:
+
+let twice = routine(x: int) => x * 2
+
+let threshold = 10
+let over = routine(x: int) => x > threshold
+
+Parameter types may be inferred only when the expected callable type supplies them.
+
+Otherwise they must be written.
+
+9.2 Capture semantics
+
+Captures are inferred.
+
+If a closure reads an outer place:
+
+shared capture
+
+If it mutates an outer "var" place:
+
+exclusive capture
+
+If it consumes a move-only outer value:
+
+own capture
+
+Explicit capture forcing is available:
+
+move routine(x: int) => x + base
+
+which captures every used move-capable outer value by ownership where possible.
+
+9.3 Representation
+
+A capturing closure becomes an anonymous compiler-generated record:
+
+closure$42 {
+    captured fields...
+}
+
+plus a statically known call body.
+
+A closure value is therefore an ordinary value.
+
+It can:
+
+live on the stack
+be moved
+be stored in another monomorphic aggregate
+be specialized into a generic routine
+be passed to another thread when its captures satisfy sendable
+
+It never needs a managed environment.
+
+9.4 Callable capability
+
+The compiler defines:
+
+capability callable<F, A, R>
+
+conceptually meaning:
+
+F can be invoked with arguments A and produces R
+
+This capability is intrinsic because tuple-shaped argument packs are compiler-level.
+
+User declarations cannot forge "callable".
+
+9.5 Routine-pointer conversion
+
+A noncapturing closure may implicitly convert to the matching:
+
+routine(...) gives ...
+
+pointer type.
+
+A capturing closure cannot.
+
+9.6 Escaping
+
+Capturing closures may escape their defining lexical block only if every capture is owned by value.
+
+A closure containing a borrow may not outlive that borrow.
+
+The normal region checker enforces this.
+
+No special closure lifetime system is added.
+
+9.7 Public ABI
+
+Anonymous closure types may not occur directly in:
+
+public signatures
+export signatures
+foreign declarations
+
+Public generic routines may accept a type parameter constrained by "callable".
+
+This preserves a stable external ABI.
+
+---
+
+10. Standard Iterators Updated for Closures
+
+The standard adapters are generalized.
 
 Conceptually:
 
-int addition
+routine map<I, T, U, F>(
+    own it: I,
+    own f: F
+) gives map_iter<I, T, U, F>
+    where I is iterator<T>,
+          F is callable<(T), U>
 
-is lowered through operations whose semantics implement Paracine's defined two's-complement result rather than depending upon C++ undefined behavior.
+Similarly:
 
-This makes generated C++20 semantically trustworthy.
+filter
+fold
+any
+all
+find
+sort_by_key
+parallel_for
 
----
+accept generic callable values.
 
-15. Routine Mapping
+Routine pointers remain accepted because they satisfy "callable".
 
-Paracine:
+This resolves the original ergonomics problem without introducing managed closures.
 
-routine add(a: int, b: int) gives int
-    give a + b
+Pipeline fusion remains mandatory for the same built-in cases.
 
-may emit conceptually:
-
-std::int32_t pcn_add(
-    std::int32_t a,
-    std::int32_t b
-) noexcept
-{
-    return pcn_wrap_add_i32(a, b);
-}
-
-The exact generated spelling is compiler-owned.
-
-The semantics are fixed.
+After inlining and specialization, closure environments are scalar-replaced where possible.
 
 ---
 
-16. Generic Mapping
+11. Associated Types Resolution
 
-Paracine generics are monomorphized before C++20 generation.
+Associated types do not exist in edition 2026.
 
-Given:
+This is final.
 
-routine maximum<T>(a: T, b: T) gives T
-    where T is ordered
+The iterator model remains:
 
-uses such as:
+iterator<I,T>
 
-maximum<int>
-maximum<double>
+rather than:
 
-produce concrete functions.
+I::Item
 
-The C++20 backend does not need to reconstruct Paracine generics using C++ templates.
+Reasons:
 
----
+simpler name resolution
+simpler interface serialization
+simpler specialization
+no projection-normalization system
+fewer cyclic type constraints
+straightforward PCIR monomorphization
 
-17. Record Mapping
-
-Paracine:
-
-record Point
-    x: float
-    y: float
-
-maps naturally to a concrete C++20 struct representation.
-
-Paracine owns:
-
-- layout semantics;
-- field semantics;
-- initialization requirements.
-
-The output backend represents them faithfully.
+A future edition may add associated types, but no 1.0 program depends upon them.
 
 ---
 
-18. Variant Mapping
+12. Type-System Representation Corrections
 
-Paracine variants lower to compiler-generated tagged representations.
+12.1 "never"
 
-The C++20 backend may emit:
+"never" is a predeclared uninhabited type.
 
-tag
-+
-union-like storage
+It has no runtime representation.
 
-or another semantically equivalent concrete representation.
+These expressions have type "never":
 
-It does not require "std::variant".
+trap(...)
+unreachable()
+process.exit(...)
+a routine declared gives never
 
----
+"never" coerces to any expected type.
 
-19. Option Mapping
+12.2 "ref<T>" and "mut<T>"
 
-"option<T>" uses a specialized compiler-selected C++20 representation.
+They are aliases:
 
-Where a niche exists, the emitter preserves that optimization.
+ref<T> = view<T> constrained to count == 1
+mut<T> = span<T> constrained to count == 1
 
-Where one does not exist, a tag-plus-value representation is used.
+They do not create a distinct ownership category.
 
----
+12.3 Pointer niches
 
-20. Result Mapping
+"raw<T>" is nullable.
 
-"result<T,E>" is likewise generated as a compact compiler-controlled representation.
+Therefore:
 
-Paracine:
+option<raw<T>>
 
-try
-fail
-give
+is not guaranteed to use a null-pointer niche.
 
-become ordinary C++ control flow.
+It uses an explicit tag unless some different layout niche is proven and recorded by the compiler.
 
-No C++ exception model is required.
+The source semantics never expose which choice was made.
 
----
+12.4 Canonical safe empty pointer
 
-21. Views
+Safe nonowning slices use a non-null canonical aligned dangling sentinel when count is zero.
 
-Paracine:
+Therefore:
 
 view<T>
-
-conceptually maps to:
-
-const pointer
-+
-count
-
-C++20 output uses a compact concrete equivalent.
-
----
-
-22. Spans
-
-Paracine:
-
 span<T>
+text
 
-maps to:
+always have a non-null pointer in safe well-formed values.
 
-mutable pointer
-+
-count
+An empty buffer likewise stores:
 
-No implicit ownership exists.
+ptr = canonical aligned sentinel
+count = 0
+capacity = 0
+
+rather than "null".
+
+This permits the following guaranteed niche representations:
+
+option<view<T>>
+option<span<T>>
+option<text>
+option<buffer<T>>
+
+where null in the representation denotes "none".
+
+Raw construction may violate the sentinel convention only inside unsafe code and must normalize before creating a safe value.
+
+12.5 "option<bool>"
+
+The stored byte forms are:
+
+0 = false
+1 = true
+other compiler-selected invalid byte = none
+
+The compiler fixes the actual none value in the ABI profile.
+
+For edition-2026 Tier-1 it is:
+
+2
+
+12.6 "option<char>"
+
+Any invalid Unicode scalar representation may form the niche.
+
+Tier-1 uses:
+
+0x00110000
+
+for "none".
 
 ---
 
-23. Buffers
+13. "raw" Parameter Mode Resolution
 
-"buffer<T>" emits a compiler-controlled ownership representation with:
+The syntax:
 
-- pointer;
-- size;
-- capacity where required;
-- move semantics;
-- deterministic destruction.
+raw x: T
 
-The emitter does not need to use "std::vector".
+means the callee receives raw authority associated with "T".
 
----
+It is valid only if "T" is one of:
 
-24. Deterministic Cleanup
-
-Paracine cleanup semantics exist independently of C++.
-
-For C++20 text output, those semantics map naturally onto:
-
-- scope objects;
-- generated cleanup helpers;
-- structured scope exits.
-
-For direct native output, the same semantics become explicit PCIR control edges and machine cleanup sequences.
+raw<U>
+a record explicitly marked @raw_authority
+a tuple/aggregate structurally containing raw authority and marked @raw_authority
 
 Thus:
 
-one Paracine lifetime model
+raw p: raw<int>
 
-has:
+is valid.
 
-two backend realizations
+This is not:
 
-without semantic divergence.
+raw x: int
 
----
+because there is no raw authority to grant.
 
-25. "defer"
+Violation:
 
-Paracine:
+E0408 meaningless raw parameter mode
 
-defer close(handle)
-
-can become:
-
-- generated scope cleanup in C++20;
-- direct cleanup control edges in native output.
-
-Both are equivalent.
+The separate "raw<T>" type remains the machine pointer type.
 
 ---
 
-26. C Interoperability
+14. Final Effect System
 
-Paracine's C ABI declarations remain usable in every backend.
+Effects are now fully defined.
 
-For C++20 output:
+The effect set is:
 
-foreign c routine ...
+alloc
+io
+thread
+trap
+unsafe
 
-generates appropriate "extern "C"" declarations.
+"pure" denotes the empty set.
 
-For direct-native output, the backend emits ABI-correct calls and symbols itself.
+It is not an additional effect.
 
----
+A declaration may write:
 
-27. Textual Output Is Inspectable
+with io, alloc
 
-Generated ".cpp" output is intentionally inspectable.
+or:
 
-Users can examine:
+with pure
 
-- specialized routines;
-- lowered records;
-- result handling;
-- explicit control flow;
-- generated ownership;
-- native API bindings.
+but "pure" may not be combined with another effect.
 
-This makes the C++20 backend especially useful for:
+14.1 Inference
 
-- auditing;
-- education;
-- debugging;
-- compiler validation;
-- backend comparisons.
+Every routine body has its minimum effect set inferred.
 
----
+Operations contribute:
 
-28. Textual Output Is Not Source-of-Truth
+allocation                    alloc
+file/console/network/process  io
+thread creation/sync blocking thread
+possible defined trap         trap
+unsafe operations             unsafe
 
-The generated C++20 file is an output artifact.
+Calls union the callee effects.
 
-It is not authoritative Paracine source.
+14.2 Explicit annotation
 
-A developer edits:
+An explicit "with" clause is an allowed upper bound.
 
-.pcn
+The inferred effect set must be a subset.
 
-not:
+Otherwise:
 
-generated .cpp
+E0360 undeclared effect
 
-Regeneration may replace the C++20 output completely.
+No "with" clause means:
 
----
+infer and record the exact effect set
 
-29. C++20 Portability Mode
+for private routines.
 
-The C++20 backend serves as Paracine's broad portability escape hatch.
+For public and export routines, the compiler writes the inferred set into the interface.
 
-Where direct native support has not been installed for a target, Paracine can still produce ".cpp" and allow an established target C++20 toolchain to finish compilation.
+A user may explicitly pin it to make API evolution intentional.
 
-This enables Paracine programs to reach:
+14.3 "unsafe"
 
-- additional operating systems;
-- embedded platforms;
-- unusual architectures;
-- vendor-specific environments;
+A routine containing unsafe operations may encapsulate them.
 
-without weakening the direct-native architecture of supported Paracine targets.
+If it has a safe public contract, its implementation may contain an "unsafe" block without exposing "with unsafe".
 
----
+However, a routine that accepts raw authority or requires the caller to uphold an unsafe precondition must declare:
 
-30. Direct-Native Independence
+with unsafe
 
-For Tier-1 Windows x86-64 output, Paracine requires no C++ compiler.
+The compiler cannot prove semantic encapsulation, so this distinction is part of API authorship.
 
-The canonical direct path remains:
+14.4 Trap effect
 
-.pcn
- ↓
-PCIR
- ↓
-Paracine Machine IR
- ↓
-machine code
- ↓
-COFF
- ↓
-PE
+Ordinary bounds checking, division by zero checking and explicit assertions contribute "trap".
 
-C++20 output sits beside that path, not inside it.
+An optimizer proving the trapping condition impossible may eliminate the operation and its local trap effect internally.
+
+The public effect of a routine is determined before optimization.
 
 ---
 
-31. Canonical Source Syntax
+15. Final Failure Model
 
-The canonical callable remains:
+Paracine has exactly two failure classes.
 
-routine add(a: int, b: int) gives int
-    give a + b
+Recoverable failure
 
-Forwarding:
+Represented by:
 
-give add(a, b)
+result<T,E>
+option<T>
 
-No output mode changes source syntax.
+and manipulated with:
 
----
+try
+fail
+choose
 
-32. Primitive Types
+Cleanup executes normally.
 
-Canonical source spellings remain:
+Terminal trap
 
-byte
-short
-int
-long
+Represented by:
 
-ubyte
-ushort
-uint
-ulong
+trap
+bounds violation
+division by zero
+assertion failure
+explicit unreachable
+stack exhaustion
+configured OOM trap
 
-float
-double
+A trap:
 
-bool
-char
-text
-size
-ssize
-void
+does not unwind Paracine scopes
+does not execute defer
+does not execute dispose
+does not become result
+does not become thread_panic
+does not resume
 
----
+The trap handler is:
 
-33. Fixed Integer Widths
+routine(trap_code, text) gives never
 
-Type| Width| Signed
-"byte"| 8| yes
-"ubyte"| 8| no
-"short"| 16| yes
-"ushort"| 16| no
-"int"| 32| yes
-"uint"| 32| no
-"long"| 64| yes
-"ulong"| 64| no
+and cannot return.
 
-These meanings apply identically to:
-
-.cpp output
-.obj output
-.exe output
+This rule is final.
 
 ---
 
-34. PCIR Remains the Semantic Center
+16. Thread Trap Resolution
 
-All output forms originate from the same optimized PCIR.
+The former recoverable thread-trap concept is deleted.
 
-This is crucial.
+There is no:
 
-Paracine does not maintain:
+std.thread.on_trap(recover)
 
-one optimizer for C++
+and no trap-derived "thread_panic".
 
-and:
+If any thread traps under the normal runtime:
 
-another optimizer for native output
+the process terminates
 
-The common semantic pipeline performs:
+just as if the main thread trapped.
 
-- constant propagation;
-- folding;
-- control-flow simplification;
-- inlining;
-- scalar replacement;
-- range analysis;
-- bounds-check elimination;
-- dead-code elimination;
-- dead-store elimination;
-- generic specialization;
-- Path Compression.
+"join" therefore becomes:
 
-Only after these transformations do output backends diverge.
+routine join<R>(own h: join_handle<R>)
+    gives result<R, thread_error>
+
+"thread_error" represents operating-system/runtime failures such as an invalid native wait or thread start failure.
+
+It never represents a language trap.
 
 ---
 
-35. Backend Separation
+17. Structured Thread Scope Resolution
 
-The production compiler contains three output subsystems:
+The old capture-free scope callback could not access parent data.
 
-backend/cxx20
-backend/native
-backend/pe
+The canonical API is now generic over a closure:
 
-Conceptually:
+routine scope<F>(own f: F)
+    where F is callable<(var thread_scope), void>
 
-optimized PCIR
-    ├──→ C++20 emitter
-    ├──→ native object emitter
-    └──→ native executable builder
+Because closures may carry inferred borrows, this directly supports:
 
-Native ".obj" and ".exe" generation share machine-backend infrastructure.
+var values = ...
+scope(routine(var s)
+    spawn_scoped(var s, routine()
+        use(values)
+    )
+)
 
----
+The compiler knows every borrow captured by "f".
 
-36. C++20 Backend Pipeline
+"scope" does not return until all spawned scoped threads finish.
 
-PCIR
- ↓
-structured-region reconstruction
- ↓
-concrete type translation
- ↓
-runtime-helper selection
- ↓
-expression lowering
- ↓
-statement lowering
- ↓
-scope/lifetime reconstruction
- ↓
-C++20 AST/text model
- ↓
-canonical formatter
- ↓
-.cpp
+Therefore every captured borrow dies before the enclosing call returns.
 
-The backend never reparses Paracine.
+"spawn_scoped" accepts a statically typed callable and applies the normal "sendable" rules to moved captures and the specialized scoped rules to borrowed captures.
+
+This resolves the concurrency/closure mismatch.
 
 ---
 
-37. Native Machine Pipeline
+18. Interior Mutability Resolution
 
-PCIR
- ↓
-legalization
- ↓
-PMIR
- ↓
-instruction selection
- ↓
-scheduling
- ↓
-register allocation
- ↓
-frame generation
- ↓
-machine encoding
- ↓
-native sections
+Safe interior mutability exists only in compiler-known or standard-library types whose implementation internally uses unsafe authority.
 
----
+Edition 2026 recognizes these safe interior-mutability families:
 
-38. COFF Path
+atomic<T>
+mutex<T>
+rwlock<T>
+once<T>
+channel<T> internal state
+thread-safe runtime handles explicitly marked by std
 
-native sections
- ↓
-symbol construction
- ↓
-relocation construction
- ↓
-COFF headers
- ↓
-COFF section table
- ↓
-COFF symbol table
- ↓
-program.obj
+Ordinary user records cannot mutate through a shared borrow.
+
+A future user-defined interior-mutability capability is not part of 1.0.
+
+This preserves the simple alias rule.
 
 ---
 
-39. PE Path
+19. Index Disjointness Resolution
 
-native sections
-+
-libraries
-+
-imports
-+
-symbols
- ↓
-Paracine native linker
- ↓
-PE section assignment
- ↓
-RVA resolution
- ↓
-import tables
- ↓
-export tables
- ↓
-relocations
- ↓
-unwind metadata
- ↓
+The borrow checker treats:
+
+a[i]
+a[j]
+
+as potentially overlapping unless it proves disjointness.
+
+The checker may prove:
+
+i != j
+
+using exact constants, normalized ranges, induction-variable facts and dominating comparisons.
+
+This analysis is optional for acceptance only when the proof succeeds.
+
+Programs requiring guaranteed independent mutable regions must use:
+
+split_at
+chunks_mut
+split_first_mut
+
+or another standard disjointness primitive.
+
+Failure to prove arbitrary dynamic indices disjoint is not a compiler deficiency.
+
+It is the specified conservative model.
+
+---
+
+20. Macro and Compile-Time Generation Resolution
+
+Paracine edition 2026 has:
+
+no textual macros
+no token macros
+no hygienic syntax macros
+no procedural compiler plugins
+no source-generating compiler callbacks
+
+It does have:
+
+const evaluation
+const generics
+generic specialization
+@derive
+conditional @feature items
+explicit build-tool pipeline steps
+
+"@derive" is limited to compiler-defined capabilities.
+
+Edition 2026 built-ins are:
+
+equatable
+ordered
+hashable
+printable
+defaultable
+
+The absence of a macro language is deliberate.
+
+---
+
+21. Async Resolution
+
+Edition 2026 has no:
+
+async
+await
+coroutine syntax
+hidden scheduler
+mandatory event loop
+
+Asynchronous architectures are built with:
+
+threads
+nonblocking OS APIs
+channels
+callbacks
+state machines
+user libraries
+
+A later edition may define coroutine lowering.
+
+No 1.0 ABI reserves coroutine frame machinery.
+
+---
+
+22. Other Native Targets Resolution
+
+Only this direct-native profile is mandatory:
+
+windows-x86_64-msx64
+
+The C++20 backend is the official portability backend.
+
+A future direct target must provide a complete target profile containing:
+
+primitive widths
+endianness
+pointer width
+ABI
+object format
+executable format
+relocation model
+unwind model
+thread/TLS model
+atomics lowering
+OS runtime bindings
+target-specific std realization
+
+No native target is considered supported merely because PMIR can express it.
+
+Support requires the entire profile.
+
+---
+
+23. Hardened Hashing Resolution
+
+The old fixed-key default map has been replaced.
+
+General map/set
+
+The default:
+
+map<K,V>
+set<T>
+
+uses a process-randomized SipHash-family key obtained from "os_rng".
+
+This protects untrusted hash tables against adversarial collision flooding.
+
+Iteration order is therefore unspecified and may differ between runs.
+
+Programs must never rely upon it.
+
+Stable hashing
+
+The following remain deterministic:
+
+hash_of<T>
+fnv1a
+crc32
+xxh3_64
+stable_hasher
+
+"stable_hasher" has a specified fixed initialization and is intended for:
+
+compiler caches
+serialization fingerprints
+reproducible tooling
+tests
+
+A deterministic table may be constructed explicitly:
+
+map_with_hasher(stable_hasher())
+
+This resolves security without removing deterministic tooling.
+
+---
+
+24. Standard-Library Network Completion
+
+The "std" tier now includes:
+
+std.net
+
+Its Tier-1 implementation uses Winsock through "std.win.ws2_32".
+
+Core types:
+
+ip_addr
+ipv4_addr
+ipv6_addr
+socket_addr
+tcp_stream
+tcp_listener
+udp_socket
+shutdown
+socket_error
+
+Representative API:
+
+routine resolve(host: text, service: text)
+    gives result<buffer<socket_addr>, socket_error>
+
+routine tcp_connect(addr: socket_addr)
+    gives result<tcp_stream, socket_error>
+
+routine tcp_bind(addr: socket_addr)
+    gives result<tcp_listener, socket_error>
+
+routine accept(var listener: tcp_listener)
+    gives result<(tcp_stream, socket_addr), socket_error>
+
+routine read(var stream: tcp_stream, dst: span<ubyte>)
+    gives result<size, socket_error>
+
+routine write(var stream: tcp_stream, src: view<ubyte>)
+    gives result<size, socket_error>
+
+routine udp_bind(addr: socket_addr)
+    gives result<udp_socket, socket_error>
+
+routine send_to(var socket: udp_socket, data: view<ubyte>, addr: socket_addr)
+    gives result<size, socket_error>
+
+routine recv_from(var socket: udp_socket, dst: span<ubyte>)
+    gives result<(size, socket_addr), socket_error>
+
+Socket objects are disposable.
+
+Native initialization of Winsock is demand-linked and performed exactly once by the runtime support object.
+
+No network runtime exists in "no_std".
+
+---
+
+25. Dynamic-Library Completion
+
+"std.dynlib" is added to the "std" tier.
+
+Tier-1 API:
+
+routine open(path: text)
+    gives result<library, io_error>
+
+routine symbol<T>(self: library, name: text)
+    gives result<raw<T>, io_error>
+    with unsafe
+
+routine close(own lib: library)
+
+The Windows realization uses the platform loader.
+
+Typed function-pointer conversion from a raw symbol requires "unsafe".
+
+This does not alter static linking.
+
+---
+
+26. Global Allocator Completion
+
+The global allocator is initialized before "main".
+
+Replacing it is permitted only through a startup hook:
+
+@startup
+routine configure_allocator()
+
+that executes before any user allocation and before user thread creation.
+
+Once the first allocation occurs, global allocator replacement is permanently locked.
+
+Attempting replacement afterward traps "Assertion".
+
+Dependencies cannot silently replace the global allocator.
+
+Exactly one startup allocator provider may be selected by the root package.
+
+---
+
+27. PCIR Completion
+
+The following rules close remaining semantic gaps in PCIR.
+
+27.1 Poison and undef
+
+PCIR contains neither:
+
+undef
+poison
+freeze
+
+Every value is defined.
+
+Unsafe invalid execution is modeled by loss of language guarantees, not by propagating an IR poison value.
+
+This prevents optimizer behavior from silently exceeding Paracine semantics.
+
+27.2 Provenance
+
+Every pointer-producing operation carries a provenance identity where known:
+
+alloca
+global
+heap allocation
+foreign/raw unknown
+
+"gep" preserves provenance.
+
+Converting a pointer to an integer loses usable provenance for safe reconstruction.
+
+"inttoptr" is unsafe and produces raw/unknown provenance.
+
+The optimizer cannot infer nonaliasing merely because integer pointer values differ.
+
+27.3 Calls and memory effects
+
+Every call carries an effect summary:
+
+readnone
+readonly(classes)
+write(classes)
+alloc
+free
+sync
+io
+trap
+unknown
+
+A foreign call defaults to:
+
+unknown + io + trap
+
+unless its declaration supplies a trusted standard-library intrinsic summary.
+
+User attributes cannot lie about a foreign routine's memory effects in safe code.
+
+27.4 Debug locations
+
+Every PCIR instruction originating from source carries a source span.
+
+Synthetic optimizer instructions inherit the narrowest dominating origin that accurately describes them.
+
+Trap sites always retain the original source operation location.
+
+27.5 ABI independence
+
+PCIR never contains:
+
+RCX
+RDX
+RSP
+XMM0
+COFF relocation types
+PE RVAs
+
+Those are strictly backend concepts.
+
+27.6 Serialization identity
+
+A serialized PCIR module contains:
+
+magic
+major version
+minor version
+target-independent type table
+layout table
+symbol table
+functions
+metadata
+content hash
+
+The content hash excludes debug-path normalization differences unless debug identity is requested.
+
+---
+
+28. Optimizer Completion
+
+28.1 Pass determinism
+
+Every pass is deterministic for identical:
+
+PCIR input
+compiler version
+target profile
+optimization profile
+
+No pass uses unordered container iteration to make transformation choices.
+
+28.2 Code-size budgets
+
+Inlining, specialization, path compression and unrolling each have separate budgets.
+
+They may not recursively amplify one another without a global growth limit.
+
+Default "opt=3" global post-inlining growth limit:
+
+300% of pre-inline PCIR instruction count per module
+
+unless profile-guided optimization overrides it.
+
+This is a compile-time/resource guard, not a semantic rule.
+
+28.3 Recursion
+
+Direct and mutual recursion are permitted.
+
+The inliner never recursively expands a cyclic call edge unless finite specialization proves a terminating depth and the resulting expansion fits its budget.
+
+28.4 Floating semantics
+
+Outside "@fastmath":
+
+no reassociation
+no reciprocal approximation
+no implicit FMA contraction
+no signed-zero elimination
+no NaN elimination
+
+Vectorization must preserve these rules.
+
+28.5 Trap ordering
+
+A pass may not transform:
+
+effect A
+possible trap
+effect B
+
+into any arrangement where B becomes externally observable before that trap.
+
+This is checked by the effect scheduler verifier.
+
+---
+
+29. PMIR Completion and Corrections
+
+29.1 Canonical Windows unwind version
+
+Tier-1 emits the classic Windows x64 unwind representation used by Paracine's frame generator.
+
+Paracine 1.0 does not emit newer optional unwind encodings merely because the host operating system may recognize them.
+
+A later backend revision may add them behind a target-feature flag without changing language semantics.
+
+29.2 Leaf functions
+
+A function that:
+
+does not modify nonvolatile registers
+does not allocate a stack frame
+does not make calls
+
+may omit ".pdata/.xdata".
+
+Every nonleaf native function receives unwind metadata.
+
+29.3 Stack probes
+
+When fixed stack allocation crosses the target profile's guard-page probe threshold, the backend emits a probing sequence compatible with Windows stack growth.
+
+The Tier-1 profile uses the standard Windows-compatible "__chkstk" runtime helper for large fixed frames.
+
+Dynamic stack allocation is not available in ordinary safe Paracine source.
+
+Only compiler/runtime intrinsics may request it in edition 2026.
+
+29.4 "INC"/"DEC"
+
+Machine selection may use "INC" or "DEC" when flag semantics and scheduling costs permit.
+
+They are not semantically forbidden.
+
+The encoder's cost model chooses between them and "ADD/SUB 1".
+
+29.5 Red zone
+
+There is no Windows x64 red zone.
+
+Generated Tier-1 code never stores below current "RSP".
+
+29.6 Internal ABI
+
+The private "pcn" convention remains legal only for routines whose ABI is entirely compiler-controlled.
+
+An address-taken routine, exported routine, foreign-callable routine or routine stored in a public routine-pointer value uses the declared external convention.
+
+Cross-convention thunks are emitted automatically.
+
+---
+
+30. Native Linker — Complete Specification
+
+The native linker is now fully defined.
+
+The link pipeline is:
+
+object discovery
+↓
+archive discovery
+↓
+directive processing
+↓
+symbol-table construction
+↓
+archive extraction
+↓
+COMDAT resolution
+↓
+duplicate-definition resolution
+↓
+reachability graph
+↓
+section garbage collection
+↓
+identical-code folding where enabled
+↓
+section contribution merging
+↓
+import synthesis
+↓
+export synthesis
+↓
+TLS synthesis
+↓
+unwind table synthesis
+↓
+load-config synthesis
+↓
+resource synthesis
+↓
+final section ordering
+↓
+RVA assignment
+↓
+file-offset assignment
+↓
+relocation application
+↓
+base-relocation synthesis
+↓
+headers
+↓
+debug directory
+↓
+checksum/signature reservation
+↓
+image verification
+↓
+PE32+
+
+---
+
+31. Link Input Discovery
+
+Inputs are processed in deterministic command-line order.
+
+Inputs may be:
+
+Paracine in-memory object models
+COFF .obj
+static .lib
+import .lib
+explicit DLL import declarations
+resource .res files
+Paracine runtime archives
+
+The linker never searches the current directory implicitly for libraries merely because a symbol is unresolved.
+
+Search directories come from:
+
+package manifest
+target profile
+explicit command line
+configured SDK location
+
+in that precedence.
+
+---
+
+32. Symbol Model
+
+Every link symbol is one of:
+
+defined strong
+defined weak
+COMDAT
+undefined
+absolute
+import
+common-compatible foreign
+
+Paracine source does not generate C-style tentative common definitions.
+
+The linker can consume foreign objects that do.
+
+A strong duplicate definition is:
+
+L1001 duplicate strong symbol
+
+unless one definition was eliminated by valid COMDAT selection.
+
+Undefined final symbols are:
+
+L1002 unresolved external symbol
+
+with all referencing objects listed.
+
+---
+
+33. Archive Extraction
+
+Static libraries use demand extraction.
+
+Algorithm:
+
+build unresolved-symbol set
+scan archive index
+extract members satisfying unresolved strong references
+add their undefined references
+repeat until fixed point
+
+An archive member is loaded at most once.
+
+"/WHOLEARCHIVE" equivalent behavior is available as:
+
+pcn link --whole-archive library.lib
+
+and in the manifest.
+
+Archive processing is deterministic.
+
+Cyclic static-library dependency does not depend on command ordering because Paracine repeats extraction across the complete selected archive set until no new member is loaded.
+
+---
+
+34. COMDAT Resolution
+
+Selections are processed as follows:
+
+NODUPLICATES
+
+More than one live definition is an error.
+
+ANY
+
+Choose the deterministic canonical instance.
+
+Preference order:
+
+root package
+earlier dependency order
+lexicographically smaller object identity
+
+SAME_SIZE
+
+All candidates must have identical byte size.
+
+Otherwise link error.
+
+Choose canonically as above.
+
+EXACT_MATCH
+
+All candidate bytes and relocation graphs must match after symbol normalization.
+
+Otherwise link error.
+
+ASSOCIATIVE
+
+The contribution lives exactly when its leader lives.
+
+Used for:
+
+pdata
+xdata
+debug fragments
+auxiliary constant data
+
+LARGEST
+
+Choose the largest contribution.
+
+Ties use deterministic canonical ordering.
+
+---
+
+35. Section Garbage Collection
+
+Release profiles enable section GC by default.
+
+Roots include:
+
 entry point
- ↓
-PE headers
- ↓
-program.exe
+exports
+forced-include symbols
+TLS structures
+TLS callbacks
+load-config referenced tables
+resource roots
+debug-required anchors when debugging is enabled
+symbols marked @used
+startup hooks
+shutdown hooks
+
+Edges include:
+
+relocations
+associative COMDAT links
+unwind references
+import thunks
+export forwarders
+startup tables
+
+Every unreachable removable contribution is discarded.
+
+Debug information for discarded code is discarded with it.
 
 ---
 
-40. Direct Object Emission
+36. Identical Code Folding
 
-Paracine directly constructs:
+ICF is optional and enabled at:
+
+opt=3 release
+
+for nonexported functions unless disabled.
+
+Two functions may fold only if:
+
+machine bytes match after relocation normalization
+relocation topology matches
+unwind behavior matches
+address identity is not semantically observable
+neither function carries @unique_address
+neither is an export with distinct required address
+
+Routine-pointer equality can observe addresses.
+
+Therefore functions whose addresses escape into program-visible values are not folded unless the language program cannot distinguish them through a guaranteed semantic comparison.
+
+Default policy:
+
+address-taken function → no ICF
+
+This favors semantic simplicity.
+
+---
+
+37. Final Native Image Sections
+
+The canonical Tier-1 image may contain:
 
 .text
 .rdata
 .data
 .pdata
 .xdata
+.idata
+.edata
 .reloc
+.tls
+.rsrc
+.debug
 
-and other required COFF sections.
+The linker may merge compatible object contributions into those final image sections.
 
-It controls:
+".bss" occupies virtual space in ".data"-class writable memory but does not require raw file bytes for the zero-filled portion.
 
-- section flags;
-- alignment;
-- relocations;
-- symbols;
-- COMDAT;
-- unwind data.
+Section names are organizational.
 
----
-
-41. PE Construction
-
-The PE writer directly controls:
-
-- DOS header/stub;
-- PE signature;
-- COFF image header;
-- PE32+ optional header;
-- section table;
-- image base;
-- entry point;
-- subsystem;
-- data directories;
-- imports;
-- exports;
-- base relocations;
-- exception information;
-- TLS data where needed.
+Loader semantics are defined by headers and data directories, not by assuming a table must reside in a same-named section.
 
 ---
 
-42. Windows x86-64 ABI
+38. Section Permissions
 
-The Tier-1 native backend conforms directly to Microsoft x64 calling conventions.
+The linker enforces W^X by default.
 
-It handles:
+Canonical final permissions:
 
-RCX
-RDX
-R8
-R9
+.text   execute + read
+.rdata  read
+.pdata  read
+.xdata  read
+.idata  read/write only where loader IAT mutation requires it
+.edata  read
+.data   read + write
+.tls    read + write template semantics
+.rsrc   read
+.reloc  read + discardable
 
-for eligible integer/pointer arguments and the corresponding XMM registers for floating arguments.
+No section is both writable and executable in a standard production image.
 
-It also implements:
-
-- caller shadow space;
-- stack alignment;
-- preserved registers;
-- volatile registers;
-- aggregate-return rules;
-- variadic boundaries;
-- unwind metadata requirements.
+A package requesting writable executable memory requires an explicit unsafe platform feature and does not change static section permissions automatically.
 
 ---
 
-43. C++20 ABI Independence
+39. Final Section Layout
 
-Generated C++20 does not define Paracine's native ABI.
+Defaults:
 
-It is a textual representation of Paracine semantics.
+FileAlignment    = 512 bytes
+SectionAlignment = 4096 bytes
 
-When compiled by another C++ toolchain, the resulting binary follows that toolchain's selected ABI.
+unless a target profile requires otherwise.
 
-Direct Paracine ".obj" and ".exe" output follow Paracine's declared native target profile.
+The linker computes:
+
+VirtualAddress(section[i])
+    = align_up(previous.VirtualAddress + previous.VirtualSize,
+               SectionAlignment)
+
+PointerToRawData(section[i])
+    = align_up(previous file end,
+               FileAlignment)
+
+"SizeOfRawData" is file-aligned.
+
+"VirtualSize" is the actual in-memory contribution size before section alignment.
+
+"SizeOfImage" is the end of the final virtual section rounded to "SectionAlignment".
+
+"SizeOfHeaders" is the complete headers region rounded to "FileAlignment".
 
 ---
 
-44. Why This Separation Matters
+40. Import Construction
 
-This gives Paracine both:
+Imports are grouped by DLL name.
 
-native determinism
+DLL grouping is case-insensitive for canonicalization but preserves the first explicitly supplied spelling for diagnostics.
+
+Within each DLL, imports are sorted deterministically by:
+
+name imports lexicographically
+then ordinal imports numerically
+
+unless preserving foreign object order is required for compatibility.
+
+For PE32+ each DLL receives:
+
+Import Directory entry
+Import Lookup Table
+Import Address Table
+DLL name string
+Hint/Name records
+
+The Import Directory ends with one zeroed entry.
+
+The lookup table and IAT each end with a zero entry.
+
+Name imports use a 16-bit hint followed by a NUL-terminated ASCII export name and alignment padding.
+
+Ordinal imports set the high PE32+ ordinal flag and contain the 16-bit ordinal.
+
+Before loading, ILT and IAT contain equivalent thunk values.
+
+The loader rewrites the IAT with resolved addresses.
+
+References to:
+
+__imp_symbol
+
+resolve directly to the IAT slot.
+
+A direct imported call normally becomes:
+
+call qword ptr [rip + IAT-slot]
+
+unless a foreign object explicitly references an import thunk symbol.
+
+---
+
+41. Delay Imports
+
+Delay loading is supported as an explicit link feature:
+
+@delay_import
+
+or manifest configuration.
+
+It is never inserted automatically.
+
+Delay-import construction generates:
+
+delay import descriptors
+delay IAT
+delay name table
+module-handle storage
+resolver thunks
+
+using Paracine runtime support.
+
+If no delay imports exist, the Delay Import data directory is zero.
+
+---
+
+42. Export Construction
+
+An export record contains:
+
+public export name
+target symbol
+optional ordinal
+optional NONAME
+optional forwarder
+
+Explicit ordinals must be unique.
+
+Unassigned ordinals are allocated deterministically from the lowest available ordinal beginning at 1.
+
+The linker emits:
+
+Export Directory
+Export Address Table
+Name Pointer Table
+Ordinal Table
+export strings
+DLL name
+
+Name pointers are sorted lexicographically as required for efficient loader lookup.
+
+A forwarder is represented by an RVA pointing to a string inside the export directory range, such as:
+
+KERNEL32.Sleep
+OTHERDLL.#27
+
+An EXE ordinarily has no exports unless requested.
+
+A DLL may export:
+
+functions
+data
+foreign-compatible ABI thunks
+
+Anonymous closure types and private internal-ABI routines cannot be exported.
+
+---
+
+43. Resource Construction
+
+Paracine accepts:
+
+.res
+
+resource input and may also construct resources from manifest declarations.
+
+Resource trees are normalized by:
+
+type
+name/id
+language
+
+Name entries precede numeric-ID entries at each level and are sorted in canonical order.
+
+The linker emits:
+
+resource directory tables
+directory entries
+UTF-16 resource names
+resource data entries
+raw resource blobs
+
+into ".rsrc".
+
+If no resources exist, the Resource data directory is zero.
+
+---
+
+44. TLS Construction
+
+"thread var" items are collected into a native TLS template.
+
+The linker emits:
+
+initialized TLS bytes
+zero-fill size
+TLS index storage
+optional callback array
+IMAGE_TLS_DIRECTORY64
+
+The directory fields containing addresses use image VAs where the PE format requires VAs and therefore receive base relocations.
+
+The callback array is NUL terminated.
+
+Edition 2026 source-level "thread var" does not require callbacks because initialization is const-evaluable and values are trivially disposable.
+
+Runtime/internal TLS callbacks may still be emitted when the runtime needs them.
+
+Generated application code does not hard-code undocumented TEB offsets.
+
+TLS addressing is implemented by the Tier-1 lowering/runtime contract.
+
+---
+
+45. Exception/Unwind Table Construction
+
+All surviving nonleaf functions contribute final:
+
+RUNTIME_FUNCTION
+UNWIND_INFO
+
+records.
+
+The linker:
+
+1. applies final function RVAs;
+2. resolves ".xdata" RVAs;
+3. sorts final ".pdata" records by "BeginAddress";
+4. verifies nonoverlapping function ranges;
+5. writes the Exception data-directory RVA and size.
+
+Associative unwind data disappears when its function is garbage-collected.
+
+A final image with malformed or unsorted exception entries is rejected by the image verifier.
+
+---
+
+46. Base Relocation Construction
+
+Paracine emits position-independent RIP-relative code whenever practical.
+
+Any remaining absolute image address requiring rebasing is recorded.
+
+For Tier-1 PE32+ the normal base-relocation type is:
+
+DIR64
+
+Relocations are grouped by 4 KiB page.
+
+Each block contains:
+
+PageRVA
+BlockSize
+TypeOffset entries
+
+Entries are sorted by offset.
+
+An "ABSOLUTE" relocation entry may be inserted only as padding to preserve required alignment.
+
+If the image contains no absolute relocatable addresses, the relocation directory may be empty.
+
+Production dynamic-base profiles ordinarily retain a valid relocation table whenever required by the image.
+
+---
+
+47. Relocation Application
+
+For every COFF relocation:
+
+S = final symbol value
+A = encoded addend
+P = final fixup location
+
+The linker computes the architecture-defined result.
+
+For Tier-1:
+
+ADDR64   → S + A
+ADDR32NB → RVA(S) + A
+REL32    → S + A - address_after_fixup
+SECTION  → target section index
+SECREL   → target offset within final section contribution
+
+Overflow is always diagnosed.
+
+There is no silent truncation.
+
+Example:
+
+L1204 REL32 target exceeds signed 32-bit displacement
+
+The small image/code model means such an overflow normally indicates an unsupported oversized image or malformed foreign object.
+
+---
+
+48. PE32+ Header Construction
+
+A canonical executable contains:
+
+DOS header
+minimal DOS stub
+PE signature
+COFF image header
+PE32+ optional header
+data directories
+section table
+section data
+optional certificate data
+
+The Tier-1 machine field is:
+
+AMD64
+
+The PE optional-header magic is:
+
+PE32+
+
+The linker fills:
+
+AddressOfEntryPoint
+BaseOfCode
+ImageBase
+SectionAlignment
+FileAlignment
+OS version policy
+Image version
+Subsystem version
+SizeOfImage
+SizeOfHeaders
+Checksum
+Subsystem
+DllCharacteristics
+StackReserve
+StackCommit
+HeapReserve
+HeapCommit
+LoaderFlags = 0
+NumberOfRvaAndSizes
+
+Reserved fields are zero.
+
+---
+
+49. Image Base
+
+Default EXE preferred image base:
+
+0x0000000140000000
+
+Default DLL preferred image base is linker-selected and alignment-correct.
+
+The user may override the preferred base.
+
+Because ASLR is enabled, code must not depend upon actually loading at the preferred base.
+
+The image base is 64 KiB aligned.
+
+---
+
+50. Subsystem
+
+Application packages choose:
+
+subsystem = "console"
+
+or:
+
+subsystem = "windows"
+
+Default:
+
+console
+
+unless the root package declares GUI application intent.
+
+The native subsystem field is set accordingly.
+
+A GUI package may define the normal Paracine "main"; "pcn_start" adapts it to the Windows GUI process startup environment.
+
+---
+
+51. Default PE Hardening
+
+Production Tier-1 images enable:
+
+HIGH_ENTROPY_VA
+DYNAMIC_BASE
+NX_COMPAT
+TERMINAL_SERVER_AWARE
+
+unless the selected image category makes a flag inappropriate.
+
+Paracine does not set:
+
+NO_SEH
+
+by default because the runtime and operating system must remain able to participate in Windows exception/unwind machinery.
+
+"FORCE_INTEGRITY" and "APPCONTAINER" are opt-in deployment properties.
+
+"WDM_DRIVER" is never set for ordinary application images.
+
+---
+
+52. Control Flow Guard
+
+CFG is a production hardening option.
+
+When enabled, the compiler/linker must generate the complete load-configuration and guard target metadata required by the selected Windows target profile.
+
+Only then is:
+
+GUARD_CF
+
+set.
+
+Indirect-call targets include:
+
+address-taken routines
+external ABI thunks
+exports that may be called indirectly
+required runtime callbacks
+
+Internal functions proven never to be indirect targets need not appear.
+
+A partially generated CFG table is forbidden.
+
+If CFG metadata generation fails, linking fails rather than silently setting an invalid hardening flag.
+
+---
+
+53. Load Configuration
+
+The linker synthesizes a load-configuration directory when required by enabled hardening features.
+
+Fields not used by the selected target profile are zero.
+
+Potential consumers include:
+
+Control Flow Guard
+security cookie integration where enabled
+guard tables
+future target-profile hardening
+
+The emitted structure size matches the exact layout version selected by the target profile.
+
+Paracine never emits a larger structure while leaving fields semantically uninitialized.
+
+---
+
+54. Stack and Heap Header Defaults
+
+Canonical defaults:
+
+stack reserve = 8 MiB
+stack commit  = 64 KiB
+
+heap reserve  = 1 MiB
+heap commit   = 64 KiB
+
+These are linker defaults, not language guarantees.
+
+They may be overridden per package.
+
+The runtime allocator is not restricted to the process default heap merely because these PE heap fields exist.
+
+---
+
+55. Entry Point
+
+EXE entry:
+
+pcn_start
+
+DLL entry when runtime initialization is needed:
+
+pcn_dll_start
+
+"pcn_start" performs:
+
+runtime state initialization
+OS argument acquisition
+UTF-8 argument construction
+standard stream initialization
+trap-handler installation
+random hash seed initialization
+runtime one-time subsystem setup
+startup hooks
+user main
+standard stream flush
+process exit
+
+There is no C runtime dependency.
+
+User "main" is never the literal PE entry point.
+
+---
+
+56. DLL Startup
+
+A Paracine DLL avoids complex work under loader lock.
+
+The DLL entry point performs only operations safe for loader initialization.
+
+General allocation, thread creation and arbitrary user callbacks are not performed from process attach.
+
+Library-level initialization requiring richer work uses explicit:
+
+initialize()
+
+APIs or safe lazy-once initialization after load.
+
+This avoids hidden loader-lock hazards.
+
+---
+
+57. Debug Directory
+
+When native debug information is enabled, the final image may contain a PE debug-directory entry pointing to CodeView information.
+
+For PDB mode, the CodeView record uses an RSDS-style identity containing:
+
+PDB identity
+age
+path or normalized file name
+
+Reproducible mode does not embed an uncontrolled absolute build path.
+
+---
+
+58. PDB Completion
+
+Paracine's canonical native PDB writer produces a modern MSF-based PDB sufficient for:
+
+line mapping
+public symbols
+private symbols at -g2
+type information
+module information
+source-file mapping
+register/stack variable location ranges
+
+The writer maintains:
+
+PDB information stream
+TPI
+IPI
+DBI
+module streams
+global/public symbol indexes
+section contribution information
+line tables
+string table
+
+The exact binary container implementation is a toolchain-format concern, not part of Paracine language semantics.
+
+Conformance is judged by:
+
+successful DIA/WinDbg consumption
+correct source-line resolution
+correct public-symbol resolution
+correct type identity
+correct variable-location ranges where emitted
+
+In reproducible mode, PDB identity is derived deterministically from the debug content hash rather than wall-clock randomness.
+
+PDB failure does not alter generated executable semantics, but a requested "-g2" build fails if its PDB cannot be produced.
+
+---
+
+59. Native Debug Levels
+
+-g0  no debug information
+
+-g1  source files + line mappings + public function names
+
+-g2  full CodeView/PDB type, local variable, lexical scope and location-range data
+
+Optimized builds may report a variable as:
+
+optimized away
+constant
+split across locations
+unavailable for part of its source range
+
+rather than inventing a misleading location.
+
+---
+
+60. PE Checksum
+
+For ordinary EXE/DLL output the checksum field is deterministic.
+
+Default application policy:
+
+Checksum = 0
+
+unless the selected image profile requires or requests a computed PE checksum.
+
+"pcn pe --checksum" computes it after final layout and before signing.
+
+Profiles such as kernel/driver targets, if added in a future target profile, may require a nonzero checksum.
+
+---
+
+61. Authenticode and Certificate Table
+
+Code signing is not part of program semantics.
+
+The PE writer reserves correct certificate-table behavior.
+
+A signed image stores certificates outside the normal mapped section data and updates the Certificate data-directory entry with the required file offset and size.
+
+The image digest excludes fields required by the PE/Authenticode hashing convention.
+
+Paracine provides:
+
+pcn sign
+pcn verify-signature
+
+as toolchain commands when signing support is installed.
+
+Signing happens after deterministic image construction.
+
+Unsigned and signed forms represent the same Paracine program.
+
+A signing private key is never stored in a package manifest.
+
+---
+
+62. Reproducible Native Linking
+
+With reproducible mode enabled, identical inputs produce byte-identical:
+
+.obj
+.lib
+.exe
+.dll
+
+except intentionally external signatures.
+
+Rules:
+
+COFF timestamps = 0
+PE COFF timestamp = 0
+export timestamp = 0
+load-config timestamp = 0
+archive member timestamps = 0
+deterministic symbol ordering
+deterministic section ordering
+deterministic padding
+deterministic PDB identity
+normalized source paths
+no random image padding
+
+Randomized runtime map hash keys are generated when the program starts and therefore do not affect binary reproducibility.
+
+---
+
+63. Build Identity
+
+Every build can emit:
+
+program.build.json
+
+containing:
+
+source hashes
+package graph
+lockfile hash
+compiler version
+language edition
+PCIR version
+PMIR version
+optimization profile
+target triple
+CPU profile
+C++ emitter version
+native backend version
+COFF writer version
+linker version
+PE writer version
+standard library version
+feature set
+build reproducibility mode
+
+The manifest is not embedded into the executable unless requested.
+
+---
+
+64. Import Library Completion
+
+When producing a DLL, Paracine may also produce:
+
+module.lib
+
+containing import descriptors for every selected export.
+
+Both:
+
+__imp_Name
+Name
+
+forms are represented where required for conventional Windows linking.
+
+Export ordinals and names match the DLL's final export table.
+
+An import library generated in the same build is validated against that table before completion.
+
+---
+
+65. Static Library Completion
+
+"pcn lib" produces a deterministic Windows archive.
+
+It emits:
+
+first linker member
+second linker member
+long-name table when needed
+object members
+
+Global symbol indexes refer to the correct archive member offsets after final serialization.
+
+The writer performs a read-back validation pass in debug/CI mode.
+
+---
+
+66. Bigobj Resolution
+
+The normal COFF representation is used whenever legal.
+
+When section or symbol numbering exceeds normal COFF limits, the writer switches to the Windows bigobj representation.
+
+Bigobj is an object-level compatibility mechanism only.
+
+Final PE images do not contain “bigobj sections.”
+
+Objects emitted as bigobj must be accepted by:
+
+Paracine linker
+supported contemporary Microsoft linker
+supported contemporary LLVM linker
+
+in interoperability testing.
+
+---
+
+67. Native Link Diagnostics
+
+Canonical linker families:
+
+L1000 input/object errors
+L1100 symbol errors
+L1200 relocation errors
+L1300 COMDAT/archive errors
+L1400 import/export errors
+L1500 image-layout errors
+L1600 unwind/TLS/load-config errors
+L1700 debug/PDB errors
+L1800 signing/certificate errors
+L1900 internal image verification
+
+Examples:
+
+L1001 duplicate strong symbol
+L1002 unresolved external
+L1104 incompatible symbol ABI
+L1204 relocation overflow
+L1302 COMDAT exact-match disagreement
+L1401 duplicate export name
+L1402 duplicate export ordinal
+L1501 image exceeds supported small code model
+L1601 malformed unwind contribution
+L1602 invalid TLS template
+L1901 generated PE failed self-validation
+
+---
+
+68. Final Image Verification
+
+Before an ".exe" or ".dll" is committed to disk, the PE writer reparses the completed byte image using an independent reader.
+
+It verifies:
+
+DOS/PE signatures
+machine type
+PE32+ magic
+header sizes
+section-table bounds
+section alignment
+file alignment
+nonoverlapping raw ranges
+nonoverlapping virtual ranges
+entry point inside executable section
+data-directory bounds
+import termination
+IAT bounds
+export-name sort order
+export ordinal validity
+pdata sort order
+unwind references
+TLS directory validity
+relocation block boundaries
+base-relocation target bounds
+load-config bounds
+resource tree bounds
+debug-directory bounds
+certificate-table file bounds
+SizeOfImage
+SizeOfHeaders
+section permissions
+reserved fields
+
+Any failure is an internal compiler error and the output image is deleted.
+
+---
+
+69. Independent Loader Test
+
+The conformance suite additionally launches generated executables through the actual Windows loader.
+
+It validates:
+
+ASLR relocation
+imports
+TLS
+unwind
+console startup
+GUI startup where applicable
+DLL loading
+exports
+thread creation
+trap termination
+large stack frames
+PDB symbolication
+
+A file merely passing Paracine's parser is not enough to claim PE conformance.
+
+---
+
+70. C++20 Backend Completion
+
+The textual backend must represent all edition-2026 language features.
+
+70.1 Closures
+
+A monomorphized capturing closure becomes a generated aggregate:
+
+struct closure_42 {
+    ...
+    Result operator()(...) noexcept;
+};
+
+or equivalent ordinary helper functions.
+
+No "std::function" is used.
+
+No heap allocation is introduced solely for closure representation.
+
+70.2 Sequencing
+
+Because Paracine defines left-to-right evaluation, generated C++ introduces temporaries where needed instead of relying upon a C++ expression whose operand evaluation rules could differ.
+
+70.3 Arithmetic
+
+Signed modular operations are expressed using unsigned-domain helpers and explicit conversion.
+
+The backend never relies on C++ signed overflow.
+
+70.4 Shifts
+
+Shift counts are explicitly normalized to Paracine width semantics where C++ would otherwise have undefined behavior.
+
+70.5 Division
+
+Generated code explicitly handles:
+
+divisor == 0
+MIN / -1
+
+before using host division where required.
+
+70.6 Float-to-int
+
+The emitted helper implements:
+
+truncate toward zero
+saturate to destination range
+NaN → 0
+
+without invoking C++ undefined behavior.
+
+70.7 Layout
+
+Every ABI-relevant generated struct includes static compile-time checks for:
+
+sizeof
+alignof
+offsetof
+
+against PCIR layout.
+
+70.8 Atomics
+
+C++ output uses standard atomic operations with explicit memory orders corresponding exactly to Paracine order values.
+
+70.9 Thread-local storage
+
+"thread var" lowers to suitable C++20 "thread_local" storage in portability mode, subject to the same trivial-destruction edition-2026 restriction.
+
+---
+
+71. Differential Backend Equivalence
+
+For programs not intentionally dependent upon target-specific properties:
+
+Paracine → C++20 → host compiler
 
 and:
 
-portable textual reach
+Paracine → PMIR → native PE
 
-without confusing them.
+must agree on Paracine-observable behavior.
 
-The ".cpp" backend is portable.
+Differences caused solely by:
 
-The ".obj/.exe" backend is architecturally controlled.
+thread scheduling
+native OS error codes
+addresses
+timing
+supported platform facilities
 
----
+are outside strict equality where documented.
 
-45. Standard Build Commands
-
-Canonical commands include:
-
-pcn build
-pcn run
-pcn check
-pcn test
-pcn clean
-pcn fmt
-
-pcn emit cpp
-pcn emit obj
-pcn emit exe
-
-pcn ir
-pcn mir
-pcn asm
-pcn obj
-pcn pe
-
-pcn explain
-pcn inspect
-pcn package
-pcn bench
-pcn profile
+The language semantics themselves do not diverge.
 
 ---
 
-46. C++20 Output Command
+72. Module/Manifest Completion
 
-pcn emit cpp main.pcn
+The package manifest gains these final production fields.
 
-produces:
+Example:
 
-main.cpp
+[package]
+name = "acme.tool"
+version = "1.0.0"
+edition = "2026"
+kind = "app"
+root = "src"
+no_std = false
+no_prelude = false
 
----
+[target.windows-x86_64]
+abi = "msx64"
+cpu = "x86-64"
+subsystem = "console"
+image_base = 0x140000000
+stack_reserve = 8388608
+stack_commit = 65536
+heap_reserve = 1048576
+heap_commit = 65536
+cfg = true
 
-47. COFF Output Command
+[profile.debug]
+opt = 0
+debug = 2
+reproducible = true
+emit = ["obj", "exe"]
 
-pcn emit obj main.pcn
+[profile.release]
+opt = 3
+debug = 1
+lto = true
+icf = true
+gc_sections = true
+reproducible = true
+emit = ["obj", "exe"]
 
-produces:
+[profile.portable]
+emit = ["cpp"]
 
-main.obj
+[link]
+libraries = ["kernel32.lib"]
+search = []
+whole_archive = []
 
----
+[resources]
+files = []
 
-48. PE Output Command
+[signing]
+enabled = false
 
-pcn emit exe main.pcn
-
-produces:
-
-main.exe
-
----
-
-49. Multi-Output Build
-
-The compiler may produce all canonical forms from one invocation:
-
-pcn build --emit=cpp,obj,exe main.pcn
-
-Output:
-
-main.cpp
-main.obj
-main.exe
-
-All originate from the same resolved program and optimization state.
-
----
-
-50. Reproducible Output
-
-A reproducible build records:
-
-- source hash;
-- Paracine compiler version;
-- PCIR version;
-- optimization profile;
-- C++20 emitter version;
-- native backend version;
-- COFF writer version;
-- PE writer version;
-- target ABI;
-- target CPU profile;
-- library versions.
+Dependency manifests cannot override root executable hardening or signing policy.
 
 ---
 
-51. Differential Backend Validation
+73. Build-Step Completion
 
-The mature compiler validates language correctness across backends.
+Arbitrary compiler-time code execution remains forbidden.
 
-For appropriate test programs:
+Explicit build steps are permitted only as root-workspace configuration.
 
-Paracine → C++20 → foreign compiler → executable
+A dependency package cannot automatically execute a build step merely by being depended upon.
 
-is compared against:
+Canonical form:
 
-Paracine → direct native → executable
+[[step]]
+name = "generate_protocol"
+tool = "tools.protocol_generator"
+inputs = ["schema/protocol.pcn-schema"]
+outputs = ["generated/protocol.pcn"]
 
-for semantic equivalence.
+The tool must itself be a declared executable package.
 
-This is a powerful compiler-validation technique.
+The build system:
 
----
+hashes inputs
+hashes tool binary
+runs in declared workspace sandbox
+records outputs
+rejects undeclared output writes in sandboxed mode
 
-52. C++20 as a Reference Backend
+Generated source becomes an ordinary compiler input.
 
-Because C++20 has widely tested compilers, the textual backend also serves as a reference realization for many Paracine semantics.
-
-It is especially useful for validating:
-
-- arithmetic;
-- record layout intent;
-- result behavior;
-- option behavior;
-- control flow;
-- generic specialization;
-- ownership cleanup.
-
-It does not replace the direct backend.
-
-It strengthens confidence in it.
+This gives controlled generation without a hidden build-script language.
 
 ---
 
-53. C++20 Output and Debugging
+74. Capability Lookup Freeze
 
-A developer can choose:
+Capability satisfaction lookup remains:
 
-direct Paracine native debugging
+1. module defining the subject type;
+2. module defining the capability;
+3. current module.
 
-or:
+All viable candidates at the same precedence level are considered together.
 
-generated C++20 debugging
+More than one exact candidate is:
 
-depending on integration needs.
+E0340 ambiguous capability member
 
-The first reflects actual Paracine machine generation.
+Imported wildcard modules do not receive special capability precedence.
 
-The second is useful when embedding Paracine-generated code inside an existing C++ project.
-
----
-
-54. C++20 Interoperability
-
-Generated ".cpp" can be compiled alongside:
-
-- existing C++20 application code;
-- vendor libraries;
-- game-engine code;
-- plugin systems;
-- legacy native projects;
-- embedded SDKs.
-
-Paracine therefore integrates easily into existing C++ environments without becoming dependent upon them.
+Closure compiler capabilities such as "callable" are intrinsic and bypass ordinary lookup.
 
 ---
 
-55. Header Generation
+75. Generic Coherence
 
-The C++20 backend also supports interface generation.
+Two different visible definitions cannot both claim the same effective capability member signature for the same subject at equal precedence.
 
-Example outputs:
+Cross-package ambiguity is diagnosed at the use site.
 
+Paracine does not have orphan impl blocks, so no global coherence registry is required.
+
+This completes the structural capability model.
+
+---
+
+76. Const Evaluation Completion
+
+Const execution may allocate only compiler-temporary evaluator storage.
+
+It cannot perform semantic runtime allocation.
+
+Const code may use:
+
+pure arithmetic
+records
+variants
+arrays
+bounded loops
+pure routines
+const generic operations
+string/text literal manipulation supported by const std
+
+It cannot perform:
+
+I/O
+threads
+foreign calls
+unsafe memory access
+runtime random
+time
+environment access
+dynamic library access
+network access
+
+Const results are serialized into ordinary constants.
+
+The step limit and recursion-depth limit are deterministic diagnostics.
+
+---
+
+77. Static Initialization Completion
+
+There is no user-visible dynamic global initialization.
+
+Allowed:
+
+const X = const_expr
+var static X: T = const_expr
+thread var X: T = const_expr
+
+Initialization bytes are established by the image.
+
+Startup hooks are explicit routines and are not equivalent to hidden constructors.
+
+This prevents initialization-order fiascos.
+
+---
+
+78. Startup and Shutdown Hooks
+
+Edition 2026 supports compiler attributes:
+
+@startup
+@shutdown
+
+only on:
+
+routine() gives void
+
+with no parameters.
+
+Startup ordering:
+
+root package first
+then dependencies in topological package order
+then source-order within a module
+
+except allocator configuration, which has its own earliest reserved phase.
+
+Shutdown hooks run in exact reverse order only on normal process return from "main".
+
+They do not run on:
+
+trap
+process.exit
+forced OS termination
+
+This rule mirrors "defer"'s non-trap behavior.
+
+---
+
+79. Main Routine Completion
+
+The accepted root signatures are:
+
+routine main() gives void
+
+routine main() gives int
+
+routine main(args: view<text>) gives int
+
+routine main() gives result<void, E>
+    where E is printable
+
+Additionally:
+
+routine main(args: view<text>) gives result<void, E>
+    where E is printable
+
+is now accepted.
+
+Argument strings are valid UTF-8.
+
+Windows UTF-16 command-line arguments are converted with replacement-free validation; malformed surrogate sequences become a startup error before user "main".
+
+A startup conversion failure prints a runtime diagnostic and exits nonzero.
+
+---
+
+80. No-Std Completion
+
+With:
+
+no_std = true
+
+available facilities are:
+
+primitive types
+records
+variants
+option/result
+arrays
+views/spans
+raw pointers
+core arithmetic
+PCIR/native code generation
+compiler intrinsics required for freestanding semantics
+
+The package supplies its own entry point contract through:
+
+@entry
+
+when producing a freestanding image.
+
+Ordinary Windows app startup is a "std" facility.
+
+A "no_std" package can still produce ".obj" for kernels, firmware loaders or custom runtimes, but such environments are outside the default Windows application profile.
+
+---
+
+81. Unsafe Boundary Completion
+
+Every public routine containing unsafe internals must satisfy one of two classifications.
+
+Safe encapsulation
+
+Signature exposes no requirement for caller-maintained raw invariants.
+
+No "with unsafe".
+
+Unsafe contract
+
+Correct calling requires the caller to uphold raw/lifetime/alias/platform invariants.
+
+Declaration includes:
+
+with unsafe
+
+and documentation must state the contract.
+
+The compiler enforces call-site unsafe context for the second class.
+
+---
+
+82. FFI ABI Compatibility
+
+A type is C/MS x64 FFI-compatible if it is one of:
+
+fixed-width integer
+float
+double
+bool with documented uint8 representation
+raw<T>
+routine pointer
+@layout(c) record whose fields are recursively compatible
+
+Paracine-native:
+
+text
+view
+span
+buffer
+option
+result
+variant
+string
+closure
+
+are not automatically C ABI types.
+
+They require:
+
+explicit wrapper records
+or exported ABI thunks
+
+This prevents accidental representation coupling.
+
+---
+
+83. Exported Paracine APIs
+
+An ordinary "export" routine may use Paracine types when consumed by another Paracine module/package because ".pci" communicates the canonical ABI contract.
+
+An "@export_name" routine intended for arbitrary foreign code must use FFI-compatible parameter/result types.
+
+Violation:
+
+E0624 foreign export exposes non-FFI type
+
+---
+
+84. Runtime Version Compatibility
+
+Every Paracine native library records:
+
+language edition
+public ABI version
+std ABI version
+target profile
+
+in its interface metadata.
+
+The linker rejects incompatible Paracine-native library ABI combinations before producing an image.
+
+Pure C ABI libraries remain governed by their own symbols/contracts.
+
+---
+
+85. PCIR-to-PMIR Machine Verification
+
+After final PMIR lowering, the backend verifies:
+
+all virtual registers resolved
+all frame indexes resolved
+all calls satisfy ABI placement
+RSP alignment correct at every call
+shadow space present for msx64 calls
+nonvolatile registers restored
+DF clear at external boundaries
+no illegal high-byte/REX combinations
+branch targets valid
+all relocations representable
+unwind model matches actual prologue
+epilog shapes recognized by target policy
+
+Failure is an internal compiler error.
+
+---
+
+86. Native Encoder Completion
+
+Every emitted instruction is produced from a declarative encoding record.
+
+The encoder covers:
+
+legacy prefixes
+REX
+VEX
+EVEX when target allows
+opcode maps
+ModRM
+SIB
+displacements
+immediates
+rel8
+rel32
+RIP-relative addressing
+
+The separate decoder round-trips final bytes during conformance tests.
+
+The compiler's assembly listing is generated from decoded final bytes, not merely PMIR intent.
+
+---
+
+87. CPU Feature Safety
+
+The selected CPU baseline is part of the build identity.
+
+The compiler never emit instructions unavailable in that baseline unless:
+
+the routine is inside a valid multiversion body
+
+with dispatch.
+
+A v3 executable is not silently made compatible with baseline x86-64.
+
+The loader cannot detect this on Paracine's behalf.
+
+It is an explicit deployment contract.
+
+---
+
+88. Multiversion Completion
+
+Syntax:
+
+@multiversion("x86-64", "x86-64-v3")
+routine work(...)
+
+The compiler generates:
+
+work$base
+work$v3
+work$resolver
+work$slot
+
+The resolver performs one-time CPU feature detection.
+
+The slot is published atomically.
+
+Subsequent calls dispatch through the resolved target.
+
+The resolver itself uses only baseline instructions.
+
+Exported multiversion routines expose one stable external thunk.
+
+---
+
+89. Runtime Independence
+
+Tier-1 Paracine requires only Windows system facilities selected by the program.
+
+There is no hidden requirement for:
+
+MSVCRT
+UCRT
+C++ runtime
+LLVM runtime
+libgcc
+
+unless the user links a foreign library that itself requires one.
+
+The Paracine runtime is demand-linked from native object modules.
+
+---
+
+90. Security Baseline
+
+Production compiler defaults include:
+
+bounds checks in safe code
+NX-compatible image
+ASLR-compatible image
+high-entropy VA
+W^X sections
+randomized default hash-table keys
+stack probing
+valid unwind metadata
+UTF-8 validation
+checked allocation size arithmetic
+COFF/PE parser bounds checking
+archive parser bounds checking
+no automatic dependency build-script execution
+
+Unsafe code can deliberately step outside safe-language guarantees but does not disable toolchain input validation.
+
+---
+
+91. Compiler Input Hardening
+
+Object, archive, PDB, resource and package parsers treat all external binary input as untrusted.
+
+They perform checked arithmetic for:
+
+offset + size
+count * element_size
+alignment
+section spans
+string table spans
+relocation indexes
+symbol indexes
+archive member offsets
+resource recursion
+
+Malformed binary input produces a diagnostic.
+
+It never becomes unchecked pointer arithmetic in the compiler.
+
+---
+
+92. Resource Limits
+
+The compiler implements configurable resource ceilings for adversarial or accidental pathological source:
+
+maximum parser nesting
+maximum generic instantiation depth
+maximum const-eval steps
+maximum const recursion depth
+maximum module count
+maximum import graph edges
+maximum object sections
+maximum symbol count
+maximum optimizer growth
+maximum diagnostic cascade
+
+Reasonable defaults are implementation-defined and reported with the relevant limit diagnostic.
+
+A user may raise them.
+
+They do not alter program semantics.
+
+---
+
+93. Final Conformance Suites
+
+A complete Paracine 1.0 implementation must pass:
+
+Frontend
+
+lexical normalization
+indentation/layout
+grammar
+name resolution
+modules
+overloads
+generics
+closures
+capabilities
+effects
+const evaluation
+
+Type/ownership
+
+copy/move
+partial move
+drop flags
+shared borrow
+exclusive borrow
+returned borrow
+closure capture regions
+thread-scoped borrows
+raw boundary
+FFI compatibility
+
+Semantics
+
+all integer operations
+all shift counts
+signed division extremes
+float-to-int saturation
+NaNs
+signed zero
+try/fail/give
+defer/dispose
+trap ordering
+
+PCIR
+
+construction
+verification
+reference interpretation
+every optimization pass
+path compression
+SSA reduction
+fusion
+vectorization legality
+effect preservation
+
+PMIR
+
+instruction selection
+ABI lowering
+register allocation
+spill behavior
+stack alignment
+large frames
+unwind
+branch relaxation
+machine encoding
+
+COFF
+
+sections
+symbols
+relocations
+COMDAT
+bigobj
+archives
+import libraries
+foreign-linker compatibility
+
+PE
+
+headers
+imports
+exports
+resources
+TLS
+pdata/xdata
+relocations
+ASLR
+load config
+CFG when enabled
+DLLs
+debug directory
+PDB
+image verification
+real Windows loader execution
+
+Cross-backend
+
+C++20/MSVC
+C++20/Clang
+direct Paracine native
+PCIR interpreter
+
+are compared over the portable semantic corpus.
+
+---
+
+94. Release Qualification
+
+A compiler release cannot describe a component as “production” unless:
+
+its required conformance suite passes
+known semantic miscompilations are zero in the release blocker set
+the native image verifier passes
+the cross-backend differential corpus passes
+the ABI matrix passes
+the unwinder matrix passes
+
+An experimental backend can coexist with the production compiler but must be labeled experimental.
+
+---
+
+95. Final Implementation Order
+
+The canonical implementation strategy is:
+
+Phase 1
+UTF-8 normalization
+lexer
+layout engine
+parser
+typed AST
+basic diagnostics
+
+Phase 2
+name resolution
+types
+generics
+capabilities
+effects
+ownership
+closure capture analysis
+
+Phase 3
+PCIR construction
+PCIR verifier
+reference interpreter
+
+Phase 4
+basic optimizer
+SCCP
+mem2reg
+SROA
+DCE
+range/BCE
+
+Phase 5
+x86-64 PMIR
+instruction selection
+register allocation
+frame layout
+encoder
+
+Phase 6
+COFF writer
+object reader
+archive reader/writer
+
+Phase 7
+native linker
+imports
+exports
+relocations
+PE headers
+runtime entry
+first .exe
+
+Phase 8
+unwind
+TLS
+resources
+DLL
+hardening
+debug
+
+Phase 9
+advanced optimizer
+inlining
+specialization
+fusion
+vectorization
+Path Compression
+SSA Reduction
+
+Phase 10
+C++20 backend
+differential validation
+full standard library
+PDB/tooling
+
+The first architecture-proof milestone is:
+
+hello.pcn
+↓
+PCIR
+↓
+PMIR
+↓
+x86-64
+↓
+COFF/link
+↓
+hello.exe
+
+without an external assembler, C++ compiler or linker.
+
+---
+
+96. First Native Milestone Contract
+
+The minimum self-contained native compiler must support:
+
+int
+bool
+text literals
+routines
+local let/var
+arithmetic
+comparison
+if
+while
+calls
+give
+foreign Windows calls or minimal std output
+
+and generate a valid direct PE32+ executable.
+
+This milestone is not language 1.0 completion by itself.
+
+It proves the architecture.
+
+---
+
+97. Final Standard-Library Tiers
+
+The canonical tiers become:
+
+core
+    std.core
+    std.mem core
+    std.num
+    std.math
+    std.slice
+    std.iter
+    std.atomic
+    std.hash
+    std.fmt core
+    std.text core
+    std.simd
+
+alloc
+    std.buffer
+    std.text.string
+    std.collections
+    std.sort
+    std.mem allocators
+
+std
+    std.io
+    std.fs
+    std.path
+    std.env
+    std.time
+    std.thread
+    std.sync
+    std.process
+    std.random
+    std.net
+    std.dynlib
+    std.win
+    std.test
+
+No tier silently pulls a higher tier.
+
+---
+
+98. Final Philosophy of Memory Safety
+
+Safe Paracine guarantees:
+
+no use after move
+no double dispose
+no dangling safe borrow
+no mutable/shared alias violation
+no out-of-bounds memory access
+no safe data race
+no uninitialized safe read
+
+It does not guarantee:
+
+no memory leak
+no deadlock
+no logical race through message ordering
+no starvation
+no stack exhaustion
+no denial-of-service through valid huge work
+
+Unsafe code may violate memory-safety assumptions.
+
+Such violation is erroneous execution and invalidates language guarantees from that point.
+
+---
+
+99. Final Definition of “No Undefined Behavior in Safe Code”
+
+Safe source has no language-level undefined behavior.
+
+An operation is instead one of:
+
+defined value
+recoverable result
+defined trap
+defined nondeterministic scheduling result
+target-documented platform behavior
+
+Compiler optimizations cannot manufacture assumptions beyond these rules.
+
+Undefined or erroneous execution enters only through:
+
+unsafe contract violation
+foreign code violating its declared ABI/contract
+external hardware/OS failure outside the abstract machine
+
+---
+
+100. Final Production Architecture
+
+The completed Paracine toolchain is:
+
+                     PARACINE SOURCE
+                           .pcn
+                            │
+                            ▼
+                  canonical normalization
+                            │
+                            ▼
+                   lexer + layout
+                            │
+                            ▼
+                 parser + typed syntax
+                            │
+                            ▼
+                    name resolution
+                            │
+                            ▼
+                generics + capabilities
+                            │
+                            ▼
+             ownership + effects + closure
+                      resolution
+                            │
+                            ▼
+                           PCIR
+                            │
+                            ▼
+                 PCIR verification
+                            │
+                            ▼
+                 semantic optimization
+                            │
+          ┌─────────────────┼─────────────────┐
+          │                 │                 │
+          ▼                 ▼                 ▼
+     C++20 legalizer    target legalizer  target legalizer
+          │                 │                 │
+          ▼                 ▼                 ▼
+     C++20 emitter          PMIR              PMIR
+          │                 │                 │
+          ▼                 ▼                 ▼
+        .cpp          x86-64 encoding    x86-64 encoding
+                            │                 │
+                            ▼                 ▼
+                       object model      object model
+                            │                 │
+                            ▼                 ▼
+                      COFF writer         native linker
+                            │                 │
+                            ▼                 ▼
+                           .obj            PE32+
+                                              │
+                                              ▼
+                                             .exe
+
+For DLL production:
+
+PCIR
+ ↓
+PMIR
+ ↓
+machine code
+ ↓
+native linker
+ ↓
+PE32+ DLL
+ ├──→ module.dll
+ └──→ module.lib
+
+For static-library production:
+
+PCIR
+ ↓
+PMIR
+ ↓
+COFF objects
+ ↓
+archive writer
+ ↓
+module.lib
+
+For portable textual production:
+
+PCIR
+ ↓
+C++20 backend
+ ↓
 module.cpp
 module.hpp
 
-where requested.
+---
 
-The generated header exposes only selected public Paracine definitions.
+101. Final One-Language Rule
+
+All realizations derive from one resolved semantic program.
+
+Therefore:
+
+.cpp
+.obj
+.exe
+.dll
+.lib
+
+are deployment products.
+
+They are not separate Paracine dialects.
+
+The source of truth remains:
+
+.pcn
 
 ---
 
-56. C ABI Headers
+102. Final Backend Law
 
-For C-facing exports, Paracine can additionally generate:
+A backend may choose a different representation.
 
-module.h
+It may not choose a different meaning.
 
-containing compatible native declarations.
+The definitive rule is:
 
-This is useful whether the implementation is compiled from C++20 or emitted directly as COFF.
-
----
-
-57. Native Linking
-
-Paracine's direct linker accepts appropriate native inputs such as:
-
-Paracine .obj
-compatible COFF .obj
-static .lib
-import .lib
-DLL imports
-
-This permits mixed native applications.
+«Semantics flow downward. Backends do not flow upward into the language.»
 
 ---
 
-58. Standard Library Realizations
+103. Final Optimization Law
 
-Paracine's standard library can exist simultaneously as:
+The original law remains unchanged and is now given its exact operational interpretation:
 
-Paracine source
-C++20-generated source where appropriate
-COFF object modules
-native static archives
-compiler intrinsics
+«Resolve what is known. Remove what is unnecessary. Represent what remains directly.»
 
-The selected backend uses the most appropriate realization.
+“Resolve” means:
 
----
+constant evaluation
+specialization
+range proof
+capability resolution
+layout resolution
+capture resolution
+ownership resolution
 
-59. C++20 Runtime Helpers
+“Remove” means:
 
-The textual backend supplies minimal helper code for semantics not safely expressible as naive C++ expressions, including:
+dead code
+dead storage
+dead checks
+dead cleanup
+dead abstractions
+dead iterator layers
+dead branches
+dead symbols
 
-- defined signed wrapping;
-- checked arithmetic;
-- tagged results;
-- specialized options;
-- runtime traps;
-- buffer ownership;
-- bounds operations.
+“Represent directly” means:
 
-Only required helpers are emitted or referenced.
-
----
-
-60. Direct Backend Runtime Helpers
-
-The native backend implements equivalent behavior through:
-
-- direct instructions;
-- inline sequences;
-- tiny runtime routines;
-- standard-library object modules.
-
-Both backends preserve the same language contract.
+the smallest semantically valid PCIR
+then the smallest target-appropriate PMIR/machine form
+without introducing runtime structure the program does not need
 
 ---
 
-61. Performance of C++20 Output
+104. Final Multi-Output Law
 
-Generated C++20 is designed to remain highly optimizable by modern C++ compilers.
+«One Paracine program may be materialized as portable C++20 text, native COFF objects, native static libraries, PE DLLs, or finished PE executables without changing its language semantics.»
 
-It exposes:
+The canonical three primary outputs remain:
 
-- concrete monomorphic functions;
-- fixed-width types;
-- simple control flow;
-- straightforward value semantics;
-- minimal runtime machinery;
-- explicit loops;
-- explicit storage.
+.pcn → .cpp
+.pcn → .obj
+.pcn → .exe
 
-This gives foreign C++ optimizers excellent material.
+while:
 
----
+.lib
+.dll
+.hpp
+.h
+.pdb
 
-62. Performance of Direct Native Output
-
-Direct native output retains Paracine-specific information through the entire machine pipeline.
-
-That gives it direct access to:
-
-- range facts;
-- alignment facts;
-- ownership facts;
-- pipeline-fusion information;
-- known branch structure;
-- exact generic specializations;
-- native layout information.
-
-The direct backend remains the canonical Paracine machine-code path.
+are canonical supporting production artifacts.
 
 ---
 
-63. Output Selection Philosophy
+105. Final Production Principle
 
-Use ".cpp" when portability, integration, inspection, or unsupported-target reach matters most.
-
-Use ".obj" when integration into a native Windows build is desired.
-
-Use ".exe" when Paracine owns the finished application.
-
-This provides a remarkably broad deployment spectrum from a single source language.
+«Write the meaning once. Resolve it once. Optimize it once. Materialize only what deployment requires.»
 
 ---
 
-64. Beginner Experience
+106. Final Language Definition
 
-None of the backend complexity appears in ordinary source.
+Paracine is a mature statically typed ahead-of-time native programming language with:
 
-A beginner still writes:
+explicit data
+explicit ownership
+inferred nonlexical borrowing
+static closures
+monomorphized generics
+structural capabilities
+defined arithmetic
+recoverable result semantics
+terminal traps
+structured native concurrency
+no mandatory GC
+no mandatory exceptions
+no mandatory scheduler
+no hidden dynamic initialization
+no mandatory external compiler
+no mandatory external assembler
+no mandatory external linker
 
-routine main() gives int
-    print("Hello")
-    give 0
+Its canonical semantic center is PCIR.
 
-and chooses an output.
+Its canonical Tier-1 machine path is:
 
----
-
-65. Professional Native Integration
-
-A library developer may write:
-
-public routine add(a: int, b: int) gives int
-    give a + b
-
-and produce:
-
-math.cpp
-
-for C++ integration,
-
-math.obj
-
-for direct binary integration,
-
-or:
-
-math.lib
-
-through Paracine's native archive tooling.
-
----
-
-66. Application Deployment
-
-An application developer can produce:
-
-application.exe
-
-directly.
-
-There is no need to expose C++20 at all.
-
----
-
-67. Compiler Inspection
-
-Compiler engineers can compare:
-
-Paracine source
+.pcn
+ ↓
 PCIR
-C++20 output
+ ↓
 PMIR
-assembly
-COFF
-PE
+ ↓
+x86-64
+ ↓
+COFF/link
+ ↓
+PE32+
 
-from a single build.
-
-That makes Paracine unusually transparent.
-
----
-
-68. Toolchain Inspection Commands
-
-pcn ir
-pcn cpp
-pcn mir
-pcn asm
-pcn obj
-pcn pe
-
-show successive output views.
-
-"pcn cpp" is the textual C++20 representation.
-
-It does not imply that native compilation passed through it.
-
----
-
-69. Definitive Technical Profile
-
-Property| Mature Paracine
-Language| Paracine
-Extension| ".pcn"
-Class| Native general-purpose / systems / performance
-Compilation| Ahead-of-time
-Compiler implementation| C++23
-Textual output| C++20
-Textual extension| ".cpp"
-Native object output| COFF
-Native object extension| ".obj"
-Native executable output| PE32+
-Native executable extension| ".exe"
-Canonical native OS| Windows
-Canonical native architecture| x86-64
-Canonical native ABI| Microsoft x64
-Semantic IR| PCIR
-Machine IR| Paracine Machine IR
-C++20 mandatory for native compilation| No
-External compiler mandatory for ".obj"| No
-External compiler mandatory for ".exe"| No
-External assembler mandatory| No
-External linker mandatory| No
-Direct machine encoding| Yes
-Direct COFF writing| Yes
-Direct PE construction| Yes
-C++20 emitter| Yes
-Header generation| Yes
-C ABI header generation| Yes
-Integer vocabulary| "byte short int long"
-Unsigned vocabulary| "ubyte ushort uint ulong"
-Default integer| "int"
-Floating| "float", "double"
-Callable| "routine"
-Parameters| "name: type"
-Return declaration| "gives type"
-Return operation| "give"
-Error value| "result<T,E>"
-Error propagation| "try"
-Error emission| "fail"
-Optional value| "option<T>"
-Decision expression| "choose"
-Pipeline| "->"
-Blocks| 4-space indentation
-Mutation| explicit "var"
-Default binding| immutable "let"
-Generics| monomorphized
-Inheritance| none
-General operator overloading| none
-GC| none mandatory
-Exceptions| none mandatory
-Scheduler| none mandatory
-Unsafe| explicit
-SIMD| automatic + explicit
-Atomics| native
-Main semantic optimizer| PCIR
-C++ textual backend| C++20
-Native instruction selection| Paracine
-Register allocation| Paracine
-Machine encoding| Paracine
-Object writer| Paracine COFF writer
-Native linker| Paracine
-PE writer| Paracine
-
----
-
-70. Canonical Output Equation
-
-Paracine's mature output architecture is:
-
-                    .pcn
-                      ↓
-                    PCIR
-                      ↓
-              semantic optimization
-                      ↓
-          ┌───────────┼───────────┐
-          ↓           ↓           ↓
-       C++20        PMIR        PMIR
-          ↓           ↓           ↓
-        .cpp      machine code machine code
-                      ↓           ↓
-                    COFF       native link
-                      ↓           ↓
-                    .obj         PE32+
-                                   ↓
-                                  .exe
-
----
-
-71. Canonical One-Sentence Definition
-
-«Paracine is a mature statically typed native programming language whose unified semantic compiler can materialize optimized programs as standards-oriented C++20 source, direct COFF object code, or complete PE32+ executables while preserving one exact Paracine language contract across every output form.»
-
----
-
-72. Governing Production Principle
-
-«Write the meaning once. Resolve it once. Optimize it once. Materialize it in the form the deployment requires.»
-
----
-
-73. Final Definition
-
-Paracine is a fully mature, production-hardened, statically typed, ahead-of-time compiled native programming language centered on direct semantic translation and multi-output realization.
-
-Its source remains:
-
-.pcn
-
-Its canonical callable remains:
-
-routine add(a: int, b: int) gives int
-    give a + b
-
-Its canonical forwarding syntax remains:
-
-give add(a, b)
-
-Its primitive integer vocabulary remains:
-
-byte
-short
-int
-long
-
-ubyte
-ushort
-uint
-ulong
-
-Its programs continue to be built from:
-
-- routines;
-- values;
-- records;
-- arrays;
-- views;
-- spans;
-- buffers;
-- variants;
-- results;
-- choices;
-- loops;
-- pipelines;
-- generics;
-- modules;
-- explicit native memory.
-
-Paracine resolves those constructs into optimized PCIR.
-
-From there the program can take three canonical forms.
-
-Portable textual form
+Its canonical portability path is:
 
 .pcn
  ↓
 PCIR
  ↓
-C++20 emitter
+C++20
  ↓
 .cpp
 
-Native object form
+Both paths implement the same program.
 
-.pcn
- ↓
-PCIR
- ↓
-PMIR
- ↓
-machine encoding
- ↓
-COFF
- ↓
-.obj
+---
 
-Native executable form
+107. Frozen Edition-2026 Statement
 
-.pcn
- ↓
-PCIR
- ↓
-PMIR
- ↓
-machine encoding
- ↓
-native linking
- ↓
-PE32+
- ↓
-.exe
+The edition-2026 language is considered frozen when the reference implementation accepts the grammar and semantics in the complete 1.0 specification plus this resolution document and no longer contains unresolved semantic placeholders.
 
-The ".cpp" output is a first-class textual representation.
+New optimizations may be added without an edition change when they preserve semantics.
 
-It is suitable for:
+New library APIs may be added compatibly.
 
-- human inspection;
-- portability;
-- C++ project integration;
-- foreign toolchains;
-- unsupported native targets;
-- semantic reference testing.
+A change to any of these requires a new language edition:
 
-The ".obj" output is a first-class native binary representation.
+grammar incompatibility
+type-system incompatibility
+ownership incompatibility
+arithmetic semantic change
+trap semantic change
+module-resolution incompatibility
+ABI-visible language representation change not protected by versioning
 
-It is suitable for:
+---
 
-- static linking;
-- mixed-language native applications;
-- libraries;
-- incremental compilation;
-- native package distribution.
+108. Final Canonical Summary
 
-The ".exe" output is the complete Paracine-native application form.
+PARACINE ".pcn"
 
-It is suitable for direct Windows execution.
-
-The three outputs share one frontend.
-
-They share one type system.
-
-They share one semantic analyzer.
-
-They share one generic-specialization model.
-
-They share one ownership model.
-
-They share one PCIR optimization pipeline.
-
-They share one language definition.
-
-They do not represent three different versions of Paracine.
-
-They represent three realizations of the same Paracine program.
-
-C++23 builds the Paracine compiler.
-
-C++20 is one text format the Paracine compiler can emit.
-
-COFF is one native binary format the Paracine compiler can emit.
-
-PE32+ is one executable image format the Paracine compiler can emit.
-
-The distinction is definitive:
-
-C++23 = compiler implementation language
-
-C++20 = portable textual program output
-
-COFF   = native object output
-
-PE32+  = native executable output
-
-Thus Paracine's mature production identity is:
-
-                         PARACINE .pcn
-                               ↓
-                              PCIR
-                               ↓
-                   optimized semantic program
-                               ↓
-              ┌────────────────┼────────────────┐
-              ↓                ↓                ↓
-           C++20             COFF             PE32+
-              ↓                ↓                ↓
-            .cpp             .obj              .exe
-
-No one output is confused with another.
-
-No textual backend is required for native compilation.
-
-No native backend is required merely to export C++20.
-
-Paracine can act as:
-
-- a native systems compiler;
-- a direct Windows executable compiler;
-- a COFF object producer;
-- a C++20 source generator;
-- an interoperability language;
-- a portable native-language frontend.
-
-Its mature equation is therefore:
-
-Clear Source
+Readable source
 +
-Exact Types
+Exact static types
 +
-Explicit Data
+Explicit ownership
 +
-Structured Decisions
+Nonlexical borrowing
 +
-Static Knowledge
+Zero-allocation static closures
 +
-Generic Specialization
+Recoverable result handling
++
+Defined machine arithmetic
++
+PCIR semantic optimization
 +
 Path Compression
 +
 SSA Reduction
-────────────────────────
-One Optimized Program
-────────────────────────
-        ↓
++
+Direct PMIR lowering
++
+Direct x86-64 machine encoding
++
+Direct COFF generation
++
+Direct native linking
++
+Direct PE32+ generation
++
+C++20 portability output
+────────────────────────────────
+One semantic program
+────────────────────────────────
+       ↓
  C++20 / COFF / PE
 
-And its final production rule is:
+And the definitive production rule is:
 
 «One language. One semantic truth. Multiple exact realizations.»
 
 PARACINE
 
-".pcn → .cpp"
+.pcn → .cpp
+.pcn → .obj
+.pcn → .exe
 
-".pcn → .obj"
+Clear to people. Obvious to machines.A couple of the backend decisions above are deliberately conservative where Windows gives the compiler several legal possibilities. For example, Paracine now commits to conventional x64 unwind metadata it can generate and verify consistently; Microsoft documents the restricted x64 prolog/epilog and unwind model that makes this necessary.  The completed linker rules also match the documented PE32+ model: imports use directory/lookup/IAT structures, exports use address/name/ordinal tables, TLS contains loader-initialized template/index/callback information, and 64-bit images use page-grouped base relocations such as DIR64. 
 
-".pcn → .exe"
-
-Clear to people. Obvious to machines.
-
-
-## *** ##
-
-
-Paracine Language Specification
-Normative draft 1.0 — grammar, formal semantics, ownership, modules, standard library
-Status note. The Paracine overview document fixes the vocabulary (routine, gives, give, let, var, record, variant, option<T>, result<T,E>, try, fail, choose, ->, view, span, buffer, defer, unsafe, foreign c routine, where T is ordered, 4-space blocks) and the architecture (PCIR, three outputs). It does not define the grammar, semantics, ownership rules, module system or library. Everything below is a proposed normative definition that stays consistent with that vocabulary. Where I had to choose between alternatives, the choice is marked [Decision] so you can overrule it.
-Part 1. Notation and lexical grammar
-1.1 Metalanguage
-EBNF is used throughout: A = B ; defines a rule, | is alternation, [ X ] is optional, { X } is zero or more, ( X ) groups, 'text' is a literal token, /re/ is a regular expression, (* ... *) is a comment. NEWLINE, INDENT and DEDENT are layout tokens produced by the layout pass (1.4).
-1.2 Source text
-1. A source file is UTF-8, normalized to NFC before lexing. A leading byte-order mark is discarded.
-2. Line terminators are LF; CRLF and CR are normalized to LF.
-3. Tab characters are forbidden outside string and character literals and comments. [Decision] Indentation is exactly four spaces per level.
-4. Trailing whitespace is ignored. A file that does not end in LF has one added.
-1.3 Tokens
-identifier    = /[\p{XID_Start}_][\p{XID_Continue}]*/ ;   (* not a keyword *)
-type_name     = identifier ;                              (* by convention Capitalized for records/variants *)
-
-dec_int       = /[0-9]([0-9_]*[0-9])?/ ;
-hex_int       = /0x[0-9A-Fa-f]([0-9A-Fa-f_]*[0-9A-Fa-f])?/ ;
-bin_int       = /0b[01]([01_]*[01])?/ ;
-oct_int       = /0o[0-7]([0-7_]*[0-7])?/ ;
-int_suffix    = 'byte' | 'short' | 'int' | 'long'
-              | 'ubyte' | 'ushort' | 'uint' | 'ulong' | 'size' | 'ssize' ;
-int_literal   = ( dec_int | hex_int | bin_int | oct_int ) [ '_' int_suffix ] ;
-
-float_literal = /[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?/ [ '_' ( 'float' | 'double' ) ] ;
-bool_literal  = 'true' | 'false' ;
-char_literal  = "'" ( char_escape | /[^'\\\n]/ ) "'" ;      (* one Unicode scalar value *)
-text_literal  = '"' { char_escape | /[^"\\\n]/ } '"' ;
-raw_text      = 'r"' /[^"]*/ '"' ;
-char_escape   = '\\' ( 'n' | 'r' | 't' | '0' | '\\' | "'" | '"'
-              | 'x' hex hex | 'u{' hex { hex } '}' ) ;
-
-line_comment  = '//' { any except NEWLINE } ;
-doc_comment   = '///' { any except NEWLINE } ;
-block_comment = '/*' { any | block_comment } '*/' ;      (* nests *)
-An unsuffixed integer literal has type int if it fits, otherwise it is a compile-time error unless context fixes another integer type. An unsuffixed float literal is double unless context fixes float.
-1.4 Keywords and reserved words
-abi       alias     and       as        break     capability  choose
-const     continue  defer     else      export    fail      false
-for       foreign   give      gives     if        import    in
-is        let       loop      module    move      not       or
-own       public    raw       record    return_   routine   test
-true      try       unsafe    var       variant   when      where
-while     with      yield_
-return_ and yield_ are reserved for future use; give is the only return operation. Primitive type names (byte short int long ubyte ushort uint ulong float double bool char text size ssize void) and the library type names option result view span buffer array are predeclared identifiers, not keywords; they may be shadowed only in a module that explicitly writes import std.prelude as nothing (discouraged).
-1.5 Operators and punctuation
-+  -  *  /  %  &  |  ^  ~  <<  >>
-==  !=  <  <=  >  >=
-=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=
-->  =>  .  ..  ..=  ,  :  ::  ?  @  (  )  [  ]  {  }
-and, or, not are the logical operators; &&, ||, ! do not exist. & and | are bitwise only.
-1.6 Layout algorithm
-The layout pass runs after lexing and before parsing.
-1. Each logical line has an indentation of 4k leading spaces. A line with any other leading-space count is a lexical error.
-2. Blank lines and comment-only lines produce no layout tokens.
-3. If a line's indentation is one level deeper than the previous significant line and the previous line ends in a block opener (a line ending in :-free header form: a declaration or statement header that takes a block), emit INDENT.
-4. If indentation decreases by n levels, emit n DEDENT tokens, then NEWLINE.
-5. Otherwise at equal indentation emit NEWLINE.
-6. Inside (…), […], {…} newlines and indentation are insignificant (line continuation). A line beginning with -> also continues the previous expression (pipeline continuation).
-7. A deeper indentation that does not follow a block opener is an error E0101: unexpected indent.
-A block is therefore NEWLINE INDENT statement { statement } DEDENT.
-Part 2. Syntactic grammar
-2.1 Compilation unit
-source_file   = [ module_decl NEWLINE ] { import_decl NEWLINE } { top_item NEWLINE } ;
-
-module_decl   = 'module' module_path ;
-module_path   = identifier { '.' identifier } ;
-
-import_decl   = 'import' module_path [ 'as' identifier ]
-              | 'import' module_path '.' '{' import_list '}'
-              | 'import' module_path '.' '*' ;          (* glob: only allowed for std.prelude-like modules *)
-import_list   = import_item { ',' import_item } ;
-import_item   = identifier [ 'as' identifier ] ;
-
-top_item      = { attribute NEWLINE } [ visibility ] item_body ;
-visibility    = 'public' | 'export' ;                   (* see 6.3 *)
-item_body     = routine_decl | record_decl | variant_decl | alias_decl
-              | const_decl | capability_decl | foreign_decl | test_decl
-              | static_decl ;
-
-attribute     = '@' identifier [ '(' [ attr_arg { ',' attr_arg } ] ')' ] ;
-attr_arg      = identifier [ '=' literal ] | literal ;
-2.2 Declarations
-routine_decl  = 'routine' identifier [ generic_params ] '(' [ param_list ] ')'
-                [ 'gives' type ] [ where_clause ] [ effects ] block ;
-param_list    = param { ',' param } [ ',' ] ;
-param         = [ param_mode ] identifier ':' type [ '=' const_expr ] ;
-param_mode    = 'own' | 'var' | 'raw' ;                  (* default: shared immutable borrow; see Part 4 *)
-effects       = 'with' effect { ',' effect } ;
-effect        = 'unsafe' | 'alloc' | 'io' | 'thread' | 'trap' | 'pure' ;
-
-generic_params= '<' generic_param { ',' generic_param } '>' ;
-generic_param = identifier | 'const' identifier ':' type ;
-where_clause  = 'where' constraint { ',' constraint } ;
-constraint    = type 'is' capability_ref { 'and' capability_ref } ;
-capability_ref= module_path [ type_args ] ;
-
-record_decl   = 'record' identifier [ generic_params ] [ where_clause ] NEWLINE INDENT
-                field { NEWLINE field } DEDENT ;
-field         = [ 'public' ] identifier ':' type [ '=' const_expr ] ;
-
-variant_decl  = 'variant' identifier [ generic_params ] [ where_clause ] NEWLINE INDENT
-                case { NEWLINE case } DEDENT ;
-case          = identifier [ '(' case_field { ',' case_field } ')' ] ;
-case_field    = [ identifier ':' ] type ;
-
-alias_decl    = 'alias' identifier [ generic_params ] '=' type ;
-const_decl    = 'const' identifier [ ':' type ] '=' const_expr ;
-static_decl   = 'var' 'static' identifier ':' type '=' const_expr ;   (* needs 'with unsafe' to access unless atomic *)
-
-capability_decl = 'capability' identifier generic_params NEWLINE INDENT
-                  capability_member { NEWLINE capability_member } DEDENT ;
-capability_member = 'routine' identifier '(' [ param_list ] ')' [ 'gives' type ] ;
-
-foreign_decl  = 'foreign' abi_name 'routine' identifier '(' [ param_list ] ')'
-                [ 'gives' type ] [ 'from' text_literal ] ;
-abi_name      = 'c' | 'msx64' ;
-
-test_decl     = 'test' text_literal block ;
-A record field with no default must be given a value at every construction. A routine with no gives clause gives void.
-2.3 Types
-type          = prim_type | path_type | generic_type | array_type
-              | tuple_type | routine_type | 'void' ;
-prim_type     = 'byte' | 'short' | 'int' | 'long' | 'ubyte' | 'ushort' | 'uint'
-              | 'ulong' | 'float' | 'double' | 'bool' | 'char' | 'text'
-              | 'size' | 'ssize' ;
-path_type     = module_path ;
-generic_type  = module_path type_args ;
-type_args     = '<' type_arg { ',' type_arg } '>' ;
-type_arg      = type | const_expr ;
-array_type    = 'array' '<' type ',' const_expr '>' ;      (* fixed length, inline storage *)
-tuple_type    = '(' type ',' type { ',' type } ')' ;
-routine_type  = 'routine' '(' [ type { ',' type } ] ')' [ 'gives' type ] ;
-Built-in generic types: option<T>, result<T,E>, view<T>, span<T>, buffer<T>, array<T,N>, raw<T> (raw pointer), atomic<T>. view and span are fat borrow types (pointer + count); routine_type values are plain function pointers with no captured environment (Paracine has no closures; [Decision] capture-free by design to keep the runtime non-managed).
-2.4 Statements
-block         = NEWLINE INDENT statement { statement } DEDENT ;
-statement     = ( let_stmt | var_stmt | assign_stmt | expr_stmt | give_stmt
-                | fail_stmt | if_stmt | choose_stmt | loop_stmt | while_stmt
-                | for_stmt | break_stmt | continue_stmt | defer_stmt
-                | unsafe_block ) NEWLINE ;
-
-let_stmt      = 'let' pattern [ ':' type ] '=' expr ;
-var_stmt      = 'var' identifier [ ':' type ] '=' expr ;
-assign_stmt   = place assign_op expr ;
-assign_op     = '=' | '+=' | '-=' | '*=' | '/=' | '%=' | '&=' | '|=' | '^=' | '<<=' | '>>=' ;
-place         = identifier | place '.' identifier | place '[' expr ']' | '*' primary ;
-expr_stmt     = expr ;
-give_stmt     = 'give' [ expr ] ;
-fail_stmt     = 'fail' expr ;
-break_stmt    = 'break' [ identifier ] ;
-continue_stmt = 'continue' [ identifier ] ;
-defer_stmt    = 'defer' ( expr | block ) ;
-unsafe_block  = 'unsafe' block ;
-
-if_stmt       = 'if' expr block { 'else' 'if' expr block } [ 'else' block ] ;
-loop_stmt     = [ label ':' ] 'loop' block ;
-while_stmt    = [ label ':' ] 'while' expr block ;
-for_stmt      = [ label ':' ] 'for' pattern 'in' expr block ;
-label         = '@' identifier ;
-
-choose_stmt   = 'choose' expr NEWLINE INDENT choose_arm { NEWLINE choose_arm } DEDENT ;
-choose_arm    = 'when' pattern [ 'if' expr ] ( block | 'then' expr )
-              | 'else' ( block | 'then' expr ) ;
-A choose over a variant, bool, option or result scrutinee must be exhaustive (see 5.7).
-2.5 Patterns
-pattern       = '_' | identifier | literal | literal '..' literal | literal '..=' literal
-              | module_path [ '(' [ pattern { ',' pattern } ] ')' ]     (* variant case *)
-              | module_path '{' [ field_pat { ',' field_pat } ] '}'     (* record *)
-              | '(' pattern ',' pattern { ',' pattern } ')'
-              | pattern 'or' pattern ;
-field_pat     = identifier [ ':' pattern ] ;
-some(p) and none are the cases of option; ok(p) and err(p) are the cases of result.
-2.6 Expressions
-Expressions are parsed by a Pratt parser. Binding power increases downward (higher binds tighter).
-Level
-Operators
-Assoc.
-1
--> (pipeline)
-left
-2
-or
-left
-3
-and
-left
-4
-not (prefix)
-—
-5
-== != < <= > >=
-none (non-chaining)
-6
-|
-left
-7
-^
-left
-8
-&
-left
-9
-<< >>
-left
-10
-.. ..=
-none
-11
-+ -
-left
-12
-* / %
-left
-13
-unary - ~ * (deref, raw only) & (borrow-of)
-prefix
-14
-as (conversion)
-left
-15
-postfix: call (), index [], field ., ?-free try
-left
-expr          = pipeline ;
-pipeline      = disjunction { '->' pipe_stage } ;
-pipe_stage    = path_expr [ '(' [ arg_list ] ')' ] ;       (* x -> f(a) means f(x, a) *)
-disjunction   = conjunction { 'or' conjunction } ;
-conjunction   = negation { 'and' negation } ;
-negation      = 'not' negation | comparison ;
-comparison    = bitor [ cmp_op bitor ] ;
-cmp_op        = '==' | '!=' | '<' | '<=' | '>' | '>=' ;
-bitor         = bitxor { '|' bitxor } ;
-bitxor        = bitand { '^' bitand } ;
-bitand        = shift { '&' shift } ;
-shift         = range { ( '<<' | '>>' ) range } ;
-range         = additive [ ( '..' | '..=' ) additive ] ;
-additive      = multiplicative { ( '+' | '-' ) multiplicative } ;
-multiplicative= unary { ( '*' | '/' | '%' ) unary } ;
-unary         = ( '-' | '~' | '*' | '&' ) unary | cast ;
-cast          = postfix { 'as' type } ;
-postfix       = primary { call_suffix | index_suffix | field_suffix } ;
-call_suffix   = '(' [ arg_list ] ')' ;
-arg_list      = arg { ',' arg } [ ',' ] ;
-arg           = [ identifier ':' ] [ 'move' | 'var' ] expr ;
-index_suffix  = '[' expr ']' ;
-field_suffix  = '.' identifier ;
-primary       = literal | path_expr | '(' expr ')' | tuple_expr | record_expr
-              | array_expr | try_expr | choose_expr | if_expr | unsafe_expr ;
-
-path_expr     = module_path [ '::' type_args ] ;            (* explicit instantiation: maximum::<int> *)
-tuple_expr    = '(' expr ',' expr { ',' expr } ')' ;
-record_expr   = module_path '{' [ field_init { ',' field_init } ] '}' ;
-field_init    = identifier [ ':' expr ] ;
-array_expr    = '[' [ expr { ',' expr } ] ']' | '[' expr ';' const_expr ']' ;
-try_expr      = 'try' unary ;
-if_expr       = 'if' expr 'then' expr 'else' expr ;
-choose_expr   = 'choose' expr NEWLINE INDENT expr_arm { NEWLINE expr_arm } DEDENT ;
-expr_arm      = 'when' pattern [ 'if' expr ] 'then' expr | 'else' 'then' expr ;
-unsafe_expr   = 'unsafe' '(' expr ')' ;
-literal       = int_literal | float_literal | bool_literal | char_literal
-              | text_literal | raw_text ;
-Disambiguation rules.
-1. a -> f(b) desugars to f(a, b) after parsing; f is resolved like any call.
-2. A comparison does not chain: a < b < c is E0210.
-3. try e binds like a prefix operator; try f(x).y parses as try (f(x).y)'s inner postfix first, i.e. try applies to the whole postfix expression.
-4. * and & as prefix are only valid on raw<T> values (dereference) and in &place (explicit borrow, used only at foreign and raw boundaries); ordinary borrowing is implicit (Part 4).
-5. A record_expr requires the name to resolve to a record type; otherwise { after a path is not parsed as a literal.
-Part 3. Types and the static type system
-3.1 Primitive types
-Type
-Size (bits)
-Domain
-Copyable
-Default value
-bool
-8
-false, true (only bit patterns 0 and 1 are valid)
-yes
-false
-char
-32
-Unicode scalar value (not a surrogate, ≤ U+10FFFF)
-yes
-'\0'
-byte, ubyte
-8
-two's-complement / unsigned
-yes
-0
-short, ushort
-16
-likewise
-yes
-0
-int, uint
-32
-likewise
-yes
-0
-long, ulong
-64
-likewise
-yes
-0
-size, ssize
-pointer width (64 on Tier-1)
-unsigned / signed object size
-yes
-0
-float, double
-32 / 64
-IEEE 754 binary32 / binary64
-yes
-0.0
-text
-2 × pointer width
-immutable UTF-8 view (pointer + byte count), always valid UTF-8
-yes
-""
-void
-0
-single value ()
-yes
-()
-[Decision] text is a borrowed, immutable string slice, not an owner. The owning string is std.text.string (a buffer<ubyte> with a UTF-8 invariant). String literals have type text and live in static storage.
-3.2 Composite types
-• Tuple (A, B, …): anonymous record with fields 0, 1, ….
-• Record: nominal product type. Field order is declaration order (see 3.6).
-• Variant: nominal sum type with named cases. Zero or more payload fields per case.
-• array<T,N>: N values of T inline, N a compile-time size.
-• option<T>: variant none | some(T). result<T,E>: variant ok(T) | err(E).
-• view<T>: { ptr: raw<T>, count: size }, a shared read-only borrow of count consecutive T.
-• span<T>: same shape, an exclusive mutable borrow.
-• buffer<T>: owning, growable contiguous storage { ptr, count, capacity }.
-• raw<T>: pointer carrying no ownership or borrow information (4.8). atomic<T>: T accessed only through atomic operations; T must be an integer, bool, raw<U> or a payload-free variant.
-• routine(A, B) gives R: pointer to a top-level routine; no environment.
-The overview's niche optimization for option<T> is a representation matter and must not be observable except through layout queries. The guaranteed niches are: option<view<T>>, option<span<T>>, option<text>, option<buffer<T>>, option<raw<T>> (null pointer) and option<bool>, option<char> (invalid bit patterns).
-3.3 Conversions
-[Decision] Paracine has no implicit numeric conversions. The only implicit typing steps are:
-1. Literal fitting. An unsuffixed literal takes the type demanded by context if its value is representable; otherwise E0301.
-2. Auto-borrow. A buffer<T>, array<T,N>, span<T> or string in an argument position expecting view<T> (or text) is borrowed implicitly as a shared view. A var place of those types in a position expecting span<T> is borrowed exclusively.
-3. Never-type coercion. fail, give, break, continue and calls to routines that cannot return have type never, which converts to any type.
-Explicit conversion is written e as T and is defined only in these cases:
-From → To
-Meaning
-integer → wider integer of same signedness
-exact
-integer → integer otherwise
-modular: result is e mod 2^w interpreted in the target type
-integer → float/double
-round-to-nearest-even
-float/double → integer
-truncate toward zero, saturating at the target range; NaN → 0
-float ↔ double
-round-to-nearest-even / exact
-char → uint
-scalar value
-uint → char
-not allowed; use std.text.char_from (returns option<char>)
-bool → integer
-0 or 1; the reverse is not allowed
-size ↔ ulong, ssize ↔ long
-identity on Tier-1 targets; integer rule elsewhere
-Anything else (text as int, buffer as view, …) is E0302. Checked and saturating alternatives live in std.num (7.4).
-3.4 Generics and capabilities
-Generics are monomorphized (as the overview requires): each generic definition is type-checked once against its where constraints, then each distinct instantiation is substituted and re-checked for code generation. A capability is a named set of routines a type must provide; it is Paracine's only abstraction mechanism for generics. There is no inheritance and no dynamic dispatch.
-capability ordered<T>
-    routine compare(a: T, b: T) gives ordering
-
-routine maximum<T>(a: T, b: T) gives T
-    where T is ordered
-    if compare(a, b) == ordering.less
-        give b
-    give a
-Capability satisfaction. A type T satisfies capability C if routines matching every member of C (with T substituted) are visible at the use site. Satisfaction is by name and signature; there are no separate impl blocks. [Decision] A member is looked up in (a) the module defining T, (b) the module defining C, (c) the current module, in that order; two candidates at the same level is E0340: ambiguous capability member.
-Built-in capabilities (defined in std.core, 7.2): equatable, ordered, hashable, copyable, defaultable, numeric, integer, floating, disposable, sendable, shareable. copyable, sendable and shareable are derived structurally by the compiler and cannot be hand-written; the rest are ordinary capabilities. numeric is satisfied by all integer and floating primitives.
-Const generics: routine fill<const N: size>(a: span<int>) is permitted; N must be a compile-time constant at every use site.
-3.5 Inference
-Inference is local and bidirectional:
-• let/var without annotation infer from the initializer. A literal initializer defaults to int/double.
-• Generic arguments are inferred from call arguments and the expected result type. If inference fails, write f::<T>(x).
-• Routine signatures, record fields and variant payloads are always fully annotated; there is no cross-routine inference.
-3.6 Layout
-Default layout: fields in declaration order, each at the next offset aligned to the field's natural alignment, with trailing padding to the record's alignment. [Decision] The compiler does not reorder fields. Attributes: @layout(c) (guaranteed identical to the C ABI struct), @packed(n) (maximum field alignment n), @align(n). A variant is laid out as a tag (the smallest unsigned integer that fits the case count, placed first) followed by a payload union aligned to its widest member, unless niche packing applies (3.2). Layout queries std.mem.size_of<T>, align_of<T> and offset_of<T>("field") are compile-time.
-Part 4. Ownership, borrowing and raw authority
-4.1 Vocabulary
-• A value occupies a place (a local, a field of a place, an element of an array, or storage reached through a buffer).
-• Every move-only value has exactly one owner place at any time.
-• A borrow is a temporary access path to a place: shared (read-only, many allowed) or exclusive (read-write, one allowed).
-• A region is the set of program points over which a borrow is live. Regions are computed by the compiler and are non-lexical: a borrow is live from creation until its last use. Paracine has no explicit lifetime parameters.
-4.2 Copy and move
-A type is copyable (structurally derived) iff it is a primitive, view<T>, raw<T> or a routine pointer, or a tuple, record, variant, array, option or result whose components are all copyable and which has no dispose routine. All other types are move-only: buffer<T>, span<T>, string, atomic<T>, any type with dispose, and any aggregate containing one.
-Using a copyable value copies it. Using a move-only value in a consuming position moves it. Consuming positions are: the right-hand side of let/var/assignment, an argument bound to an own parameter, give e, a record or variant constructor argument, an element of an array or tuple literal, and fail e. After a move the source place is uninitialized: reading it is E0401: use of moved value. A var place may be re-initialized by assignment. A move may be written explicitly (move x) for clarity; it is required only when passing to an own parameter while the same call also borrows the place elsewhere.
-Partial moves. A field of a local record may be moved out, leaving the record partially initialized. The record cannot then be used as a whole until the field is re-initialized, and it must not have a dispose routine (E0402).
-Conditional moves. Flow analysis tracks initialization per control-flow path. Where a place is moved on only some paths, the compiler allocates a hidden drop flag so cleanup runs exactly on the paths where the value is still owned.
-4.3 Parameter modes
-Declaration
-Mode
-Caller supplies
-Callee may
-x: T
-shared borrow
-any initialized place or rvalue
-read x; not move out, not mutate, not let the borrow outlive the call unless the result is tied (4.5)
-var x: T
-exclusive borrow
-a var place; the call site writes var place
-read and write x; the caller keeps ownership
-own x: T
-ownership transfer
-any value; move-only values are moved
-do anything; must dispose or move it onward before exit
-raw x: T
-raw authority
-an unsafe context
-use x as a raw pointer or raw-derived value
-For small copyable T a shared borrow may be passed by value. This is an implementation detail that cannot change semantics because the borrow is read-only.
-Results: gives T returns an owned value by move or copy. gives view<U> or gives span<U> returns a borrow (4.5).
-4.4 The aliasing rule
-For every place p at every program point:
-1. there may be any number of live shared borrows of p or exactly one live exclusive borrow of p, never both;
-2. while an exclusive borrow of p is live, p and its fields can be neither read nor written except through that borrow;
-3. while a shared borrow of p is live, p cannot be written, moved or re-initialized;
-4. borrowing a field borrows only that field (field-sensitive), but indexing is not: a[i] and a[j] are the same place unless range analysis proves i != j, or the program uses std.slice.split_at(var a, k) to obtain two disjoint spans.
-Violations: E0410: conflicting borrow, E0411: write while borrowed, E0412: move while borrowed.
-4.5 Returned borrows (region elision)
-A routine whose gives type is view<U>, span<U>, text, or a record/option/result containing one is borrow-returning. The returned borrow is tied to parameters by these rules, applied in order:
-1. If @from(p, q, …) appears on the routine, the result may borrow from exactly those parameters.
-2. Else if exactly one parameter is a borrow-mode parameter whose type is not a plain copyable scalar, the result borrows from it.
-3. Else if there is a first parameter named self, the result borrows from it.
-4. Else E0420: ambiguous borrow source; annotate with @from.
-A returned borrow stays live as long as its holder and must not outlive the owner of the borrowed place. A routine can never give a borrow of a local variable or own parameter (E0421).
-routine first_word(s: text) gives text        // rule 2: borrows from s
-    ...
-
-@from(a, b)
-routine pick(a: view<int>, b: view<int>) gives view<int>
-    ...
-4.6 Views, spans, slicing
-• x[a..b] has type view<T> in a shared context and span<T> in an exclusive context (an assignment target, a var argument, or a binding annotated span). Bounds are checked against x.count; failure traps (7.1) unless the compiler proves the range valid.
-• Creating a span from x requires an exclusive borrow of x (4.4 rule 1). A span is move-only, so it cannot be copied into two exclusive paths.
-• A buffer<T> operation that may reallocate (push, reserve, insert, clear, …) takes var buffer and therefore cannot be called while any view or span into that buffer is live (E0411). This eliminates iterator invalidation.
-4.7 Cleanup: disposable, defer, scope exit
-capability disposable<T>
-    routine dispose(var self: T)
-• A routine named dispose whose first parameter is var self: T and that gives void makes T disposable. dispose cannot fail.
-• Scope-exit actions run in reverse order of registration. Registration points are the initialization of a disposable local (schedules dispose) and each executed defer statement. Drop flags guard conditionally initialized or moved places.
-• For a record, dispose(self) runs first, then the fields are disposed in declaration order. For arrays and buffer, elements are disposed in index order, then storage is released.
-• Scope exit means any of: falling off the end of the block, give, fail, break, continue, or a propagating try. Cleanup runs after the returned value has been computed and moved into the return slot.
-• A trap (7.1) does not run cleanup.
-defer takes a single expression (defer close(h)) or an indented block. A deferred block may not use give, break, continue or try to leave itself. A deferred action sees variables as they are at scope exit, so a variable it uses must not have been moved away (E0431).
-4.8 Raw authority
-raw<T> is a machine pointer without ownership, borrow, bounds or lifetime. Its operations are unsafe except: copy, comparison, raw_null<T>(), is_null, and conversion to size.
-An unsafe block or an unsafe(expr) expression permits: dereference *p, indexed offset p[i], std.mem.read/write/copy/set, casts between raw<T> and raw<U>, taking &place as raw, calling foreign routines and with unsafe routines, reading and writing var static items, and std.mem.view_from_raw/span_from_raw.
-The unsafe contract. Within unsafe code the programmer guarantees: (a) validity: each read or write targets live storage of the correct size; (b) alignment: addresses satisfy the type's alignment (unless @packed); (c) initialization: reads see initialized bytes; (d) aliasing: a view/span created from raw authority obeys 4.4 for its lifetime; (e) provenance: a pointer is used only within the allocation it was derived from; (f) thread safety: no data races on non-atomic memory. A violation is erroneous execution: guarantees of this specification are lifted from that point. The compiler may assume the contract holds. All other Paracine behavior is fully defined; safe code has no undefined behavior.
-Safe encapsulation. A routine that contains unsafe blocks but whose signature has no with unsafe effect asserts that its callers cannot violate the contract through it. The compiler does not verify this claim. The standard library uses this to build buffer, string and atomics.
-4.9 Ownership and concurrency
-Two structurally derived capabilities govern threads:
-• sendable: a value of T may be moved to another thread. Copyable types are sendable except raw<T>, which is not unless the containing type carries @assert_sendable (an unsafe assertion). view<T> is sendable iff T is shareable; span<T> iff T is sendable. Records and variants are sendable iff all components are.
-• shareable: a shared borrow of T may be used by several threads at once. Primitives, atomic<T>, and immutable aggregates of shareable types are shareable; view<T> over shareable T is shareable; buffer<T> is shareable iff T is. Safe code has no non-atomic interior mutability, so no further rule is needed.
-A routine passed to std.thread.spawn is a routine pointer (no captures) and its arguments must be sendable. Borrows may cross threads only through std.thread.scope (7.9), whose structured join point guarantees every borrow is dead before the scope returns.
-4.10 Worked example
-record Packet
-    id: uint
-    body: buffer<ubyte>
-
-routine parse(input: view<ubyte>) gives result<Packet, parse_error>
-    if input.count < 4
-        fail parse_error.truncated
-    var body = std.mem.buffer_with_capacity<ubyte>(input.count - 4)
-    try body.push_all(input[4..input.count])
-    let id = read_u32_le(input[0..4])
-    give Packet { id: id, body: move body }
-
-routine consume(own p: Packet) gives uint
-    defer log_line("consumed")
-    give p.id          // p.body is disposed at scope exit
-body is moved into the Packet, so no drop runs for it in parse. p is owned by consume and disposed after the return value p.id has been copied out. If push_all fails, try returns the error and body is disposed by scope exit.
-Part 5. Formal semantics
-5.1 Judgment forms
-Let Γ be a typing environment mapping names to a type, a mode (let | var | own | borrow) and an initialization state. Let Σ be the table of routine signatures, record and variant definitions, and capability definitions. Let ρ be the routine result context (R) of the enclosing routine's declared gives type.
-Σ; Γ ⊢ e : T            expression e has type T
-Σ; Γ ⊢ s ⇝ Γ'          statement s is well-typed and yields environment Γ'
-Σ; Γ ⊢ p : T ⇝ Δ        pattern p matches type T, binding Δ
-Γ ⊢ place(e) : T, m     e is a place of type T accessible with mode m
-⊢ T copyable | T movable | T sendable | T shareable
-Rules are written premises / conclusion. "Fresh" and "live" regions are those of 4.1 and 4.4 and are checked by the borrow analysis, a separate pass over PCIR-before-optimization whose output is part of well-typedness.
-5.2 Typing rules (expressions)
-(T-Lit-Int)     literal n fits type T, T integer
-                --------------------------------
-                Γ ⊢ n : T
-
-(T-Var)         Γ(x) = (T, _, init)
-                --------------------------------
-                Γ ⊢ x : T
-
-(T-Arith)       Γ ⊢ a : T    Γ ⊢ b : T    T numeric    op ∈ {+,-,*,/,%}
-                -------------------------------------------------------
-                Γ ⊢ a op b : T
-
-(T-Bits)        Γ ⊢ a : T    Γ ⊢ b : T    T integer    op ∈ {&,|,^}
-                --------------------------------------------------------
-                Γ ⊢ a op b : T
-
-(T-Shift)       Γ ⊢ a : T    Γ ⊢ n : uint    T integer
-                --------------------------------------
-                Γ ⊢ a << n : T          (same for >>)
-
-(T-Cmp)         Γ ⊢ a : T    Γ ⊢ b : T    T is equatable (==, !=) or ordered (<, <=, >, >=)
-                ----------------------------------------------------------------------------
-                Γ ⊢ a cmp b : bool
-
-(T-Logic)       Γ ⊢ a : bool    Γ ⊢ b : bool
-                ------------------------------
-                Γ ⊢ a and b : bool          (likewise or; and Γ ⊢ not a : bool)
-
-(T-Cast)        cast (T → U) is in table 3.3
-                Γ ⊢ e : T
-                --------------------------------
-                Γ ⊢ e as U : U
-
-(T-Call)        Σ(f) = routine<α⃗>(m₁ x₁:T₁, …, mₙ xₙ:Tₙ) gives R where C
-                θ = unify(α⃗, args)    θ(α⃗) satisfy C
-                for each i: Γ ⊢ aᵢ : θ(Tᵢ) under mode mᵢ (4.3)
-                -------------------------------------------------------
-                Γ ⊢ f(a⃗) : θ(R)
-
-(T-Field)       Γ ⊢ e : S    S is record with field f : T    f visible (6.3)
-                -------------------------------------------------
-                Γ ⊢ e.f : T
-
-(T-Index)       Γ ⊢ e : X    X ∈ {array<T,N>, view<T>, span<T>, buffer<T>}    Γ ⊢ i : size
-                ----------------------------------------------------------------
-                Γ ⊢ e[i] : T
-
-(T-Slice)       as T-Index with i = a..b, a : size, b : size   ⇒   view<T> or span<T> by 4.6
-
-(T-Record)      S is record {f₁:T₁ … fₙ:Tₙ}    each fᵢ given exactly once or defaulted
-                Γ ⊢ eᵢ : Tᵢ
-                ---------------------------------------------------
-                Γ ⊢ S { fᵢ: eᵢ } : S
-
-(T-If-Expr)     Γ ⊢ c : bool    Γ ⊢ a : T    Γ ⊢ b : T
-                ------------------------------------------
-                Γ ⊢ if c then a else b : T
-
-(T-Choose)      Γ ⊢ s : S    for each arm (pᵢ [if gᵢ] then eᵢ):
-                Γ ⊢ pᵢ : S ⇝ Δᵢ,   Γ,Δᵢ ⊢ gᵢ : bool,   Γ,Δᵢ ⊢ eᵢ : T
-                arms are exhaustive (5.7)
-                ---------------------------------------------------
-                Γ ⊢ choose s { arms } : T
-
-(T-Pipe)        Γ ⊢ f(a, b⃗) : T          (a -> f(b⃗) is syntactic sugar, resolved before typing)
-
-(T-Try-Result)  Γ ⊢ e : result<T,E>    ρ = result<U,F>    conv(E → F)
-                -------------------------------------------------
-                Γ ⊢ try e : T          (effect: may exit with err(conv(e.err)))
-
-(T-Try-Option)  Γ ⊢ e : option<T>    ρ = option<U>
-                ----------------------------------
-                Γ ⊢ try e : T
-conv(E → F) holds iff E = F, or a routine from_error(e: E) gives F is visible at the try. try is a type error in a routine whose declared gives is neither result nor option (E0501).
-5.3 Typing rules (statements)
-(S-Let)         Γ ⊢ e : T    Γ ⊢ p : T ⇝ Δ    p irrefutable
-                --------------------------------------------
-                Γ ⊢ let p = e ⇝ Γ, Δ (all immutable)
-
-(S-Var)         Γ ⊢ e : T    x ∉ dom(Γ) in current scope
-                -------------------------------------
-                Γ ⊢ var x = e ⇝ Γ, x : (T, var, init)
-
-(S-Assign)      Γ ⊢ place(p) : T, var    Γ ⊢ e : T
-                ----------------------------------
-                Γ ⊢ p = e ⇝ Γ              (old value of p is disposed first, if disposable)
-
-(S-Give)        ρ = R    Γ ⊢ e : R'    wrap(R', R) holds   (5.5)
-                -------------------------------------------
-                Γ ⊢ give e ⇝ Γ⊥                (Γ⊥ = unreachable continuation)
-
-(S-Fail)        ρ = result<T,E>    Γ ⊢ e : E'    conv(E' → E)
-                ---------------------------------------------
-                Γ ⊢ fail e ⇝ Γ⊥
-
-(S-If)          Γ ⊢ c : bool    Γ ⊢ block₁ ⇝ Γ₁    Γ ⊢ block₂ ⇝ Γ₂
-                -----------------------------------------------
-                Γ ⊢ if c block₁ else block₂ ⇝ merge(Γ₁, Γ₂)
-
-(S-While)       Γ ⊢ c : bool    Γ ⊢ block ⇝ Γ'
-                -------------------------------
-                Γ ⊢ while c block ⇝ merge(Γ, Γ')
-
-(S-For)         Γ ⊢ e : X    X is iterable with item I (7.5)    Γ ⊢ p : I ⇝ Δ    Γ,Δ ⊢ block ⇝ Γ'
-                ---------------------------------------------------------------------------
-                Γ ⊢ for p in e block ⇝ merge(Γ, Γ')
-
-(S-Defer)       Γ ⊢ e : void (or any, discarded)
-                ---------------------------
-                Γ ⊢ defer e ⇝ Γ  and registers e on the scope-exit list
-
-(S-Unsafe)      Γ ⊢ block under unsafe ⇝ Γ'
-                -------------------------------
-                Γ ⊢ unsafe block ⇝ Γ'
-merge(Γ₁, Γ₂) takes, for each place, the less initialized state; a place moved in either branch is "maybe moved" and gets a drop flag (4.2). A routine body is well-typed only if every path ends in give, fail, a call of type never, or the routine gives void and falls off the end (implicit give). Falling off the end of a non-void routine is E0510.
-5.4 Operational semantics
-Machine state. A configuration is ⟨ σ, μ, κ, t ⟩ where σ is the store of locals (a map from variable-instance names to addresses), μ is the memory (a partial map from addresses to bytes, partitioned into stack, static, heap regions, each allocation having a unique id for provenance), κ is the continuation (a stack of frames and pending scope-exit actions) and t is the term being reduced (an expression or statement). Reduction is ⟨σ,μ,κ,t⟩ → ⟨σ',μ',κ',t'⟩ or terminates in one of done(v), trap(c) (with trap code c) or exit(n).
-Evaluation order. Evaluation is fully specified: operands and call arguments are evaluated strictly left to right; a place expression is evaluated to an address before the right-hand side of an assignment; a and b and a or b evaluate b only if needed; a choose evaluates the scrutinee once, then arms top to bottom, evaluating the guard only if the pattern matches. A pipeline a -> f(b) evaluates a before b.
-Representative rules (small-step, abbreviated notation e → e' under evaluation context E):
-(E-Ctx)      e → e'                    (E-Add)     n₁ + n₂  →  wrap_w(n₁ + n₂)
-             ---------------
-             E[e] → E[e']
-
-(E-Div)      n₂ ≠ 0           n₁ / n₂  →  wrap_w(trunc(n₁ ÷ n₂))
-             n₂ = 0           n₁ / n₂  →  trap(DivideByZero)
-
-(E-If)       if true  then a else b → a        if false then a else b → b
-
-(E-Let)      ⟨σ,μ,κ, let x = v; s⟩ → ⟨σ[x↦a], μ[a↦v], κ, s⟩     a fresh stack address
-
-(E-Call)     push frame(f, return address, scope-exit list = []),
-             bind each parameter per its mode:
-               shared / var: parameter = address of the argument place (or of a temporary)
-               own:          parameter = moved value (source place becomes uninitialized)
-
-(E-Give)     run scope-exit list of every enclosing scope of the frame in LIFO order,
-             then pop frame and deliver v (wrapped per 5.5)
-
-(E-Try-Ok)   try ok(v) → v
-(E-Try-Err)  try err(e) → fail conv(e)      (so scope-exit actions run, then the routine returns err)
-(E-Try-Some) try some(v) → v          (E-Try-None) try none → give none
-
-(E-Index)    0 ≤ i < count     a[i] → load(base(a) + i·sizeof(T))
-             otherwise          a[i] → trap(Bounds)
-The moves described by rule E-Call and E-Let are the point at which "source becomes uninitialized" (4.2) is realized; a conforming implementation may elide the physical copy but not the logical effect.
-5.5 Result and option wrapping
-In a routine whose declared type is result<T,E>:
-• give e with e : T produces ok(e); with e : result<T,E> it returns e unchanged. If both interpretations apply (when T = result<T,E>, impossible by finiteness) the program is ill-formed.
-• fail e with e : E (after conversion) produces err(e).
-• falling off the end is allowed only if T = void, and produces ok(()).
-In a routine whose declared type is option<T>: give e with e : T produces some(e); give none produces none; give of an option<T> value returns it unchanged.
-The predicate wrap(R', R) of S-Give holds iff R' = R, or R = result<R',E>, or R = option<R'>.
-5.6 Arithmetic, floating point and conversions
-For an integer type of width w and signedness s, write wrap_w(n) = ((n mod 2^w) interpreted as s).
-• + - * are modular: a op b = wrap_w(a op b) evaluated over the mathematical integers. This is the "defined two's-complement result" the Paracine overview requires; the signed and unsigned operations are bit-identical.
-• Unary - on T: wrap_w(0 - a); ~a is bitwise complement.
-• / truncates toward zero; a % b has the sign of a with a == (a / b) * b + a % b. b == 0 traps DivideByZero. For signed T, MIN / -1 = MIN and MIN % -1 = 0 (both defined, no trap).
-• << and >> use the shift count modulo w (n & (w-1)). >> is arithmetic for signed and logical for unsigned types.
-• Comparisons on integers are exact; on bool, false < true; on char, by scalar value.
-• float/double follow IEEE 754-2019 with round-to-nearest-even, no flush-to-zero, no contraction (a*b+c is never fused unless written with std.num.fused_mul_add) and no reassociation unless the routine or module carries @fastmath, in which case the compiler may assume no NaN/Inf and may reassociate. == on floats is IEEE equality (NaN != NaN). The ordered capability for floats uses the total order of std.num.total_cmp; the operator < uses IEEE comparison.
-• Conversions follow table 3.3.
-Compile-time evaluation of these operators must produce identical results to run-time evaluation (this is required for constant folding to be semantics-preserving).
-5.7 Pattern matching and exhaustiveness
-choose arms are tried top-to-bottom. Exhaustiveness is decided by the standard usefulness algorithm on the pattern matrix:
-1. Let P be the matrix of arm patterns for arms without guards (guarded arms are ignored for exhaustiveness, because a guard may be false).
-2. A wildcard row (_ ) is useful with respect to P if some value of the scrutinee type is matched by it but by no row of P.
-3. The choose is exhaustive iff the wildcard is not useful.
-4. Constructors: for a variant, one per case; for bool, true and false; for tuples/records, a single constructor; for option and result, their two cases; for integers and char, ranges (exhaustive only if the ranges cover the whole type; otherwise an else arm is required).
-5. An arm that is not useful (already covered by earlier arms) is W0520: unreachable arm and is not an error.
-A non-exhaustive expression-form choose is E0521; a non-exhaustive statement-form choose over a variant, option, result, or bool is also E0521; over integers, text or char without else, E0522.
-5.8 Constant evaluation
-const initializers, array lengths, const generic arguments, @align and similar contexts use const expressions: any expression using only literals, const items, calls of routines marked with pure that do not use unsafe, foreign, alloc, io, thread, or trap effects reachable from the call, and pure standard-library routines. Const evaluation is deterministic and obeys 5.6 exactly. A trap during const evaluation is a compile-time error E0530. A step limit (default 10⁷ reductions, overridable by @const_steps(n)) bounds the evaluation; exceeding it is E0531.
-5.9 Memory model
-• Safe code has no data races, by 4.9 and 4.4. Therefore a safe program is sequentially consistent per thread with respect to non-atomic memory, and the only cross-thread communication is through atomics, joins, channels and the other std.thread primitives.
-• Atomic operations carry an ordering from relaxed, acquire, release, acq_rel, seq_cst; the default for all std.atomic operations is seq_cst. The synchronizes-with, happens-before and coherence relations are those of the C++20 memory model; the Paracine backend is required to implement exactly that model, which is what makes the C++20 output backend's translation of atomics faithful.
-• Thread creation and join are release/acquire edges. Mutex unlock/lock pairs, channel send/receive pairs and std.thread.scope exit are likewise.
-• A data race on non-atomic memory (possible only via unsafe code) is erroneous execution (4.8).
-5.10 Traps
-A trap is a defined, deterministic abnormal termination. Trap codes: Bounds, DivideByZero, Overflow (only from explicit checked operations that choose to trap), Unreachable (std.core.unreachable()), Assertion, OutOfMemory (from infallible allocation), StackExhausted, InvalidEnum (reserved for foreign data). On a trap the runtime calls the trap handler (default: write a one-line diagnostic with the code and source location to the error stream, then terminate the process with exit code 0xC0000409 on Windows or abort-equivalent elsewhere). Handlers are replaceable (std.core.set_trap_handler) but must not return. Traps do not run defer/dispose actions: they are not exceptions.
-Precise traps. If an operation traps, all observable effects that precede it in the evaluation order have happened and none that follow it have. The optimizer may reorder or eliminate non-trapping pure operations, and may eliminate a trap only if it proves the trap condition false. It may not move an observable effect across a possible trap.
-5.11 Observable behavior and backend equivalence
-The observable behavior of a program is the sequence of: (a) calls to foreign routines and std.io/std.sys operations with their arguments, (b) reads and writes of volatile locations and std.mem.volatile_* operations, (c) atomic operations with their orderings, (d) the exit code or the trap code with its location, and (e) the final contents of any memory passed to or reachable from foreign code at each foreign call. A conforming implementation (any backend) must produce a program whose observable behavior is one of those permitted by 5.4 to 5.10 (the as-if rule). Differences allowed by the overview's phrase "explicitly documented target-platform properties" are limited to: pointer width, size range, endianness (little on Tier-1), the text of trap diagnostics, thread scheduling, and the values of std.mem.address_of results.
-Consequences for backends:
-• The C++20 backend must emit explicit sequencing wherever C++ leaves evaluation order unspecified (function arguments, operands), and must use unsigned arithmetic and explicit conversion helpers for 5.6.
-• Both backends must implement shift masking, saturating float-to-int casts, and MIN / -1 as defined here, even where the hardware or C++ would differ.
-• Floating-point contraction must be disabled in emitted C++ (#pragma STDC FP_CONTRACT OFF plus per-compiler flags documented in the emitted header) and in the native backend, unless @fastmath.
-5.12 Soundness statement
-Theorem (progress and preservation, safe subset). If ⊢ P : ok (the program type-checks and passes the borrow/init analysis) and contains no unsafe code outside the standard library, then for every reachable configuration, either the term is a value, or it can reduce, or it has trapped with a trap code from 5.10, or it has exited. Moreover, every reduction preserves typing, uniqueness of owners, and the aliasing rule 4.4; no reachable configuration has a read of uninitialized or moved memory, an out-of-bounds access, a double dispose, or a data race.
-Proof obligations (for a mechanized definition): (1) a substitution lemma for generic instantiation; (2) preservation of the initialization lattice under merge; (3) a borrow-region invariant: for every live borrow, its owner place is initialized and not mutated except through that borrow; (4) cleanup soundness: along every path each owned value is disposed at most once and exactly once if reachable at scope exit. These are stated here as the verification targets for the reference compiler's test suite and any formalization effort; this document does not contain the machine-checked proof.
-Part 6. The module system
-6.1 Units of organization
-Unit
-Definition
-File
-One .pcn source file. Exactly one module.
-Module
-A named namespace of items (routines, types, constants, capabilities, nested imports). Its name is declared by module a.b.c and must equal the file's path relative to the package source root: src/a/b/c.pcn.
-Package
-A tree of modules with a manifest paracine.toml. The unit of versioning, dependency, distribution and linking.
-Workspace
-A set of packages built together with one lockfile.
-A module a.b may have child modules a.b.c (file src/a/b/c.pcn). A child is an ordinary module; being nested grants it no special access to its parent's private items. [Decision] The module graph is a flat namespace tree for naming only; access is governed by 6.3, never by nesting.
-6.2 Name resolution
-Inside a module, an identifier is resolved by searching these scopes from innermost to outermost; the first scope that contains the name wins, and an ambiguity within one scope is E0602:
-1. local variables and parameters (innermost block first);
-2. generic parameters of the enclosing routine or type;
-3. items declared in the current module (item order is irrelevant: any item may be used before its declaration, in any module);
-4. names introduced by import ... .{ ... } or import ... as ...;
-5. the prelude: the names exported by std.prelude (7.2), implicitly imported into every module;
-6. otherwise E0603: unresolved name.
-A qualified name m.x resolves m first as a module alias or an imported module path, then x within it. A local variable may shadow an item or an import; two items in the same module with the same name are E0604 (routines may be overloaded by arity or distinct parameter types, but not by return type, and overload resolution is exact-match on the argument types after literal fitting and auto-borrow, with no ranking: zero matches is E0610, more than one is E0611).
-6.3 Visibility
-Every item has one of three visibilities:
-Spelling
-Visible to
-Appears in generated .hpp/.h, DLL export table
-(none)
-the declaring module only
-no
-public
-every module in the same package
-no
-export
-every module in the package and every dependent package
-yes
-export implies public. An export item may mention only export types in its signature (E0620); a public item may mention only public or export types. Record fields have their own modifier: a field without public is private to the declaring module. A record with any private field can be constructed with T { … } only inside its own module; elsewhere it must be built through that module's routines. A record whose fields are all public is transparent. Variants are always transparent to every module that can see them (pattern matching requires the cases to be visible). To hide a variant's structure, wrap it in a one-field record with a private field.
-@opaque on an exported record makes its size and layout unavailable to dependents: dependents may hold it only by raw<T>/view<T>/span<T> or through routines of its module. This is the stable-ABI mechanism for DLL boundaries.
-6.4 Imports and re-exports
-import std.text                       // use as text.join(...)
-import std.text as t                  // use as t.join(...)
-import std.collections.{map, set}     // use as map<...>, set<...>
-import std.collections.{map as dict}
-import std.num.*                      // glob; permitted only if the module is marked @glob_ok
-public import std.math                // re-export to package
-export import vendor.widgets.core     // re-export to dependents
-Grammar amendment (replaces the import_decl rule of 2.1):
-import_decl = [ visibility ] 'import' module_path [ 'as' identifier ]
-            | [ visibility ] 'import' module_path '.' '{' import_list '}'
-            | [ visibility ] 'import' module_path '.' '*' ;
-Imports are not transitive: importing a does not make a's own imports visible, except for names a re-exports. An import of a module that does not exist is E0605; importing an item that is not visible is E0606. Unused imports are W0607.
-Acyclicity. The graph of import edges between modules must be a DAG (E0608: import cycle, with the cycle printed). Mutually recursive items must live in the same module. This rule makes each module's interface (6.6) computable in dependency order and enables parallel, incremental compilation.
-6.5 Packages and the manifest
-[package]
-name     = "acme.net"            # globally unique, dotted
-version  = "1.4.2"               # semantic version
-edition  = "2026"                # language edition (6.9)
-kind     = "lib"                 # app | lib | dll | static
-root     = "src"
-
-[dependencies]
-"acme.bytes" = "^2.1"
-"vendor.zlib" = { version = "1.3", kind = "static", path = "../zlib" }
-
-[features]
-default = ["tls"]
-tls     = ["acme.crypto"]
-
-[target.windows-x86_64]
-linker_inputs = ["ws2_32.lib"]
-
-[profile.release]
-opt   = 3
-trap  = "abort"
-emit  = ["obj", "exe"]
-
-[profile.portable]
-emit  = ["cpp"]
-• Dependency resolution follows semantic versioning; the resolver picks the highest version satisfying all constraints and writes the full graph with content hashes to paracine.lock. Builds use the lockfile when present (this supplies the "library versions" field the overview requires for reproducible builds, 50).
-• Features are additive; enabling a feature enables the @feature("name")-guarded items and the optional dependencies it names. Features never change the meaning of an item that exists without them.
-• Kinds. app produces an executable (.exe) and has an entry point (6.7); lib produces .obj modules plus an interface bundle for Paracine clients; static additionally archives them as .lib; dll produces a PE image with an export table from export items and @export_name. Any kind may also emit cpp (with .hpp).
-• Build scripts do not exist. [Decision] Code generation happens through ordinary Paracine programs invoked by the build tool as explicit pipeline steps ([[step]] tables), never through arbitrary code in the compiler.
-6.6 Compilation units, interfaces and generics
-A module compiles to one object unit and one interface unit (.pci, a canonical binary or text file). The interface contains: all public and export declarations with their resolved types; the bodies of every generic item and of every routine marked @inline; capability definitions; constants; layout facts for non-@opaque records; and a hash of all of the above.
-• A dependent is recompiled only if the interface hash of something it imports changes (early cut-off).
-• Generic instantiation happens in the using unit (the generic body comes from the interface). The instance is emitted with COMDAT / linkonce semantics under a mangled name that includes the type arguments, so identical instances from different units fold at link time. This also guarantees that the textual (.cpp) backend, where each unit is a translation unit, can emit each instance as an inline function in a pcn_ namespace without ODR violations.
-• Whole-program optimization (--lto) merges PCIR of all modules in the package and its dependencies before optimization and may inline, specialize and remove dead public items. Exported items are always preserved.
-6.7 Symbols, linking, entry point
-Name mangling (for .obj and .exe): pcn$<package>$<module>$<item>[$<instance-hash>], with the signature hash included for overloaded routines. Packages and modules use . → $ replacement. @export_name("SomeName") on an export routine replaces the mangled name with a C-style unmangled one (required for foreign interop and DLL exports). Generated .hpp headers declare mangled routines inside namespace pcn and @export_name routines inside extern "C".
-Foreign declarations. foreign c routine puts(s: raw<ubyte>) gives int declares a routine with the Microsoft x64 C calling convention (c = the platform's C ABI; msx64 forces Microsoft x64 on any host). An optional from "kernel32.dll" clause records the import library/DLL for the PE import table. Calling a foreign routine requires unsafe; a safe wrapper is usually provided by the declaring module. Argument and result types must be C-compatible: integers, float, double, bool (as 8-bit), raw<T>, @layout(c) records of C-compatible fields, routine pointers.
-Entry point. An app package's root module main defines exactly one routine named main, with any of these signatures:
-routine main() gives int
-routine main() gives void
-routine main(args: view<text>) gives int
-routine main() gives result<void, E>      where E is printable
-int is the process exit code. void exits 0. result<void,E>: ok exits 0, err(e) prints e to the error stream and exits with 1. The runtime start-up sequence is: (1) initialize the standard streams and the argument view, (2) install the default trap handler, (3) call main, (4) flush standard streams, (5) exit. There is no dynamic initialization before main: var static initializers and constants are compile-time (5.8) and live in .data/.rdata.
-Linking inputs (7 of the overview, 57): Paracine .obj, compatible COFF .obj, static .lib, import .lib, and DLL imports. Symbol conflicts between a Paracine definition and a foreign one with the same final name are E0630 at link time. Unused sections are removed (--gc-sections default in release).
-6.8 Standard library as a package
-std is an implicit dependency of every package, versioned with the compiler (6.9), provided in four realizations (Paracine source, C++20 source, COFF objects, intrinsics), per the overview, 58. The same source defines all realizations; the build selects the realization appropriate to the output form. A package may opt out with no_std = true in the manifest, in which case only the core subset (7.2) and the types of 3.2 are available and nothing in the library may allocate or perform I/O (freestanding / kernel / embedded use).
-6.9 Editions, stability, deprecation
-• An edition ("2026") fixes the keywords, grammar and prelude. A package states its edition; the compiler can compile packages of different editions together because editions affect only front-end interpretation, and PCIR is edition-free.
-• std follows semantic versioning tied to the compiler release; items are marked @stable("1.0"), @unstable("feature"), or @deprecated("1.3", "use x instead"). An unstable item is usable only when the package enables the feature in its manifest.
-• A breaking change to the language requires a new edition. New library items and diagnostics may be added in minor releases.
-6.10 Tests and documentation
-test "name" blocks are removed from every build except pcn test. A test block can see its own module's private items. A test passes if it returns normally and fails if it traps or assert fails. /// doc comments attach to the following item; pcn doc generates a documentation site; code blocks in doc comments marked example are compiled and run by pcn test as doctests.
-6.11 Diagnostics summary for Part 6
-Code
-Meaning
-E0601
-module path does not match file location
-E0602
-ambiguous name
-E0603
-unresolved name
-E0604
-duplicate item
-E0605 / E0606
-missing module / invisible item
-E0608
-import cycle
-E0610 / E0611
-no matching / ambiguous overload
-E0620
-exported signature mentions non-exported type
-E0630
-duplicate symbol at link time
-Part 7. The standard library
-7.1 Organization and tiers
-The library is one package, std, in three tiers selected by manifest flags (6.8):
-Tier
-Modules
-Needs allocator
-Needs OS
-core
-std.core, std.prelude, std.mem (non-allocating part), std.num, std.math, std.slice, std.iter, std.atomic, std.hash, std.fmt (formatting to a caller-provided span), std.simd, std.text (text/char operations)
-no
-no
-alloc
-std.mem (allocators, arenas), std.buffer, std.text.string, std.collections, std.sort (stable)
-yes
-no
-std
-std.io, std.fs, std.path, std.env, std.time, std.thread, std.sync, std.process, std.random (OS entropy), std.win (Win32 bindings), std.test
-yes
-yes
-Conventions used throughout this part. Signatures are written in Paracine. self is the first parameter of an operation on a type and is written with its mode: self: view<T> is read-only, var self: T exclusive, own self: T consuming. A routine called with dot syntax x.f(a) is sugar for f(x, a) when f is declared in the module that defines the type of x or imported with it; there are no methods and no impl blocks. Growing operations are fallible and give result<void, alloc_error>; constructors that allocate eagerly (buffer_with_capacity, string_from) trap with OutOfMemory on failure and each has a try_ counterpart that gives a result. A single-element borrow is view<T> / span<T> with count == 1 and is aliased as ref<T> / mut<T> (read with r[0]).
-7.2 std.core and the prelude
-Prelude (implicitly imported). Types: all primitives, option, result, view, span, buffer, array, raw, atomic, string, ordering, alloc_error. Routines: print, println, eprint, eprintln, format, assert, assert_eq, unreachable, min, max, swap. Capabilities: equatable, ordered, hashable, defaultable, disposable, printable, copyable, sendable, shareable, iterator.
-Core capabilities.
-capability equatable<T>
-    routine equals(a: T, b: T) gives bool
-
-variant ordering
-    less
-    equal
-    greater
-
-capability ordered<T>
-    routine compare(a: T, b: T) gives ordering      // requires equatable<T> consistently
-
-capability hashable<T>
-    routine hash(v: T, var h: hasher)
-
-capability defaultable<T>
-    routine default() gives T
-
-capability printable<T>
-    routine format(v: T, var out: formatter) gives result<void, fmt_error>
-
-capability numeric<T>      // satisfied by all integer and floating primitives
-capability integer<T>      // integer primitives
-capability floating<T>     // float, double
-== and != on a type T call equals (and are built in for primitives, text, bool, char, and for tuples/records/variants whose components are equatable and which carry @derive(equatable)). Likewise < etc. call compare and @derive(ordered) compares fields lexicographically in declaration order (variant: by case index, then payload). @derive(hashable, printable, defaultable) are also available. There is no automatic derivation without the attribute, so equality is never silently structural.
-option<T> operations (module std.core):
-routine is_some(self: option<T>) gives bool
-routine is_none(self: option<T>) gives bool
-routine unwrap(own self: option<T>) gives T                    // traps Assertion on none
-routine expect(own self: option<T>, why: text) gives T         // traps with message
-routine unwrap_or(own self: option<T>, own fallback: T) gives T
-routine map<T, U>(own self: option<T>, f: routine(T) gives U) gives option<U>
-routine and_then<T, U>(own self: option<T>, f: routine(T) gives option<U>) gives option<U>
-routine ok_or<T, E>(own self: option<T>, own e: E) gives result<T, E>
-routine take(var self: option<T>) gives option<T>              // leaves none behind
-routine as_ref(self: option<T>) gives option<ref<T>>
-result<T,E> operations: is_ok, is_err, unwrap (traps if err), unwrap_err, unwrap_or, map, map_err, and_then, ok(own self) gives option<T>, err(own self) gives option<E>.
-Traps and assertions (module std.core):
-routine trap(code: trap_code)                gives never
-routine assert(cond: bool, why: text = "")   // traps Assertion if false; kept in all profiles
-routine debug_assert(cond: bool, why: text = "")  // removed when profile has debug = false
-routine unreachable()                        gives never
-routine set_trap_handler(h: routine(trap_code, text) gives never)
-Errors. Standard error types are small variants that satisfy printable: alloc_error, parse_error, fmt_error, io_error, bounds_error. io_error carries a stable kind (not_found, permission_denied, already_exists, interrupted, would_block, invalid_input, unexpected_eof, other) and an OS code (ulong).
-7.3 std.mem, std.buffer, std.slice
-Core memory routines.
-routine size_of<T>() gives size                      // compile-time
-routine align_of<T>() gives size
-routine offset_of<T>(field: text) gives size
-routine swap(var a: T, var b: T)                     // exchange two places
-routine replace(var dest: T, own value: T) gives T   // returns the old value
-routine take(var dest: T) gives T where T is defaultable
-routine forget(own v: T)                             // no dispose runs; safe but leaks
-routine read<T>(p: raw<T>) gives T                   with unsafe
-routine write<T>(p: raw<T>, own v: T)                with unsafe
-routine copy_bytes(dst: raw<ubyte>, src: raw<ubyte>, n: size)    with unsafe
-routine set_bytes(dst: raw<ubyte>, value: ubyte, n: size)        with unsafe
-routine view_from_raw<T>(p: raw<T>, n: size) gives view<T>       with unsafe
-routine span_from_raw<T>(p: raw<T>, n: size) gives span<T>       with unsafe
-routine volatile_read<T>(p: raw<T>) gives T                      with unsafe
-routine volatile_write<T>(p: raw<T>, own v: T)                   with unsafe
-Allocation. There is one replaceable global allocator; the default maps to HeapAlloc/HeapFree on Windows. The allocator capability is allocate(var a: A, size: size, align: size) gives raw<ubyte> (null on failure) and deallocate(var a: A, p: raw<ubyte>, size: size, align: size). Provided allocators: global_allocator, arena (bump allocation; reset(var a) frees everything; disposing the arena releases its blocks), pool<T> (fixed-size slots), stack_allocator<N> (inline storage). Containers take an optional allocator type parameter defaulting to global_allocator (e.g. buffer<T> is buffer_in<T, global_allocator>).
-buffer<T> (owning, contiguous, T any type; elements are disposed on removal):
-routine buffer_new<T>() gives buffer<T>                           // no allocation
-routine buffer_with_capacity<T>(n: size) gives buffer<T>          // traps on OOM
-routine try_buffer_with_capacity<T>(n: size) gives result<buffer<T>, alloc_error>
-routine buffer_from<T>(items: view<T>) gives buffer<T>  where T is copyable
-routine count(self: buffer<T>) gives size
-routine capacity(self: buffer<T>) gives size
-routine is_empty(self: buffer<T>) gives bool
-routine as_view(self: buffer<T>) gives view<T>                    // @from(self)
-routine as_span(var self: buffer<T>) gives span<T>                // @from(self)
-routine push(var self: buffer<T>, own x: T) gives result<void, alloc_error>
-routine push_all(var self: buffer<T>, xs: view<T>) gives result<void, alloc_error>   where T is copyable
-routine pop(var self: buffer<T>) gives option<T>
-routine insert(var self: buffer<T>, at: size, own x: T) gives result<void, alloc_error>
-routine remove(var self: buffer<T>, at: size) gives T            // traps Bounds if out of range
-routine truncate(var self: buffer<T>, n: size)
-routine clear(var self: buffer<T>)
-routine reserve(var self: buffer<T>, extra: size) gives result<void, alloc_error>
-routine shrink_to_fit(var self: buffer<T>)
-Growth uses the factor 2 policy and is amortized O(1). buffer<T> indexes with b[i] (bounds-checked) and slices with b[a..b] as in 4.6.
-Slices (std.slice, operating on view<T>/span<T>):
-routine count(self: view<T>) gives size
-routine first(self: view<T>) gives option<ref<T>>     // @from(self)
-routine last(self: view<T>) gives option<ref<T>>
-routine split_at(self: view<T>, k: size) gives (view<T>, view<T>)
-routine split_at(var self: span<T>, k: size) gives (span<T>, span<T>)   // the disjoint-span primitive (4.4)
-routine chunks(self: view<T>, n: size) gives chunk_iter<T>
-routine windows(self: view<T>, n: size) gives window_iter<T>
-routine contains(self: view<T>, x: T) gives bool        where T is equatable
-routine find(self: view<T>, x: T) gives option<size>    where T is equatable
-routine copy_from(var dst: span<T>, src: view<T>)       // counts must match, else traps Bounds
-routine fill(var dst: span<T>, x: T)                    where T is copyable
-routine reverse(var s: span<T>)
-routine swap_at(var s: span<T>, i: size, j: size)
-routine binary_search(self: view<T>, x: T) gives result<size, size>   where T is ordered
-7.4 std.num and std.math
-For every integer type T (with T replaced accordingly):
-routine checked_add(a: T, b: T) gives option<T>      // also sub, mul, div, rem, neg, shl, shr, pow
-routine wrapping_add(a: T, b: T) gives T             // identical to the + operator; provided for clarity
-routine saturating_add(a: T, b: T) gives T           // also sub, mul
-routine overflowing_add(a: T, b: T) gives (T, bool)  // wrapped result and overflow flag
-routine abs(a: T) gives T                            // signed: MIN stays MIN
-routine abs_diff(a: T, b: T) gives (unsigned counterpart of T)
-routine min(a: T, b: T) gives T                      // max, clamp(x, lo, hi)
-routine pow(a: T, e: uint) gives T                   // wrapping
-routine gcd(a: T, b: T) gives T
-routine count_ones(a: T) gives uint                  // also count_zeros, leading_zeros, trailing_zeros
-routine rotate_left(a: T, n: uint) gives T           // also rotate_right
-routine swap_bytes(a: T) gives T                     // also to_le/to_be/from_le/from_be
-routine is_power_of_two(a: T) gives bool             // unsigned only; next_power_of_two
-routine parse<T>(s: text, radix: uint = 10) gives result<T, parse_error>
-For float and double: sqrt floor ceil round trunc abs copysign is_nan is_inf is_finite min max clamp, fused_mul_add(a,b,c), total_cmp(a,b) gives ordering, to_bits/from_bits, and the constants PI, E, TAU, EPSILON, MAX, MIN_POSITIVE, INFINITY, NAN. std.math adds sin cos tan asin acos atan atan2 sinh cosh tanh exp exp2 log log2 log10 pow cbrt hypot, correctly rounded for sqrt and within 1 ulp for the others (the exact algorithms are part of the library version so that results are identical in every backend: the library supplies its own implementations rather than calling the host C library, to satisfy the equivalence requirement of 5.11).
-The +, -, * operators are the wrapping operations (5.6). Code that must detect overflow uses the checked_* family; there is no "overflow trap" mode that changes +, so program meaning never depends on a build profile.
-7.5 Iteration and pipelines (std.iter)
-capability iterator<I, T>
-    routine next(var it: I) gives option<T>
-For a capability with several parameters, the first parameter is the constrained subject and the rest are written in the constraint: where I is iterator<T> means I satisfies iterator<I, T>.
-The for statement. for p in e block is defined by desugaring:
-1. If e : view<T>, array<T,N> (by view), or buffer<T> (by view): iterate positions 0..count, binding p to a read-only borrow of the element (a copy for scalars).
-2. If e : span<T> and the loop is written for var x in e: binds x as an exclusive borrow of each element in turn. Exclusive borrows of different elements do not overlap since each is dead before the next begins.
-3. If e : range (from a..b or a..=b on any integer type): yields integers.
-4. If e : I where I is iterator<T>: var it = e; loop { choose next(var it) { when some(p) then block; when none then break } }.
-Because the loop holds a borrow on e for its entire duration, the aliasing rule 4.4 forbids growing or clearing a buffer while iterating it.
-Adapters. Every adapter is an ordinary generic routine that consumes an iterator and gives a new concrete iterator type. Parameters that would be closures are routine pointers (no captures); extra context is passed via an explicit state argument.
-routine iter(self: view<T>) gives view_iter<T>
-routine map<I, T, U>(own it: I, f: routine(T) gives U) gives map_iter<I, T, U>   where I is iterator<T>
-routine filter<I, T>(own it: I, f: routine(view<T>) gives bool) gives filter_iter<I, T>
-routine take(own it: I, n: size) gives take_iter<I>        // also skip, step_by, chain, zip, enumerate, rev (double-ended only), peekable
-routine fold<I, T, A>(own it: I, own init: A, f: routine(A, T) gives A) gives A
-routine sum(own it: I) gives T            where T is numeric
-routine count(own it: I) gives size
-routine any(own it: I, f: routine(T) gives bool) gives bool    // also all, find, position
-routine min_by_key / max_by_key(...)
-routine collect<I, T>(own it: I) gives result<buffer<T>, alloc_error>
-routine collect_into(own it: I, var out: buffer<T>) gives result<void, alloc_error>
-Pipelines. x -> f(a) means f(x, a) (2.6). Thus:
-let total = numbers
-    -> iter()
-    -> filter(is_even)
-    -> map(square)
-    -> sum()
-Fusion guarantee. Adapter chains over built-in sources are semantically a sequence of next calls, and every adapter is @inline. PCIR is required to fuse a chain whose adapters are all from std.iter and whose final consumer is sum, count, fold, any, all, find, collect_into or a for loop into a single loop with no intermediate storage; this is the "pipeline fusion" the overview refers to, and conformance tests check that the emitted code for such chains contains no allocation and no per-element call.
-7.6 Text, characters and formatting (std.text, std.fmt)
-Model. text is immutable valid UTF-8; string is the owning, growable counterpart (record string wrapping a buffer<ubyte> with the UTF-8 invariant, private field). Offsets are byte offsets and must fall on scalar boundaries, otherwise the operation traps Bounds. There is no implicit indexing by character.
-routine count_bytes(self: text) gives size            // `count` is reserved for slices; text has count_bytes / count_chars
-routine count_chars(self: text) gives size            // O(n)
-routine is_empty(self: text) gives bool
-routine slice(self: text, a: size, b: size) gives text    // @from(self); traps on non-boundary
-routine starts_with(self: text, p: text) gives bool       // also ends_with, contains
-routine find(self: text, p: text) gives option<size>      // byte offset; also rfind
-routine split(self: text, sep: text) gives split_iter     // iterator<split_iter, text>
-routine lines(self: text) gives lines_iter
-routine chars(self: text) gives char_iter                 // iterator<char_iter, char>
-routine trim(self: text) gives text                       // also trim_start, trim_end
-routine eq_ignore_case(a: text, b: text) gives bool       // ASCII case folding
-routine to_upper / to_lower(self: text) gives result<string, alloc_error>   // full Unicode simple mapping
-routine char_from(u: uint) gives option<char>
-routine encode_utf8(c: char, out: span<ubyte>) gives size   // writes 1..4 bytes
-routine decode_utf8(bytes: view<ubyte>) gives option<(char, size)>
-routine validate_utf8(bytes: view<ubyte>) gives bool
-routine text_from_utf8(bytes: view<ubyte>) gives option<text>      // @from(bytes)
-char predicates: is_digit(radix), is_alpha, is_alnum, is_whitespace, is_upper, is_lower, to_digit(radix) gives option<uint>, len_utf8. string operations: string_new, string_from(text), try_string_from, as_text(self: string) gives text (@from self), push_text(var, text) and push_char(var, char) (fallible), clear, truncate(at), reserve, join(parts: view<text>, sep: text) gives result<string, alloc_error>.
-Where a string appears where text is expected, auto-borrow (3.3 item 2) applies.
-Formatting. format, print, println, eprint, eprintln are compiler intrinsics with a literal first argument:
-println("point = ({}, {}), hex = {:08x}", p.x, p.y, flags)
-let s = format("{:>10.3}", ratio)      // gives result<string, alloc_error>
-• The format text must be a literal (E0701 otherwise); the number and types of arguments are checked at compile time (E0702). Every argument type must satisfy printable.
-• Placeholders: {} default; {:spec} with [[fill]align][sign][#][0][width][.precision][type]; align < ^ >; type x X o b e E for numbers, ? for debug form (types with @derive(printable)). {{ and }} are literal braces. Arguments are evaluated once, left to right.
-• println appends LF. Console output on Windows is converted to the console code page UTF-16 via WriteConsoleW or passed raw UTF-8 if the stream is redirected; the bytes written to a redirected stream are always UTF-8.
-• Float printing is shortest round-trip (Ryu-class) by default so output is identical across backends; {:.N} is correctly rounded.
-• Under no_std, only std.fmt.write_to(out: span<ubyte>, ...) gives result<size, fmt_error> is available.
-7.7 Collections (std.collections)
-All collections own their elements, are move-only, are disposable, and take an optional allocator parameter. Mutating operations that may reallocate take var self and are therefore excluded while borrows into the collection are live (4.6). Lookups return option<ref<V>> / option<mut<V>> borrows tied to the collection.
-Type
-Structure
-Complexity
-Notes
-buffer<T>
-dynamic array
-push O(1) amortized, insert/remove O(n)
-in prelude
-deque<T>
-ring buffer
-push/pop both ends O(1)
-front, back, push_front, push_back, pop_front, pop_back, indexing
-map<K,V>
-open-addressing hash table
-O(1) expected
-K is hashable and equatable
-set<T>
-hash set
-O(1) expected
-union, intersect, difference gives iterators
-sorted_map<K,V>
-B-tree
-O(log n)
-K is ordered; in-order iteration, range queries range(lo, hi)
-sorted_set<T>
-B-tree
-O(log n)
-likewise
-heap<T>
-binary heap
-push/pop O(log n)
-T is ordered; max-heap, peek gives option<ref<T>>
-bitset<N>
-inline bits
-O(1) per bit
-set, clear, test, count_ones, iter_ones
-map representative API:
-routine map_new<K, V>() gives map<K, V>
-routine count(self: map<K, V>) gives size
-routine insert(var self: map<K, V>, own k: K, own v: V) gives result<option<V>, alloc_error>   // old value if replaced
-routine get(self: map<K, V>, k: K) gives option<ref<V>>
-routine get_mut(var self: map<K, V>, k: K) gives option<mut<V>>
-routine contains_key(self: map<K, V>, k: K) gives bool
-routine remove(var self: map<K, V>, k: K) gives option<V>
-routine entry(var self: map<K, V>, own k: K) gives entry<K, V>      // for insert-or-update: entry_or_insert(own e, own v) gives result<mut<V>, alloc_error>
-routine keys(self: map<K, V>) gives key_iter<K, V>
-routine values(self: map<K, V>) gives value_iter<K, V>
-routine iter(self: map<K, V>) gives map_iter<K, V>                 // yields (ref<K>, ref<V>)
-routine clear(var self: map<K, V>)
-routine reserve(var self: map<K, V>, extra: size) gives result<void, alloc_error>
-Determinism. The default hasher is a fixed-seed SipHash-1-3 so that iteration order of map/set is unspecified but identical for identical insertion histories on every backend and every run. A program that wants HashDoS resistance constructs map_with_hasher(random_state()), which seeds from OS entropy and therefore gives a different iteration order per run.
-7.8 I/O, files, time, process (std.io, std.fs, std.path, std.env, std.time, std.process)
-Streams. Two small capabilities abstract byte I/O:
-capability reader<R>
-    routine read(var r: R, dst: span<ubyte>) gives result<size, io_error>   // 0 means end of stream
-
-capability writer<W>
-    routine write(var w: W, src: view<ubyte>) gives result<size, io_error>
-    routine flush(var w: W) gives result<void, io_error>
-Provided: stdin(), stdout(), stderr() (process-wide handles; stdout is line-buffered on a console and block-buffered when redirected; flushed at exit and before a trap diagnostic), file, memory_reader(view<ubyte>), memory_writer(var buffer<ubyte>), buffered_reader<R>, buffered_writer<W>. Helpers: read_exact, read_to_end(var r, var out: buffer<ubyte>), read_line(var r, var out: string), write_all, copy(var r, var w).
-Files.
-variant open_mode
-    read
-    write            // create or truncate
-    append
-    read_write
-    create_new       // fail if exists
-
-routine open(path: text, mode: open_mode) gives result<file, io_error>
-routine seek(var f: file, from: seek_from, offset: long) gives result<ulong, io_error>
-routine size(f: file) gives result<ulong, io_error>
-routine read_file(path: text) gives result<buffer<ubyte>, io_error>      // whole file
-routine read_text_file(path: text) gives result<string, io_error>        // validates UTF-8
-routine write_file(path: text, data: view<ubyte>) gives result<void, io_error>
-routine exists(path: text) gives bool
-routine create_dir_all(path: text) gives result<void, io_error>
-routine remove_file(path: text) gives result<void, io_error>
-routine list_dir(path: text) gives result<dir_iter, io_error>
-file is disposable (dispose closes the handle and ignores close errors; call close(own f) gives result<void, io_error> to observe them). On Windows these map to CreateFileW, ReadFile, WriteFile, SetFilePointerEx, GetFileSizeEx, FindFirstFileW and so on, via foreign msx64 declarations in std.win.kernel32, with paths converted from UTF-8 to UTF-16 using a stack buffer for paths up to 260 units and the heap beyond, and the \\?\ prefix applied for long paths.
-Paths (std.path): join(a, b), parent, file_name, extension, with_extension, is_absolute, normalize, all on text and returning text borrows or string. Separators / and \ are both accepted on Windows; output uses \.
-Environment and process. std.env.args() gives view<text>, std.env.var(name: text) gives option<string>, current_dir(), std.process.exit(code: int) gives never (flushes streams, does not run pending defers), std.process.spawn(cmd: text, args: view<text>) gives result<child, io_error>, wait(var child) gives result<int, io_error>.
-Time. instant (monotonic, now(), elapsed(self)), duration (nanos as long; seconds(n), millis(n), as_secs_f64), system_time (wall clock: now(), unix_seconds). sleep(d: duration). On Windows: QueryPerformanceCounter/Frequency, GetSystemTimePreciseAsFileTime.
-7.9 Concurrency (std.thread, std.sync, std.atomic)
-Threads.
-routine spawn<A, R>(f: routine(A) gives R, own arg: A) gives result<join_handle<R>, io_error>
-    where A is sendable, R is sendable
-routine join(own h: join_handle<R>) gives result<R, thread_panic>
-routine scope(f: routine(var s: thread_scope)) gives void
-routine spawn_scoped<A, R>(var s: thread_scope, f: routine(A) gives R, own arg: A) gives scoped_handle<R>
-routine sleep(d: duration)          routine yield_now()
-routine available_parallelism() gives size
-routine current_id() gives thread_id
-Dropping (disposing) a join_handle detaches the thread; thread_panic is returned if the thread ended with a trap and the program installed a thread-local trap handler that returns control to the join point via std.thread.on_trap(recover) (otherwise any trap terminates the whole process, 5.10). scope blocks until every thread spawned through its thread_scope has finished; this is the one place where arguments of a spawned thread may be borrows of the parent's data, since all of them are dead before scope returns (4.9). In spawn_scoped, A need only be sendable as a bundle of borrows (view<T> with T: shareable, or one span<T> per disjoint region).
-Synchronization.
-Type
-Operations
-mutex<T>
-mutex_new(own v: T), lock(self: mutex<T>) gives guard<T>, try_lock(self) gives option<guard<T>>. guard<T> is disposable (unlock on dispose); value(var g: guard<T>) gives mut<T> (@from g). Poisoning does not exist: a trap terminates the process.
-rwlock<T>
-read(self) gives read_guard<T>, write(self) gives guard<T>
-condvar
-wait(self, var g: guard<T>), wait_timeout(...), notify_one, notify_all
-once<T>
-get_or_init(self, f: routine() gives T) gives ref<T>
-barrier
-wait(self)
-channel<T>
-channel_new<T>(capacity: size) gives (sender<T>, receiver<T>), send(self: sender<T>, own v: T) gives result<void, send_error<T>>, recv(self: receiver<T>) gives result<T, recv_error>, try_recv, recv_timeout; senders are copyable by clone_sender (explicit); closing is by disposing all senders. MPMC, bounded (capacity 0 = rendezvous) or unbounded when capacity is size.MAX.
-A mutex<T> takes self by shared borrow (it is shareable when T is sendable); the guard is how mutation of the protected value becomes legal without an exclusive borrow of the mutex itself. This is a library invariant implemented with unsafe code inside std.sync and is the canonical example of safe encapsulation (4.8).
-Atomics.
-variant order
-    relaxed
-    acquire
-    release
-    acq_rel
-    seq_cst
-
-routine load(self: atomic<T>, o: order = order.seq_cst) gives T
-routine store(self: atomic<T>, v: T, o: order = order.seq_cst)
-routine exchange(self: atomic<T>, v: T, o: order = order.seq_cst) gives T
-routine compare_exchange(self: atomic<T>, expected: T, desired: T,
-                         success: order = order.seq_cst, failure: order = order.seq_cst) gives result<T, T>
-routine fetch_add / fetch_sub / fetch_and / fetch_or / fetch_xor / fetch_min / fetch_max(self: atomic<T>, v: T, o: order = order.seq_cst) gives T   // integers; wrapping
-routine fence(o: order)
-Atomic operations take self by shared borrow: atomics are shareable and are the only mutation permitted through a shared borrow in safe code. Lock-free guarantees: atomic<T> is lock-free for T of size 1, 2, 4, 8 on Tier-1 (is_lock_free<T>() is a compile-time query); larger T is not permitted. Requesting an invalid combination of orders (e.g. release for a load) is E0710.
-Data-parallel helper. std.thread.parallel_for(range: range, f: routine(size, ctx: view<C>), ctx: view<C>) where C is shareable, with a work-stealing pool sized by available_parallelism(), used for loops whose iterations are independent. parallel_for is not inserted automatically by the compiler.
-7.10 Hashing, sorting, random numbers, SIMD, testing, Windows bindings
-std.hash. hasher (SipHash-1-3, 64-bit output; write_bytes, write_u64, finish(self) gives ulong), hash_of<T>(v) gives ulong where T is hashable, fnv1a(bytes), crc32(bytes), xxh3_64(bytes). Hash values are stable across backends and library patch releases within an edition.
-std.sort.
-routine sort(var s: span<T>)                        where T is ordered      // unstable, introsort, O(n log n) worst-case
-routine stable_sort(var s: span<T>) gives result<void, alloc_error>   where T is ordered   // merge sort, needs scratch
-routine sort_by_key(var s: span<T>, key: routine(view<T>) gives K)     where K is ordered
-routine is_sorted(self: view<T>) gives bool         where T is ordered
-routine select_nth(var s: span<T>, n: size)         where T is ordered
-Comparators are routine pointers or the ordered capability; there are no capturing comparators. A comparator that is not a strict weak ordering cannot cause memory unsafety but makes the resulting order unspecified.
-std.random. rng capability: next_u64(var r: R) gives ulong. Provided generators: pcg64, xoshiro256pp, splitmix64 (all seedable, fully specified, identical output on every backend) and os_rng (BCryptGenRandom on Windows). Helpers: uniform_u64(var r, lo, hi) (unbiased), uniform_f64(var r) in [0,1), shuffle(var r, var s: span<T>), fill_bytes(var r, dst: span<ubyte>).
-std.simd. vec<T, N> is a built-in fixed-width numeric vector (T numeric; N in {2, 4, 8, 16, 32, 64} with total width ≤ 512 bits). It is a copyable value type. [Decision] Although general operator overloading does not exist in Paracine, vec<T,N> is a compiler built-in type and the arithmetic operators + - * / and bitwise & | ^, comparisons (giving mask<N>), and unary - apply lane-wise, with the scalar semantics of 5.6 per lane. Library routines: splat, load(view<T>), store(var span<T>, v), select(mask, a, b), shuffle<const idx: array<uint,N>>, reduce_add / reduce_min / reduce_max, fused_mul_add, sqrt, abs, any(mask), all(mask). If the target lacks a vector width, the backend lowers lane-wise to scalar code; the result is identical. "Automatic" vectorization of scalar loops (overview, profile table) is an optimization and never changes observable behavior; in particular it must preserve 5.6 for floating-point reductions, so floating-point sum reductions are vectorized only in @fastmath scope.
-std.test. assert_eq(a, b) (requires equatable and printable, prints both on failure), assert_ne, assert_lt, assert_close(a, b, tol), expect_trap(f: routine(), code: trap_code) (runs f in a child process with a recovering trap handler), and bench(name, f: routine()) used by pcn bench.
-std.win (Windows x86-64 only; every item is foreign msx64, wrapped by safe routines in the higher-level modules): kernel32 (file, process, thread, time, memory, console), ntdll (minimal), bcrypt (random), user32/gdi32 (window creation, message pump; optional feature gui), ws2_32 (sockets, feature net). Types: handle (@opaque raw<void>), hresult, last_error().
-7.11 Library realizations and the backend contract
-Per overview section 58, each library routine has up to four realizations; the semantics are those of the Paracine source and the others must match them exactly:
-Realization
-Used by
-Content
-Paracine source (.pcn + .pci)
-all backends before PCIR optimization
-the reference definition
-Intrinsic
-both backends
-trap, size_of, fused_mul_add, atomics, volatile_*, vec ops, format expansion, unreachable
-COFF object (std.lib)
-native .obj/.exe
-precompiled non-generic routines and runtime support (heap, console I/O, thread start, trap handler, start-up code)
-C++20 helper header (pcn_runtime.hpp)
-.cpp backend
-pcn_wrap_* arithmetic helpers (5.6), pcn_trap, pcn_shl/shr with masking, pcn_f2i_sat, buffer/allocator support, atomics via <atomic> with explicit orders, threads via <thread>
-Conformance rule for realizations. For every non-intrinsic library routine, the test suite runs the Paracine source, the COFF object and the C++20 helper on the same inputs and requires identical results (this is the library-level form of the differential validation of overview section 51). Library routines that depend on OS behavior (file, time, threads) are specified by their observable calls (5.11) rather than by identical timing.
-7.12 What is deliberately absent
-• No garbage collector, no implicit allocation: every allocation is visible as a call that mentions buffer, string, arena, box-like containers, or format/join.
-• No exceptions, RTTI, reflection, or dynamic dispatch (no dyn/virtual); polymorphism is generic and monomorphized.
-• No closures or captured environments (routine pointers carry no state); stateful callbacks pass an explicit context argument.
-• No global mutable state in safe code outside atomics and std.sync types; var static requires unsafe unless of type atomic<T>.
-• No user-defined operators (except the built-in vec and numeric operators), no implicit conversions, no function overloading by return type.
-Part 8. Conformance, open issues and decisions to confirm
-8.1 What "conforming" means
-An implementation conforms to this specification if it (a) accepts exactly the programs that satisfy Parts 1–6 and rejects the rest with the diagnostics named there (the code numbers are normative for the class of error, not for message text), (b) executes accepted programs as specified by Part 5, and (c) provides the library of Part 7 with the stated semantics. Each output form (.cpp, .obj, .exe) is a separate realization and must individually meet (b) and (c); equivalence between them is judged by 5.11.
-8.2 Required test suites (normative targets for the reference compiler)
-1. Grammar suite: every production in Part 2 with positive and negative cases; layout algorithm edge cases (dedent chains, continuation lines, -> continuation).
-2. Type suite: each typing rule of 5.2 and 5.3, each conversion of table 3.3, capability resolution and its ambiguity rule.
-3. Ownership suite: every E04xx diagnostic; moves in branches and loops (drop-flag correctness); region elision cases of 4.5; unsafe encapsulation tests with a checking allocator.
-4. Arithmetic suite: exhaustive 8- and 16-bit tables for every integer operator; randomized 32/64-bit tests against an arbitrary-precision oracle; float conversions at saturation and NaN.
-5. Cross-backend differential suite: every program in suites 1–4 and the library suite compiled to .cpp (built by at least MSVC and Clang) and to .exe, outputs and exit codes compared.
-6. Library suite: per-routine tests, the realization-equivalence tests of 7.11, concurrency stress tests (with a race detector on the C++20 build).
-7. Fusion suite: the code-shape tests of 7.5 (no allocation or per-element call for fused chains).
-8.3 Open issues that should be settled before a 1.0 freeze
-These are genuine gaps or tensions; I list them rather than hide them.
-1. Closures. Capture-free routine pointers keep the runtime non-managed, but they make adapters like map and filter less convenient and force explicit context passing. Alternatives: (a) keep as is; (b) allow non-escaping capturing closures that are monomorphized and inlined as generic parameters (zero allocation, no heap closures); this is the usual way to recover ergonomics without a runtime. Option (b) would add a closure expression to 2.6 and a callable capability.
-2. Interior mutability and the borrow checker's reach. Rule 4.4 is conservative for indexing (same place for all indices). Range analysis helps, but algorithms such as in-place partitioning need split_at. A more precise index-disjointness analysis is possible but increases checker complexity.
-3. Associated types. iterator<I, T> uses a second type parameter because capabilities have no associated types. This works but makes constraints such as where I is iterator<T> appear in many generic signatures. Associated types would simplify at the cost of a more complex type-checker.
-4. Trap vs. unwinding. Traps never run defer/dispose (5.10). Systems that need cleanup on failure (e.g. flushing a log) must install a trap handler that does it explicitly. A "cleanup on trap" mode is not specified.
-5. Macros / compile-time code generation. 6.5 deliberately excludes build scripts and macros; @derive is the only generative mechanism, and only for the built-in capabilities. User-level derive, or compile-time reflection, is out of scope for 1.0.
-6. Async. The overview excludes a mandatory scheduler. Structured concurrency is provided by threads and scope; an async surface language would need to be designed on top of that and is not specified.
-7. Other targets. Parts of this specification mention Tier-1 (Windows x86-64) properties (pointer width, default trap exit code, std.win). Targets reached through the .cpp backend inherit those parts of the library that do not use std.win; a platform abstraction layer (std.sys) with Linux and macOS realizations is still to be written.
-8.4 Decision log (everything I chose where the overview was silent)
-#
-Decision
-Where
-D1
-Exactly four spaces per indentation level; tabs forbidden
-1.2
-D2
-text is a borrowed immutable UTF-8 slice; string is owning
-3.1
-D3
-Routine pointers carry no environment (no closures)
-2.3
-D4
-No implicit numeric conversions; as is the only conversion
-3.3
-D5
-Capabilities are satisfied by name and signature, with a fixed lookup order
-3.4
-D6
-Records are never reordered; @layout(c) and @packed available
-3.6
-D7
-Wrapping + - * for all integers; shifts mask the count; MIN / -1 = MIN
-5.6
-D8
-Default parameter mode is a shared borrow; var exclusive; own moves
-4.3
-D9
-No lifetime parameters; region elision rules with @from
-4.5
-D10
-Traps terminate; they do not unwind or run cleanup
-5.10
-D11
-give e auto-wraps into ok / some; fail e auto-wraps into err
-5.5
-D12
-Float contraction and reassociation off unless @fastmath
-5.6
-D13
-std function-like collections use fixed-seed SipHash; deterministic order
-7.7
-D14
-Growth operations are fallible; eager constructors trap on OOM and have try_ forms
-7.1
-D15
-import graph is acyclic; items within a module are order-independent
-6.2, 6.4
-D16
-Three visibilities: private, public (package), export (dependents, ABI)
-6.3
-D17
-Built-in vec<T,N> is the only type with operator semantics beyond primitives
-7.10
-D18
-One module per file, path equals module name
-6.1
-Any of these can be reversed; several (D3, D10, D11, D14) have visible consequences for how the language feels and are the ones most worth reviewing first.
-8.5 Relationship to the overview
-Nothing here changes the overview's output forms, architecture, ABI or optimization pipeline. The spec adds the grammar (Part 2), type rules (Part 3), ownership rules (Part 4), semantics that the optimizer and both backends must preserve (Part 5), the module and package system (Part 6) and the library (Part 7). The overview's claims that go beyond what is specified here (for example, details of PMIR, register allocation, the PE writer, or the exact "Path Compression" optimization) remain to be specified in separate documents: a PCIR specification, a PMIR and ABI-lowering specification, and a COFF/PE writer specification.
-
-
-## *** ##
-
-
-Paracine Backend Specifications
-Companion to the Paracine Language Specification (normative draft 1.0)
-Contents. Part A: PCIR, the semantic intermediate representation and optimizer. Part B: Paracine Machine IR (PMIR) and the Microsoft x64 ABI lowering. Part C: the COFF object writer, the PE32+ image writer and the native linker.
-Status note. The overview names these components and their pipeline stages but defines none of their internals, and it does not define "Path Compression" or "SSA Reduction" beyond the names. Everything below is a proposed normative definition consistent with the language specification, in particular its rules for arithmetic (5.6), traps (5.10), evaluation order and observable behavior (5.11), and ownership (Part 4). Choices I made where the sources were silent are marked [Decision]. Numeric facts about the Windows ABI, COFF and PE formats follow the public Microsoft documentation as I know it; items I am less than certain of are marked [Verify] and should be checked against the current Microsoft PE/COFF and x64 ABI documents before implementation.
-Part A. PCIR: the semantic intermediate representation
-A.1 Role and design goals
-PCIR is the single representation on which all semantic optimization happens and from which every output form is produced (overview §34). It must satisfy five requirements:
-1. Fully typed and monomorphic. No generics, capabilities, or overloads remain. Every value has a concrete PCIR type.
-2. Exact semantics. Every instruction has the arithmetic, trap and ordering behavior of language spec Part 5; no instruction has undefined behavior. (Exception: instructions that originate in unsafe code are marked !unsafe and may be assumed to obey the unsafe contract, 4.8.)
-3. Retains source-level facts that machine IRs normally lose: ownership/aliasing, value ranges, alignment, proven bounds, lifetimes of cleanup obligations.
-4. Retains enough structure to reconstruct structured C++20 control flow without a general goto-elimination algorithm.
-5. Serializable and versioned, so a build can record the PCIR version (overview §50) and so pcn ir output can be parsed back.
-A.2 Program structure
-module      := global* function* extern*
-global      := @name : type [= constant] attrs      (* static storage: rdata / data / bss class *)
-extern      := declare @name (types) -> type  abi(c|msx64|pcn)  [import("dll")]
-function    := func @name (params) -> type attrs { block+ }
-block       := label (block-params): instruction* terminator
-A function has one entry block with no predecessors. A block carries typed block parameters instead of phi nodes [Decision]: edges pass values explicitly (br L(%a, %b)), which keeps SSA construction local, simplifies the verifier, and makes critical-edge splitting trivial. A terminator is the last instruction of a block: br, condbr, switch, ret, trap, unreachable, or tailcall.
-Globals are constants (.rdata), initialized mutable (.data), or zero-initialized (.bss), matching const items, var static items and string literals of the source.
-A.3 Type system
-PCIR type
-Meaning
-i1
-boolean in SSA values (stored as i8)
-i8 i16 i32 i64
-signless integers; signedness is carried by the operation, not the type
-f32 f64
-IEEE binary32 / binary64
-ptr
-machine pointer (64-bit on Tier-1), untyped; accesses carry their own type
-{t1, t2, ...}
-struct (SSA aggregate value) with explicit layout (A.3.1)
-[n x t]
-fixed array
-<n x t>
-vector (from vec<T,N> and from auto-vectorization)
-void, never
-no value / does not return
-Signed and unsigned source types map onto the same integer type: int and uint are both i32. char is i32; bool is i1 in registers and i8 in memory; size/ssize are i64 on Tier-1 (target-dependent width otherwise, resolved at PCIR construction); view<T>, span<T>, text are {ptr, i64}; buffer<T> is {ptr, i64, i64}; routine pointers are ptr.
-A.3.1 Layout. PCIR construction runs a layout pass that assigns every record and variant its size, alignment and field offsets by the rules of language spec 3.6, including niche selection for option<T> (3.2). The result is recorded on the type and is the definition used by both backends, so the C++20 backend can emit alignas and static_assert(offsetof(...)) checks against it and the native backend can use the numbers directly. A variant is {iN tag, [k x i8] payload} aligned to its widest member; a niche-packed option is the payload type itself with the niche value meaning none.
-A.4 Values, SSA and memory
-Values. Every instruction that produces a result defines exactly one SSA value (%name); the definition dominates all uses. Constants are written inline: 42:i32, 3.5:f64, null. There is no undef; uninitialized memory is modeled by alloca without a store, and reading it before a store is rejected by the verifier in safe code (language spec 4.2).
-Memory. Memory is accessed only by load, store, atomics, call and the memcpy/memset intrinsics. Local variables start as alloca slots; the mem2reg pass (A.11) promotes every slot whose address never escapes into SSA values. Each memory instruction carries attributes:
-• !align n (a power of two);
-• !volatile (observable, never removed or reordered with other volatile or foreign effects);
-• !atomic order for relaxed | acquire | release | acq_rel | seq_cst;
-• !own K where K is excl(region), shared(region), or raw: the access goes through an exclusive borrow, a shared borrow, or raw authority (language spec Part 4), with a region id naming the borrow;
-• !nonnull, !range(lo, hi) on loaded integers, !dereferenceable n.
-Alias model. Two memory accesses may alias unless: (a) one has !own excl(R) and the other is not derived from R's borrow chain, or (b) both are shared(R) loads, or (c) they address provably disjoint allocas or globals, or (d) offsets within the same base are provably disjoint. Ownership-derived noalias is the main way PCIR retains the language's aliasing guarantees (4.4). The alias analysis is sound because the borrow checker already enforced rule 4.4; !own raw accesses use the conservative model "may alias anything with raw provenance in the same allocation".
-A.5 Instruction set
-Notation: T is an integer type of width w, F a float type.
-A.5.1 Integer arithmetic (all total, no UB)
-Instruction
-Semantics (language spec 5.6)
-add T a, b; sub; mul
-wrap_w result
-neg T a; not T a
-modular negate; bitwise complement
-sdiv T a, b; srem
-truncated; traps DivideByZero if b = 0; MIN/-1 = MIN, MIN%-1 = 0
-udiv T a, b; urem
-traps DivideByZero if b = 0
-and T, or, xor
-bitwise
-shl T a, n; lshr; ashr
-count taken as n & (w-1); n has type T
-rotl T, rotr T
-rotate; count masked
-popcnt, clz, ctz, bswap, bitrev
-clz/ctz of 0 give w
-add.ovf.s T a, b → {T, i1}; sub.ovf; mul.ovf; .u variants
-exact wrapped result and overflow flag, for checked_*
-icmp pred T a, b → i1
-eq ne slt sle sgt sge ult ule ugt uge
-select i1 c, a, b
-no short-circuit (both operands already evaluated)
-A.5.2 Floating point
-fadd fsub fmul fdiv frem fneg fabs sqrt fma copysign; fcmp pred with oeq one olt ole ogt oge ord uno ueq une ult ule ugt uge. Each may carry the flag !fast (a @fastmath scope: reassociation allowed, NaN/Inf assumed absent, A.8); otherwise strict IEEE with no contraction (5.6). fma exists only when the source writes fused_mul_add or in !fast scope.
-A.5.3 Conversions
-zext, sext, trunc; sitofp, uitofp (round-to-nearest-even); fptosi.sat, fptoui.sat (truncate toward zero, saturate, NaN → 0: exactly language spec 3.3); fpext, fptrunc; bitcast (same-size reinterpret between integers, floats, vectors); ptrtoint, inttoptr (marked !unsafe).
-A.5.4 Aggregates and addressing
-%x  = extract {t...} %agg, k             // static field/element index
-%y  = insert  {t...} %agg, %v, k
-%a  = gep.field %p, @layout, k           // pointer + static field offset
-%a  = gep.elem  %p, %i, T                // pointer + i * sizeof(T), no bounds check
-      boundscheck %i, %n                 // traps Bounds unless 0 <= i < n (unsigned compare)
-boundscheck is a separate instruction with effect "may trap", so that bounds-check elimination (A.11) has a precise target. gep never traps; overflow in address computation cannot occur for in-range indices, and raw use is covered by the unsafe contract.
-A.5.5 Memory and atomics
-load T, %p [attrs], store T %v, %p [attrs], memcpy %dst, %src, %n !align, memmove, memset; alloca T [, count] !align (frame allocation, with optional lifetime.start/end markers around scopes to allow stack-slot sharing); atomic.load, atomic.store, atomic.rmw op (xchg add sub and or xor min max), atomic.cmpxchg → {T, i1}, fence order.
-A.5.6 Calls and effects
-call @f(args) [abi], call.indirect %fp(args) sig, tailcall (terminator; guaranteed only when @tail is requested, otherwise an optimization), call.foreign (an extern call; effect io). Calling-convention lowering is not done in PCIR: arguments and results are SSA values (possibly aggregates). ABI lowering belongs to PMIR (Part B).
-A.5.7 Intrinsics
-trap code, loc; unreachable (terminator; reaching it is trap Unreachable); assume %c (!unsafe code only); likely/unlikely as branch weights; prefetch; cpu.pause; readcyclecounter; vector operations (vadd, vshuffle, vreduce.add, vselect, vload/vstore, vmask); stacksave/stackrestore (not used by safe source).
-A.5.8 Control flow
-br L(%a, %b)                         // unconditional with block arguments
-condbr %c, L1(args), L2(args) !weight(a, b)
-switch T %v, default L0(args), [k1 -> L1(args), ...]
-ret %v | ret
-trap CODE                            // terminator form
-unreachable
-A.6 Control flow structure and regions
-PCIR is a CFG (basic blocks and edges) with an optional region tree attached as metadata. The region tree records the source structure from which each block came: seq, if(cond, then, else), switch, loop(header, latch, exits), scope(cleanup_chain), try_exit.
-• Reducibility invariant. The CFG is always reducible (every cycle has a single entry), because the front end generates only structured control flow (if, choose, loop, while, for, break, continue, labeled break/continue, give/fail/try). Every pass must preserve reducibility. A pass that would break it (e.g. unrestricted jump threading into a loop) must not run, or must re-establish it by node splitting under a cost bound.
-• Region validity. A pass that changes the CFG must update or drop the affected regions. A dropped region is legal (the C++20 backend then uses its general structuring algorithm, A.13); a stale region is a verifier error. [Decision] The C++20 backend does not require regions; they make its output nicer and cheaper to produce.
-Cleanup edges. Scope-exit actions (dispose, defer; language spec 4.7) appear in PCIR as ordinary blocks reached by explicit edges, never as implicit unwinding. A scope with cleanup has a cleanup chain of blocks in LIFO registration order; every exit edge of the scope (fall-through, give, fail, break, continue, propagating try) is routed through the chain to its destination, with block parameters carrying the pending return value or error. Drop flags (4.2) are alloca i1 slots promoted to SSA where possible; a flag known true or false on an edge folds the corresponding cleanup block away, which is the main source of cleanup-code elimination.
-A.7 Effects and the ordering model
-Every instruction has an effect summary from this lattice:
-Effect
-Examples
-pure
-arithmetic without division, compares, select, extract, gep, fptosi.sat
-trap (pure + may trap)
-sdiv, udiv, urem, srem, boundscheck
-read(M)
-non-volatile loads from memory class M
-write(M)
-non-volatile stores, memcpy
-sync
-atomics, fences
-io
-volatile accesses, call.foreign, calls to routines with io effect, process exit
-diverge
-non-terminating call (never result)
-Memory class M is derived from provenance: a specific alloca or global, a region id, or any.
-Ordering rules. An optimizer may reorder or delete instructions only if the result preserves: (1) data dependencies (SSA edges and the memory dependencies of the alias model); (2) the relative order of any two instructions that are sync or io, and of each of them with respect to any instruction that may trap, so that precise traps (language spec 5.10) hold: all earlier observable effects have happened and none later; (3) the cleanup-edge structure. A trap-effect instruction may be deleted only if its trap condition is proven false (e.g. by range facts) and may be hoisted only if it is speculation-safe, which for traps means never, unless dominated by an equivalent earlier check.
-A.8 Metadata carried on IR
-Values and instructions may carry: !range(lo, hi) (integer facts from types, option niches, bounds proofs), !knownbits(mask, value), !align, !nonnull, !dereferenceable, !own (A.4), !loc (source span, always preserved for trap diagnostics), !weight, !inline (always | never | hint), !fast, !unsafe, !noreturn, !fusible (marks an iterator next chain from std.iter for the fusion pass, A.11), !origin (module and routine name for diagnostics and pcn explain).
-Metadata is advisory except !volatile, !atomic, !unsafe, !loc on trapping instructions, and !own where the alias model uses it. These are semantic and must be preserved, or soundly weakened, by every transformation.
-A.9 Verifier rules
-The verifier runs after construction and after every pass in debug builds (after each stage in release builds). A violation is a compiler bug (ICE-Pxxxx). Rules:
-1. Well-formed CFG: one entry block; every block reachable or deleted; each block ends in exactly one terminator; branch arguments match target block parameter types and count.
-2. SSA: each value defined once; each use dominated by its definition (block parameters dominate the block body).
-3. Types: operand types match the instruction signature; no implicit conversion; pointer operands are ptr; integer widths agree.
-4. Memory: every alloca read on every path is preceded by a store on that path (non-!unsafe code); alignments are powers of two and at most 4096; atomics use an integer or pointer type of size 1, 2, 4 or 8.
-5. Effects: no pure instruction has side effects; every trap or io instruction keeps its !loc.
-6. Regions: each region's blocks are connected as declared; a loop header dominates the region's blocks; every exit edge of a scope region passes through its cleanup chain; no stale region (A.6).
-7. Ownership metadata: each !own excl(R) access has an access chain through the borrow that defines R; live excl(R) and shared(R) regions over the same place do not overlap (re-checks language spec 4.4 on the IR, as a defense against optimizer bugs).
-8. Constants: every constant fits its type. Division by constant zero is allowed (it traps at run time) and produces warning W-Pdiv0.
-9. Calls: callee signature matches arguments; a never-returning callee is followed by unreachable; tailcall caller and callee return types agree.
-10. Monomorphic: no unresolved generic or capability reference.
-A.10 Construction: from typed AST to PCIR
-Construction takes the monomorphized, borrow-checked program and emits PCIR by these rules. Each rule preserves the evaluation order of language spec 5.4.
-Source construct
-PCIR
-let x = e, var x = e
-alloca slot + store, or directly an SSA value if x is never borrowed mutably or address-taken (mem2reg finishes the job)
-x = e
-store; if the old value is disposable, its dispose call is emitted first (5.3 S-Assign)
-Shared borrow x as argument
-pointer to the place (ptr) with !own shared(R) on callee loads; small copyable scalars are passed as values
-var x argument
-pointer with !own excl(R)
-own x argument / move
-memcpy (or SSA aggregate copy) into the callee's value, then the drop flag of the source is cleared (store i1 0)
-give e
-evaluate e, wrap per 5.5 (ok/some), br into the enclosing scope's cleanup chain with the value as block argument, ending in ret
-fail e, try e
-fail: wrap in err, route through cleanup chain, ret. try: switch tag on the result/option; success edge continues with the payload, failure edge converts and goes to the fail path
-if, if expression
-condbr; expression form joins through a block parameter
-choose
-decision tree compiled from the pattern matrix (5.7): switch on variant tags and integer ranges, guards as condbr, arms in source order for equal-priority tests
-loop, while, for, break, continue
-loop region: header block with parameters for loop-carried values, latch, exit blocks; labeled forms jump to the labeled region's exits with scope cleanup in between
-Indexing a[i]
-boundscheck %i, %count then gep.elem then load/store; slicing emits one range check 0 <= a <= b <= count (two compares) and builds the {ptr, i64} result
-+ - * / % << >>, comparisons, as
-the instructions of A.5 with exactly the semantics of 5.6 and table 3.3; / and % emit their trap forms
-and, or
-condbr (short-circuit) joining through a block parameter of type i1
-defer, dispose at scope exit
-cleanup chain blocks (A.6), guarded by drop flags where the value may have been moved
-unsafe code
-same instructions marked !unsafe, accesses marked !own raw
-foreign call
-call.foreign
-format(...)/print(...)
-expanded at construction into calls to formatting routines with constant format pieces; the number and types of arguments were already checked
-Atomic operations
-the matching atomic.* with the stated order
-The result is non-optimized but valid PCIR: correct SSA, all checks present, all cleanup edges explicit.
-A.11 The optimization pipeline
-Optimization is a fixed sequence of passes grouped into stages, repeated at most N times (N = 2 at opt=2, 3 at opt=3) until a fixed point of the cheap cleanups. All passes consume and produce valid PCIR (A.9). The pass names below are normative so that pcn explain and pcn ir --after=<pass> have a stable vocabulary.
-Stage 1: simplification.
-1. fold: constant folding and algebraic simplification. Rule: folding must use the same evaluator as language spec 5.8 and the library's arithmetic (pcn_arith); the compile-time and run-time results must be bit-identical, including trap conditions (a foldable sdiv x, 0 is not folded: it stays a trap).
-2. sccp: sparse conditional constant propagation.
-3. simplifycfg: merge straight-line blocks, remove empty blocks, fold branches on constants, remove unreachable blocks; updates regions.
-4. mem2reg: promote non-escaping alloca slots (including drop flags) to SSA values, with block parameters at joins.
-5. sroa: scalar replacement of aggregates; splits {ptr, i64} views and small records into scalars so they live in registers.
-Stage 2: inlining and specialization.
-6. inline: bottom-up call-graph order. Always inline !inline always; never inline !inline never or recursive cycles; otherwise inline by a cost model (instruction count after substitution, call-site frequency from !weight, callee known-constant arguments reduce cost). Because generics are already monomorphic, inlining crosses generic boundaries without special handling. Inlined routines retain !origin for pcn explain.
-7. specialize: clone a routine for call sites that pass constants or exact ranges for parameters when the cloned body shrinks by a threshold (the "Resolve what is known" of the overview's optimization law).
-Stage 3: redundancy removal.
-8. gvn: global value numbering and CSE for pure instructions; also redundant-load elimination using the alias model.
-9. range: forward range analysis producing !range/!knownbits; propagates facts from loads with !range and from option niches, and from dominating compares and boundschecks.
-10. bce: bounds-check elimination. A boundscheck %i, %n is removed if range analysis proves 0 <= %i < %n. Loop-aware: for a counted loop with induction variable %i and bound %n where the array count %n' equals %n (same SSA value or proven equal), the checks inside the body are removed. Checks whose failure is certain become trap Bounds.
-11. dse: dead-store elimination (with alias model); dce: dead code elimination of pure and read instructions with no uses.
-Stage 4: loop optimization.
-12. licm: hoist loop-invariant pure and read instructions (never trap-effect ones unless dominated by an equivalent preceding check, A.7).
-13. indvars: canonicalize induction variables; strength reduction of address computation.
-14. unroll: full unroll for small constant trip counts; partial unroll for heuristics at opt>=2.
-15. fuse: pipeline fusion (below).
-16. vectorize: loop and SLP vectorization into <n x t> operations. Integer loops are vectorized whenever dependence analysis proves legality; floating-point reductions only under !fast (language spec 7.10). Trap-effect instructions in the loop body either prevent vectorization or are converted into a vector precheck.
-Stage 5: compression and reduction.
-17. pathcomp: Path Compression (defined below).
-18. ssared: SSA Reduction (defined below).
-19. tailcall: turn call; ret into tailcall when the callee ABI permits (or when @tail was requested; failure to satisfy @tail is an error).
-20. finalize: remove dead regions, renumber, assign final block order by weights (hot path fall-through), run the full verifier, then hand off to the backend (A.13).
-A.11.1 Pipeline fusion
-When a value of iterator type is produced by std.iter adapters and consumed by a !fusible consumer (sum, count, fold, any, all, find, collect_into, or a for loop), and all intermediate iterators are non-escaping allocas or SSA aggregates after inline and sroa, fuse rewrites the chain into one loop:
-1. each adapter's next has been inlined, so the chain is a nest of switch on option tags;
-2. fuse merges the producer loop and each adapter's state update into a single loop header with all state as block parameters;
-3. none branches are threaded directly to the loop exit (this uses pathcomp's jump-threading primitive);
-4. intermediate option<T> values never materialize because their tag tests were resolved on the path.
-The pass is required to succeed (language spec 7.5 conformance) for chains of adapters from std.iter over built-in sources; for user-defined iterators it applies when next is inlinable. If it fails, results are unchanged: fusion affects speed only.
-A.11.2 Path Compression (definition) [Decision]
-The overview names this optimization without defining it. Paracine defines it as follows.
-A path is a sequence of blocks connected by unconditional or provably-determined branches. Path Compression replaces each path of blocks whose intermediate decisions are determined by known values with a single shorter path, duplicating or merging blocks as needed, without changing observable behavior.
-Concretely it comprises four transformations, applied to a fixed point per function under a code-size growth cap (default 25% of the original function):
-1. Branch-to-branch collapse. br L1 where L1 is an empty block ending in br L2 becomes br L2; likewise for condbr whose target is a block that immediately branches on the same or a constant-determined condition.
-2. Known-value jump threading. If a predecessor P of block B passes a block argument whose value fixes the outcome of B's terminating condbr/switch (a constant, or a value with a !range that decides the test), redirect P directly to the chosen successor with the appropriate arguments, duplicating B's non-terminator instructions into a new block if B is entered from other paths. This is how option/result tag tests that were just constructed disappear.
-3. Cleanup-path trimming. An edge into a cleanup chain whose drop flags are known (constants on that edge) is rewritten to enter the chain at the first cleanup block that actually runs, skipping blocks whose guards are false.
-4. Tail merging. Identical suffixes of sibling blocks ending in the same terminator are merged (only for non-trap/io instructions with the same !loc-insensitive semantics), with the divergence carried in block parameters.
-It must not cross an effect-ordering boundary (A.7), must preserve reducibility (A.6), and must leave every !loc on a trapping instruction intact.
-A.11.3 SSA Reduction (definition) [Decision]
-SSA Reduction minimizes the number of SSA values and block parameters without changing meaning.
-1. Redundant parameter removal. A block parameter that receives the same value (or itself) along every incoming edge is replaced by that value (the SSA analogue of removing trivial phis).
-2. Copy and extract/insert folding. extract(insert(a, v, k), k) → v; chains of insert into the same aggregate become one construction; bitcast pairs cancel.
-3. Parameter narrowing. A parameter whose every incoming value comes from zext/sext of a narrower value is narrowed, with the extension moved after the block entry (or removed if all uses tolerate the narrow type by range facts).
-4. Live-range shortening. Instructions with a single use are sunk toward that use when this does not move a trap/io/sync instruction or increase register pressure estimates.
-5. Dead parameter removal. Parameters with no uses are removed from the block and from all incoming edges.
-SSA Reduction runs last in stage 5 so that the backend sees the smallest value graph.
-A.11.4 Pass legality summary
-Pass class
-May change
-Must not change
-Arithmetic (fold, sccp, gvn, range)
-which instruction computes a value
-the wrap/trap/saturation semantics of 5.6; floating results outside !fast
-CFG (simplifycfg, pathcomp, unroll)
-block structure and duplication
-effect order (A.7); reducibility; trap !loc
-Memory (mem2reg, sroa, dse, licm)
-which accesses exist
-!volatile, !atomic, !unsafe accesses; alias-model soundness
-Cleanup
-which cleanup blocks exist
-that every owned value is disposed exactly once on every path (4.7)
-Parallel (vectorize)
-lane structure
-semantics per lane; trap order for the first trapping lane in source order
-A.12 Textual form (example)
-Source:
-routine sum(xs: view<int>) gives int
-    var acc = 0
-    for x in xs
-        acc += x
-    give acc
-PCIR after construction (abridged):
-func @sum(%xs: {ptr, i64}) -> i32 {
-entry:
-  %p = extract %xs, 0
-  %n = extract %xs, 1
-  br loop(0:i64, 0:i32)
-loop(%i: i64, %acc: i32):
-  %c = icmp ult i64 %i, %n
-  condbr %c, body, exit(%acc)
-body:
-  boundscheck %i, %n                       !loc(sum.pcn:3)
-  %a = gep.elem %p, %i, i32
-  %v = load i32, %a !align 4 !own shared(R1)
-  %acc2 = add i32 %acc, %v
-  %i2 = add i64 %i, 1:i64
-  br loop(%i2, %acc2)
-exit(%r: i32):
-  ret %r
-}
-After range and bce, the boundscheck is removed because the loop condition %i < %n dominates it. After vectorize at opt=3, the loop is replaced by a vector loop plus scalar epilogue; integer add reassociation is legal because integer addition is exactly associative under wrapping semantics (5.6), which is why integer reductions vectorize without @fastmath.
-A.13 Interface to the backends
-Common contract. After finalize, PCIR is verifier-clean, monomorphic, and carries layout (A.3.1). Backends may read all metadata and may not modify PCIR; each runs on a private copy (this is how the three outputs of one build share one optimization result, overview §49).
-C++20 backend (backend/cxx20). Pipeline per overview §36: structured-region reconstruction → type translation → helper selection → expression/statement lowering → scope reconstruction → formatting.
-• Structuring. If the function has a complete, valid region tree, emit it directly: if, switch, while/for(;;) with break/continue. Otherwise run a restructuring algorithm for reducible CFGs (dominator-tree-based, with loop headers as for(;;) and exit-blocks as labeled breaks via a state variable only where required). Gotos are not emitted.
-• Values. Block parameters become local variables assigned before each branch. SSA values with one use are inlined into expressions; others become const locals with deterministic names.
-• Semantics. Every operation is emitted through helpers (pcn_add_i32, pcn_shl_i32, pcn_sdiv_i32, pcn_f2i_sat) or inline sequences that realize A.5 exactly; evaluation order is explicit (one operation per statement when order matters). Traps are pcn_trap(code, file, line) marked [[noreturn]].
-• Metadata. !align becomes alignas/__builtin_assume_aligned guarded by a feature macro; !own excl may become __restrict on parameters; !range/!nonnull become [[assume(...)]] only when the build opts into --cxx-assume.
-• Layout. Types are emitted with static_assert(sizeof(T) == N && alignof(T) == A) and one static_assert(offsetof(...)) per field from A.3.1.
-Native backend (backend/native, Part B). Takes the CFG (regions ignored), runs target legalization into PMIR, and does the rest. It uses !range, !align, !own, !weight, branch probabilities and !knownbits for instruction selection and scheduling.
-Serialization and versioning. PCIR has a canonical text form (as above, with a stable grammar) and a compact binary form (.pcir, used for LTO and for inter-process caching). Both start with pcir <major>.<minor>. A change that alters semantics of an existing instruction increments major; adding instructions or metadata increments minor. A compiler may read any file with the same major and equal or lower minor. The PCIR version is recorded in the reproducibility manifest (overview §50).
-A.14 Testing PCIR
-1. Verifier fuzzing: randomly generated PCIR checked against an independent reference interpreter.
-2. Reference interpreter: a direct small-step interpreter of A.5 following language spec 5.4 exactly, used as an oracle; every pass is tested by running the same input before and after it.
-3. Translation validation in CI: for sampled functions, symbolic equivalence of pre/post-pass PCIR using an SMT solver for integer and bit-vector operations.
-4. Golden tests for pcn ir --after=<pass> on a curated corpus, including the sum example above (bounds check gone; loop vectorized) and fusion cases of language spec 7.5.
-5. Differential end-to-end tests across .cpp and .exe (language spec 8.2 suite 5).
-Part B. Paracine Machine IR (PMIR) and Microsoft x64 lowering
-B.1 Role and stage order
-PMIR is the machine-level representation used by the direct-native backend for both .obj and .exe output (overview §6, §7, §37). It starts as a direct, one-to-few translation of PCIR into x86-64 machine instructions over virtual registers and ends as a sequence of encoded bytes with relocations.
-The overview lists the stages as: legalization, PMIR, instruction selection, scheduling, register allocation, frame construction, ABI lowering, encoding. In practice ABI lowering cannot wait until after register allocation, because argument and return registers constrain allocation. [Decision] ABI lowering therefore has two phases that together are the overview's "ABI lowering" stage:
-Phase
-When
-Does
-B-ABI-1 (call and entry lowering)
-during legalization
-assigns each parameter, argument, and result to a physical register or stack slot; inserts copies to/from pre-colored virtual registers; materializes by-reference copies and hidden return pointers
-B-ABI-2 (frame finalization)
-after register allocation
-chooses the final frame layout, emits prologue/epilogue, shadow space, saves of non-volatile registers, stack probes, and the unwind records
-Stage order used by this specification:
-PCIR (final)
-  -> target legalization (+ B-ABI-1)
-  -> PMIR in SSA form (virtual registers)
-  -> instruction selection
-  -> pre-RA scheduling
-  -> SSA destruction (parallel-copy sequentialization)
-  -> register allocation (+ spill code)
-  -> post-RA scheduling and peepholes
-  -> frame construction (B-ABI-2) and unwind-record construction
-  -> branch relaxation and encoding
-  -> sections + relocations (handed to Part C)
-B.2 Target profiles
-A target profile names OS, architecture, ABI, and CPU feature level. The Tier-1 profile is windows-x86_64-msx64.
-CPU level
-Required features
-Notes
-x86-64 (default)
-SSE2, CMPXCHG16B not assumed
-runs on every x86-64 Windows machine
-x86-64-v2
-+ SSE4.2, POPCNT, SSSE3
-popcnt, pblendv, roundsd available
-x86-64-v3
-+ AVX, AVX2, BMI1/2, FMA, LZCNT, MOVBE
-vfmadd, shlx, lzcnt, tzcnt, 256-bit vectors
-x86-64-v4
-+ AVX-512 F/BW/DQ/VL/CD
-masks, 512-bit vectors
-[Decision] The CPU level is chosen at build time (cpu = "x86-64-v3" in the profile, or --cpu=). The compiler does not emit runtime feature dispatch by itself; a routine may carry @multiversion("x86-64", "x86-64-v3"), which emits one body per level plus a resolver run once at start-up (through a cpuid probe in pcn_start) that fills a function-pointer slot. Code compiled for a level the machine lacks is a configuration error, not an emulated case. An optional tune = "<name>" selects the scheduling model (default: a generic modern-core model).
-Tier-1 invariants: 64-bit pointers; little-endian; size is 64-bit; the x87 FPU is never used; the MXCSR rounding mode is assumed to be round-to-nearest-even with flush-to-zero and denormals-are-zero both off (this is the Windows process default, and is required by language spec 5.6). Foreign code that changes these must restore them before returning (E-ABI documentation requirement, not enforced).
-B.3 PMIR structure
-machine_function  := name, abi, frame_info, machine_block+
-machine_block     := label, preds, succs (with probabilities), instr*, live_in*
-instr             := opcode  def_operands  use_operands  [implicit defs/uses]  flags
-operand           := vreg | physreg | imm | frame_index | symbol(+offset) | mem | label | cond_code
-mem               := base(vreg|rip|frame_index), index(vreg)*scale, disp(imm|symbol), segment?, size
-• Register classes: GR8 GR16 GR32 GR64, FR32 FR64 (scalar float in XMM), VR128 VR256 VR512, VK (AVX-512 mask), FLAGS (a single pseudo-register for EFLAGS, def/used implicitly by arithmetic and conditional instructions).
-• SSA in PMIR. Until SSA destruction, each virtual register has one definition; block parameters of PCIR become PMIR PHI pseudo-instructions. Tied operands express x86 two-address form: ADD32rr %d(tied-def), %a(tied-use), %b, where %d and %a must receive the same physical register; the allocator inserts a copy when %a is live after.
-• Opcodes are target instructions named by mnemonic and operand form (ADD32rr, ADD32rm, ADD32ri8, IMUL64rri32, MOVZX32rm8, LEA64r, CMOV32rr, JCC, SETCC, MOVSDrm, VFMADD231PDrr...). Every opcode record states: operand classes, implicit defs/uses (flags, RAX, RDX), side-effect class from PCIR's lattice (A.7), encoding templates, latency and throughput per tuning model, and whether it is commutable or foldable (memory-operand folding).
-• Memory operands carry the PCIR alias metadata (!own, alias class, !align, !volatile, !atomic) so scheduling and peephole passes keep using the sound alias model.
-• Frame indexes name stack objects (locals, spill slots, outgoing-argument area, incoming-argument area) until B-ABI-2 assigns offsets.
-B.4 Legalization
-Legalization rewrites PCIR into forms the target can select directly:
-1. Integer widths. i1 becomes an 8-bit register value (0 or 1) or a flags-resident condition when immediately consumed by a branch or select. i8/i16 arithmetic is performed in 32-bit registers with explicit zero- or sign-extension only where a later use needs defined upper bits (instruction selection tracks "known extended" facts to remove redundant extensions). Operations on i128 (not source-visible; arises only from mul.ovf.u64 lowering) are expanded to two-register sequences.
-2. Division and remainder. sdiv/srem and udiv/urem get explicit guards; see B.5.
-3. Shifts and rotates. The x86 shift count is masked to 5 bits for 8/16/32-bit operands and 6 bits for 64-bit. PCIR requires n & (w-1). Therefore: for i32 and i64, a variable shift maps directly (and SHLX/SHRX/SARX under BMI2 avoid the CL constraint); for i8 and i16 the legalizer inserts AND ecx, w-1 (or promotes to 32 bits with a prior mask and later narrowing).
-4. Aggregates. Struct-typed SSA values are split into scalars; aggregates in memory use field offsets from the PCIR layout (A.3.1). memcpy/memset of constant small size expands to moves.
-5. Floating point. f32/f64 map to scalar SSE (ADDSS, ADDSD, ...); fabs is ANDPS with a constant mask, fneg is XORPS with the sign mask, fcopysign combines the two; sqrt is SQRTSS/SD; fma is VFMADD* when the CPU level has FMA, otherwise a call to pcn_fma_f64/_f32 (a correctly rounded software implementation) so results never differ between levels.
-6. Conversions. Detailed in B.5.
-7. Constants. Integer immediates that do not fit the instruction form (e.g. 64-bit constants in ALU instructions) are materialized with MOV64ri. Floating constants live in .rdata and are loaded RIP-relative; 0.0 is XORPS reg, reg; all-ones masks use PCMPEQD.
-8. Vectors. <n x t> wider than the CPU level supports are split; masks (<n x i1>) become XMM/YMM lane masks (pre-AVX-512) or VK registers.
-9. ABI phase 1 (B.8).
-B.5 Instruction selection
-Selection works per block on a dependency DAG built from PMIR-ready PCIR, using declarative pattern tables (cost-ordered). A pattern replaces a DAG fragment with one or more machine instructions and states constraints (CPU feature, operand ranges, flag liveness). The covering algorithm is greedy by cost with tie-break on code size. Patterns must preserve PCIR semantics exactly, including at the extremes; the table below lists the non-obvious ones.
-PCIR
-x86-64 lowering
-Notes
-add/sub T
-ADD/SUB; LEA for 3-operand add or add-imm into a different register; INC/DEC not used (partial flags)
-wrapping is native
-mul T
-IMUL r, r/m (low half identical for signed and unsigned); LEA/shift for constants 2^k, 3, 5, 9 and sums
-
-sdiv i32 a, b
-see below
-exact semantics
-udiv i32 a, b
-TEST b,b; JE trap_div0; XOR edx,edx; DIV b
-skip test if !range(b) excludes 0
-shl/lshr/ashr
-SHL/SHR/SAR r, imm (imm masked at compile time) or by CL; BMI2 SHLX/SHRX/SARX
-B.4 item 3
-rotl/rotr
-ROL/ROR (RORX under BMI2)
-
-popcnt/clz/ctz
-POPCNT, LZCNT/TZCNT (v3); otherwise BSR/BSF plus a zero-input fixup so that clz(0)=w, ctz(0)=w; POPCNT absent at x86-64 becomes a table-free bit-twiddling sequence
-exact semantics at 0
-icmp + condbr
-CMP/TEST + Jcc; macro-fusion adjacency preserved
-
-select
-CMOVcc when both arms are already computed and cheap; branchy form if one arm would trap or has high latency
-
-add.ovf.s
-ADD + SETO; .u: ADD + SETC
-one flag read
-mul.ovf.u64
-MUL + SETO
-RDX:RAX
-boundscheck i, n
-CMP i, n; JAE trap_bounds_k
-unsigned compare also rejects negative i; one shared cold stub per (function, loc)
-sitofp
-CVTSI2SD/SS with a preceding XORPS to break the false dependency
-
-uitofp i32
-zero-extend to 64 then CVTSI2SD; uitofp i64: branch on sign bit (halve-with-sticky-bit, convert, double), or VCVTUSI2SD at v4
-exact round-to-nearest-even
-fptosi.sat
-see below
-exact saturating semantics
-fcmp
-UCOMISD/SS then flags decode, with parity check for oeq/une/ordered predicates; ord/uno via UCOMISD x,x-style parity test
-see below
-atomic.load (any order)
-plain MOV
-x86-TSO provides acquire; seq_cst loads need no fence when stores are made strong
-atomic.store relaxed/release
-plain MOV
-
-atomic.store seq_cst
-XCHG [m], r
-implies LOCK
-atomic.rmw add/sub
-LOCK XADD (value needed) or LOCK ADD/SUB (value unused)
-
-atomic.rmw and/or/xor
-LOCK AND/OR/XOR if old value unused; else CAS loop
-
-atomic.rmw xchg
-XCHG [m], r
-
-atomic.rmw min/max
-CMPXCHG loop
-
-atomic.cmpxchg
-LOCK CMPXCHG (CMPXCHG16B only with an explicit 16-byte feature, not default)
-RAX pre-colored
-fence seq_cst
-LOCK OR dword ptr [rsp], 0 or MFENCE (profile choice; default LOCK OR)
-
-fence acquire/release/acq_rel
-no instruction (compiler barrier only)
-
-memcpy n (known small)
-MOV pairs / MOVUPS / VMOVDQU
-
-memcpy n (large or unknown)
-REP MOVSB when ERMS is assumed (v3+ default off; profile flag) else call pcn_rt_memcpy
-
-trap code
-MOV ecx, code; LEA rdx, [rip+loc]; CALL pcn_rt_trap then UD2
-pcn_rt_trap is noreturn
-Signed division (exact semantics: trap on 0, MIN / -1 = MIN, MIN % -1 = 0). x86 IDIV raises #DE both for a zero divisor and for MIN / -1, so both must be handled before the instruction:
-    test   ecx, ecx
-    je     .Ltrap_div0
-    cmp    ecx, -1
-    je     .Lneg            ; divisor is -1: result = -a (wraps: MIN stays MIN); remainder = 0
-    cdq
-    idiv   ecx
-    jmp    .Ldone
-.Lneg:
-    neg    eax               ; quotient
-    xor    edx, edx          ; remainder
-.Ldone:
-Both guards are omitted when range facts exclude the case (!range of the divisor excludes 0 and/or -1, or the divisor is a constant other than 0, -1). Division by a constant power of two uses a shift sequence with sign correction; division by other constants uses the multiply-high reciprocal method with correction, verified at compile time against the exact definition.
-Saturating float-to-int (fptosi.sat.i32 from f64 in XMM0, result EAX), with MIN=-2^31, MAX=2^31-1:
-    cvttsd2si eax, xmm0          ; yields 0x80000000 on NaN or out-of-range
-    ucomisd   xmm0, [rip+.Lmaxf]  ; compare with 2147483647.0
-    jae       .Lsat_max           ; x >= MAX  -> 0x7FFFFFFF  (unordered sets CF=1,PF=1,ZF=1; handled next)
-    ucomisd   xmm0, xmm0
-    jp        .Lnan               ; NaN -> 0
-    jmp       .Ldone              ; otherwise cvttsd2si result is right (MIN included)
-.Lsat_max: mov eax, 0x7FFFFFFF
-    jmp .Ldone
-.Lnan:    xor eax, eax
-.Ldone:
-The jae after UCOMISD is taken for unordered operands as well (CF=1 means below or unordered on Intel/AMD, so JAE is not taken when CF=1; the sequence tests unordered next via JP). The exact flag logic is generated from a table and checked by exhaustive tests over all f32 bit patterns for the 32-bit case and by randomized plus edge-case testing for f64 and 64-bit targets. At v4, VCVTTSD2SI with embedded rounding and VFIXUPIMMSD can implement the same semantics branch-free.
-Float comparison. With UCOMISD a, b: unordered sets ZF=PF=CF=1; a<b sets CF=1; a>b clears all; a=b sets ZF=1. Hence: ogt = ja; oge = jae (CF=0, which is false when unordered because CF=1); olt/ole swap the operands and use ja/jae; oeq = jne .false; jp .false; une = jne .true; jp .true; one = jne with jnp; ord = jnp; uno = jp. All other predicates derive from these by inversion.
-B.6 Scheduling and peepholes
-• Pre-RA scheduling is a per-block list scheduler on the dependency DAG with latencies from the tuning model. It respects PCIR's effect order (A.7), keeps compare/branch pairs adjacent for macro-fusion, and bounds register-pressure growth by switching to a pressure-reducing heuristic when the estimated live count nears the allocatable set size.
-• Post-RA scheduling runs once spilled code exists, limited to local reordering of independent loads and stores and to hiding load-use latency.
-• Peepholes (run after RA and again after relaxation): MOV r,0 → XOR r32,r32 (when flags are dead); CMP r,0 → TEST r,r; use 32-bit forms where the upper half is dead (smaller encoding, zero-extends implicitly); remove MOV r,r copies; fold a load into the consuming ALU instruction (ADD r, [m]) when the loaded register is otherwise dead and the memory effect order allows; convert LEA chains; branch inversion to favor fall-through using block weights; JMP to JMP.
-• Alignment. Loop headers of hot loops (by !weight) are aligned to 16 bytes with multi-byte NOPs; function entries are aligned to 16 bytes; a jump-heavy block never starts within the last 1 byte of a 32-byte window if the tuning model reports the JCC erratum penalty (opt-in tune).
-• AVX hygiene. Any function that executes a 256- or 512-bit VEX/EVEX instruction emits VZEROUPPER before every CALL to non-Paracine code and before RET (this avoids the SSE/AVX transition penalty in callers that use legacy SSE).
-B.7 Register allocation
-Registers. Allocatable GPRs: RAX RCX RDX RBX RSI RDI R8 R9 R10 R11 R12 R13 R14 R15 (and RBP when no frame pointer is required; RSP never). Allocatable vector registers: XMM0-15 (XMM16-31 at v4). Reserved: RSP; RBP when it is the frame pointer. No register is reserved for a thread or runtime pointer (thread data is reached through GS: segment accesses to the TEB, used only by runtime routines).
-Class
-Volatile (caller-saved)
-Non-volatile (callee-saved)
-GPR
-RAX RCX RDX R8 R9 R10 R11
-RBX RBP RDI RSI RSP R12 R13 R14 R15
-XMM (low 128 bits)
-XMM0-XMM5
-XMM6-XMM15
-YMM upper halves, ZMM, XMM16-31, K masks
-all volatile
-none
-Flags
-DF must be clear at calls and returns; arithmetic flags volatile
-
-Algorithm. A split-greedy allocator, in the style of linear-scan-with-splitting but driven by priority: (1) compute live intervals over SSA-destructed PMIR; (2) assign priorities by spill weight (loop-depth-weighted use density from !weight); (3) process intervals highest priority first, choose a free register honoring hints (copy partners, tied operands, ABI pre-colors); (4) if none, try eviction of lower-weight intervals, then splitting around loop boundaries and calls (intervals live across a call prefer non-volatile registers; if none are available the interval is split around the call), then spilling; (5) after assignment, rewrite virtual registers, insert spill/reload code with rematerialization where cheap (constants, addresses of globals and frame objects, loads from .rdata), then coalesce remaining copies. At opt=1 the allocator is replaced by a faster linear-scan variant with no splitting; both obey the same constraints, so behavior is identical.
-Constraints modeled as pre-colored registers or register hints: IDIV/DIV and MUL use RAX/RDX; variable shifts use CL (unless BMI2); CMPXCHG uses RAX; string moves use RSI/RDI/RCX; calls clobber the volatile set (modeled as a regmask on the CALL); two-address instructions use tied operands (B.3); 8-bit register operands must avoid AH/BH/CH/DH conflicts with REX-requiring registers (the allocator never uses the high-byte registers).
-Spill slots are frame indexes sized and aligned by class (8 bytes GPR, 16 bytes vector, 32/64 for wider). Slots whose live ranges do not overlap are shared (stack coloring), using PCIR's lifetime.start/end markers and the allocator's own intervals.
-B.8 Microsoft x64 ABI lowering (B-ABI-1)
-This section states the rules the backend implements for every routine and call that crosses the external boundary (exported routines, foreign declarations, routine pointers whose address escapes, and the entry point). It follows the public Microsoft x64 calling convention as I know it; [Verify] every item against the current Microsoft documentation before implementation.
-B.8.1 Argument passing
-• Arguments are assigned by position, left to right. Position i (0-based, first four) uses the i-th register of the integer sequence RCX, RDX, R8, R9 if the argument is an integer, pointer, or small aggregate, or the i-th register of XMM0, XMM1, XMM2, XMM3 if it is float or double. The two sequences share the same position counter: a double as the second argument occupies XMM1, and RDX is then unused.
-• Arguments after the fourth go on the stack, each in its own 8-byte slot at [RSP + 32 + 8*(i-4)] relative to the caller's RSP at the call instruction (above the 32-byte shadow space).
-• Integers narrower than 64 bits are passed in the low bits of the register; the upper bits are unspecified (callee must not assume extension) and the callee extends as needed. Paracine as a caller always passes bool, char, byte, short, int values with defined zero/sign extension to 32 bits (harmless, helps some foreign callees), and as a callee never relies on the upper bits of such arguments.
-• Aggregates (records, tuples, views, spans, text): if the size is exactly 1, 2, 4 or 8 bytes the value is passed in a register as if it were an integer of that size (even if its fields are floating point). For every other size (including 3, 5, 6, 7 and anything above 8 bytes, e.g. a view<T> or text at 16 bytes) the caller makes a copy in its own frame and passes a pointer to the copy in the integer register or stack slot. The callee owns that copy for the duration of the call, so it may modify it.
-• Vector values (vec<T,N>, 128-bit and larger) are passed by reference like other large aggregates under the plain Microsoft x64 convention.
-• Shadow space: the caller always reserves 32 bytes immediately above the return address's slot (at [RSP .. RSP+31] at the call), whether or not the callee has four register parameters. The callee may use it to spill RCX, RDX, R8, R9 (their "home" slots) or as scratch. A leaf routine that makes no calls need not reserve shadow space for its own callees, but must still treat the area its caller provided as writable by itself.
-• Variadic calls (foreign c routine printf(fmt: raw<ubyte>, ...); this requires the small grammar amendment param_list = param { ',' param } [ ',' '...' ] in foreign_decl only): floating-point arguments among the first four positions are passed in the XMM register and duplicated in the corresponding integer register. The callee's argument-spill logic depends on this.
-B.8.2 Return values
-Result type
-Location
-integer or pointer up to 64 bits, bool, char
-RAX (upper bits unspecified for narrow types)
-float, double
-XMM0
-aggregate of size exactly 1, 2, 4 or 8
-RAX
-any other aggregate (including views and text)
-hidden pointer: the caller passes the address of a result buffer as an extra first argument in RCX (shifting all other arguments by one position), and the callee returns that same address in RAX
-128-bit vector
-XMM0
-void, never
-none
-B.8.3 Registers across calls
-See the table in B.7. In addition: the direction flag is clear on entry to and return from every routine; the stack pointer is 16-byte aligned at the call instruction (so RSP is 8 mod 16 on entry to a callee); the callee must restore every non-volatile register it modifies; the caller cleans up all stack arguments (in practice the frame reserves the outgoing area once). There is no red zone: nothing may be stored below RSP.
-B.8.4 The internal convention [Decision]
-The plain convention passes 16-byte views by reference through memory, which costs stores and loads on every call of the very common view<T>/text routines. Because the language never exposes machine addresses of non-exported routines, the backend may use a faster convention for them without changing observable behavior (language spec 5.11).
-A routine uses the internal convention (pcn) iff it is not exported, its address is never taken, and it is not called through a routine pointer or from foreign code. Otherwise it uses msx64. The internal convention is enabled at opt >= 2:
-• Integer-class arguments (including each 8-byte half of a larger aggregate, split by field boundaries; so a view<T> is two registers) use, in order, RCX, RDX, R8, R9, R10, R11, RAX-free subset: RCX RDX R8 R9 R10 R11. Float-class arguments use XMM0–XMM5. Position is not shared; each class counts separately. Any remaining arguments go on the stack at [RSP + 8*k] with no shadow space.
-• Aggregates up to 32 bytes are passed split into scalars; larger ones by reference to a caller-owned copy.
-• Results: up to two integer-class values in RAX, RDX; up to two float-class values in XMM0, XMM1; larger results through a hidden pointer in RAX-less form: the pointer is the first integer argument in RCX, and the callee does not need to return it.
-• Volatile/non-volatile sets are identical to the Microsoft x64 convention, so an internal routine can be called from an msx64 stub and vice versa without extra saves.
-• The stack alignment rule is the same. Every routine, internal or not, has full Windows unwind data (B.9).
-When an exported routine has an internal body (it takes a view or returns a record, say), the compiler emits the body with the internal convention and an ABI thunk with the msx64 signature that loads the by-reference arguments into registers and tail-jumps to the body. If the body is small, it is inlined into the thunk.
-B.9 Frame construction and unwind data (B-ABI-2)
-B.9.1 Layout
-higher addresses
-  +------------------------------+
-  |  caller's frame / its outgoing|  <- includes the shadow space + stack args
-  |  argument area                |
-  +------------------------------+
-  |  return address               |  <- RSP at function entry (8 mod 16)
-  +------------------------------+
-  |  pushed non-volatile GPRs     |  (push in a fixed order: RBP, RBX, RSI, RDI, R12-R15)
-  +------------------------------+
-  |  alignment padding            |
-  +------------------------------+
-  |  saved non-volatile XMM regs  |  (16-aligned, via MOVAPS)
-  +------------------------------+
-  |  locals, spill slots, allocas |
-  +------------------------------+
-  |  outgoing argument area       |  shadow space (32 B) + stack args; 16-aligned at its end
-  +------------------------------+  <- RSP after the prologue
-lower addresses
-Rules. (1) All stack adjustment happens in the prologue: RSP is constant throughout the body (no push/pop inside the body), so every address is RSP-relative and unwind data is static. (2) The frame size is chosen so that RSP is 16-byte aligned after the prologue. (3) The outgoing-argument area is sized for the maximum number of stack arguments over all calls in the routine plus 32 bytes of shadow space, omitted if the routine is a leaf. (4) A frame pointer (RBP) is established only if the routine uses alloca with a dynamic count, has an object aligned above 16 bytes, or carries @frame_pointer; then LEA RBP, [RSP + off] (with off a multiple of 16 and at most 240) follows the allocation, and all locals are RBP-relative or RSP-relative as the unwind data allows. (5) A stack probe is required for frames of 4096 bytes or more: the prologue calls __chkstk (provided by the runtime object pcn_rt with the Windows-compatible contract: RAX = frame size in bytes; it touches each page in descending order and preserves all registers except R10, R11 and the flags) before SUB RSP, RAX. [Verify] the exact __chkstk contract. (6) Large frames also set SizeOfProlog and the unwind codes accordingly.
-B.9.2 Prologue and epilogue shapes required by Windows unwinding
-Windows x64 requires that the prologue and epilogue be one of a small set of recognizable shapes, because the unwinder interprets the epilogue by pattern when it must unwind from inside it.
-Prologue, in this order:
-1. optional PUSH of non-volatile GPRs (any order, recorded in the unwind codes);
-2. one stack allocation: SUB RSP, imm (or LEA RSP, [RSP-imm], or the __chkstk form);
-3. optional LEA RBP, [RSP+off] (frame pointer);
-4. optional MOV [RSP+off], reg for non-volatile GPR saves (SAVE_NONVOL) and MOVAPS [RSP+off], XMMn for XMM saves (SAVE_XMM128);
-5. then the body.
-Epilogue (every return path):
-1. ADD RSP, imm or LEA RSP, [RBP+imm] (undoes step 2 and 3 of the prologue);
-2. POP of the pushed registers in reverse order;
-3. RET, or a tail JMP (JMP rel32, JMP [rip+disp32], or REX.W JMP r/m64).
-No other instruction may appear between the first epilogue instruction and the RET, except the register restores that are recognized as part of the epilogue. Tail calls are implemented as epilogue + JMP, so they are also unwindable.
-B.9.3 Unwind records
-For every function the frame builder produces an abstract unwind record: the code offset ranges, the prologue size, the frame register (if any), and the ordered list of codes. Part C serializes them into .xdata/.pdata. Summary of the unwind operations used by Paracine (numbers per the Windows x64 unwind format, [Verify]):
-Code
-Value
-Used for
-UWOP_PUSH_NONVOL
-0
-PUSH of a non-volatile GPR
-UWOP_ALLOC_LARGE
-1
-SUB RSP, imm with size 136 bytes to 512K−8 (16-bit form) or up to 4GB−8 (32-bit form)
-UWOP_ALLOC_SMALL
-2
-SUB RSP, imm of 8 to 128 bytes
-UWOP_SET_FPREG
-3
-establishing the frame register
-UWOP_SAVE_NONVOL / _FAR
-4 / 5
-MOV [RSP+off], reg (near/far offsets)
-UWOP_SAVE_XMM128 / _FAR
-8 / 9
-MOVAPS [RSP+off], XMMn
-UWOP_PUSH_MACHFRAME
-10
-not generated by Paracine (hardware-interrupt frames)
-Paracine has no exceptions in the language, so unwind data exists for three purposes: (1) stack walks by debuggers, profilers, and crash handlers; (2) correct behavior of the Windows structured-exception machinery when a hardware fault (access violation, stack overflow, illegal instruction from UD2 after a trap stub) propagates out of the program; (3) interop with foreign code that expects to walk Paracine frames. The runtime installs a vectored exception handler in pcn_start that maps stack-overflow and UD2 faults to the StackExhausted and Unreachable traps (language spec 5.10) and then calls the program's trap handler.
-B.10 Code model, addressing and relocations
-• Small code model. All code and data of an image lie within 2 GiB, so code addresses data and other code RIP-relatively with 32-bit displacements. Direct calls are CALL rel32; data references are [rip + sym].
-• Imports. A call to an imported function is CALL [rip + __imp_Name] (an indirect call through the import address table); LEA of an imported function's address loads from the same slot. Delay-load is a linker option (Part C).
-• Image base independence. Executables default to DYNAMICBASE with high-entropy ASLR, so the code is position-independent: no absolute 32-bit address appears in code. Absolute 64-bit addresses appear only in data (tables of routine pointers, relocated by base relocations, Part C).
-• Switch tables. switch with at least 5 dense cases lowers to a jump table in .rdata of 32-bit image-relative offsets (ADDR32NB relocations): LEA rdx, [rip+table]; MOV eax, [rdx+idx*4]; LEA rcx, [rip+__ImageBase]; ADD rax, rcx; JMP rax. Sparse cases lower to a binary search of compares.
-• Relocation kinds used (COFF IMAGE_REL_AMD64_*, Part C): REL32 (call/branch/RIP-relative data), ADDR64 (64-bit data pointers), ADDR32NB (image-relative RVAs in tables and unwind data), SECTION/SECREL (debug info), REL32_n forms are not used (the compiler computes the trailing-immediate adjustment itself, or uses REL32 plus an addend).
-• Alignment of data: .rdata constants are aligned to their natural alignment, vector constants to 16 bytes.
-B.11 Branch relaxation and encoding
-• Branch relaxation. Every branch starts as the short form (rel8) if the target is in the same function and the distance is not yet known to exceed 127 bytes; layout then iterates: assign offsets, convert out-of-range short branches to rel32, repeat until no branch changes (monotone, so it terminates). Cross-function and cross-section references always use rel32 with a relocation.
-• Encoder. Table-driven: for each opcode form, a template (legacy prefixes, REX, VEX/EVEX, opcode map, ModRM and SIB rules, displacement and immediate sizes). Selection among equivalent encodings prefers: shortest; disp8 when the displacement fits; no REX when no extended or 64-bit operand; RIP-relative with disp32 always for symbols. Addressing special cases (RSP/R12 as base need a SIB; RBP/R13 as base with no displacement need disp8 = 0) are covered by table tests.
-• Integrated disassembly. pcn asm and pcn obj --listing print assembly decoded from the final bytes (a separate decoder), not from PMIR, so a mismatch between intended and encoded instructions is visible. The encoder and the decoder are tested against each other for every opcode form with randomized operands.
-• Relocations. Each fixup is recorded as (section, offset, symbol, type, addend) and handed to Part C.
-B.12 Textual PMIR and a complete example
-For the sum routine of the PCIR example (language spec routine sum(xs: view<int>) gives int), if the routine is not exported (internal convention; the view arrives in RCX, RDX):
-machine_function @sum  abi=pcn  frame={leaf}
-bb0:
-  %p:gr64   = COPY $rcx
-  %n:gr64   = COPY $rdx
-  %i:gr64   = MOV64r0               ; zero idiom
-  %acc:gr32 = MOV32r0
-  JMP bb1
-bb1:                                  ; loop header, weight 1000
-  %i1:gr64 = PHI [%i, bb0], [%i2, bb2]
-  %a1:gr32 = PHI [%acc, bb0], [%a2, bb2]
-  CMP64rr %i1, %n, implicit-def $eflags
-  JCC cond=ae, bb3, implicit $eflags
-bb2:
-  %a2:gr32 = ADD32rm %a1(tied), %p, scale=4, index=%i1, disp=0   ; load folded, !own shared
-  %i2:gr64 = ADD64ri8 %i1(tied), 1
-  JMP bb1
-bb3:
-  $eax = COPY %a1
-  RET implicit $eax
-Final code after register allocation and encoding (generic CPU level):
-sum:
-    xor   eax, eax            ; acc
-    xor   r8d, r8d            ; i
-    jmp   .Lcheck
-    align 16
-.Lbody:
-    add   eax, dword ptr [rcx+r8*4]
-    inc   r8                  ; (ADD r8, 1 where flags/stall policy forbids INC)
-.Lcheck:
-    cmp   r8, rdx
-    jb    .Lbody
-    ret
-If the same routine is exported, the thunk with the plain Microsoft x64 convention (the view arrives by reference in RCX) is:
-sum:                              ; msx64 thunk
-    mov   rdx, qword ptr [rcx+8]  ; count
-    mov   rcx, qword ptr [rcx]    ; pointer
-    jmp   sum$body                ; body uses the internal convention
-B.13 Debug information
-The native backend emits CodeView records (.debug$S symbols and line tables, .debug$T types) in objects and produces a .pdb through Paracine's own PDB writer (MSF container with DBI, TPI, IPI and symbol streams). Variable locations are derived from final register assignments and spill slots, with location ranges per live range. The PDB writer's file-format details are outside this document and need a separate specification. -g0 omits all debug data; -g1 emits line tables only; -g2 emits full variable information.
-B.14 Machine verification and testing
-1. Machine verifier (runs after every PMIR phase in debug builds): operand register classes valid; each tied pair assigned identical registers after RA; every use dominated by a def (pre-RA SSA) or reached by a live def (post-RA); EFLAGS not live across an instruction that clobbers it; frame indexes resolved after B-ABI-2; stack alignment is 16 bytes at every CALL; callee-saved registers restored on every RET path; prologue and epilogue match the shapes of B.9.2; unwind codes reproduce the prologue effect when simulated.
-2. Semantic tests. Every PCIR test program (Part A, A.14) is run through the native backend and compared with the PCIR reference interpreter. Operator tables of B.5 are tested exhaustively on small widths and by random plus edge sampling on wide ones (including MIN / -1, shifts by 0 and by ≥ w, NaN, ±0, saturation boundaries).
-3. ABI conformance. A matrix of C and C++ test programs compiled with MSVC and Clang-cl calls Paracine exports and is called by them across all argument-class combinations of B.8 (sizes 1–32 bytes, floats in mixed positions, 5+ arguments, variadics, hidden-pointer returns, large aggregates), checking values and register preservation.
-4. Unwinder tests. RtlVirtualUnwind on frames captured at every instruction of generated prologues/epilogues, comparing the recovered RSP/RIP with the expected values; tests with huge frames, frame pointers, XMM saves, and tail calls.
-5. Allocator stress. Randomized programs with up to thousands of live values, checked against the PCIR interpreter; forced-spill mode (artificially few registers) must produce identical results.
-6. Cross-platform CI. On non-Windows CI hosts the produced code is executed under an x86-64 emulator using a Windows-ABI shim; this validates codegen but not OS interaction.
-Part C. COFF object writer, archives, linker and PE32+ writer
-C.1 Components and data flow
-PMIR encoder output
-   (sections, symbols, relocations, unwind records, debug records)
-        |
-        v
-  in-memory object model  ---------------------->  COFF writer  ---->  program.obj
-        |
-        |  (for .exe / .dll builds, the same object model, plus inputs read from disk)
-        v
-  linker: load inputs -> resolve -> COMDAT -> GC -> merge -> layout
-          -> imports/exports -> relocate -> base relocs -> unwind table -> headers
-        |
-        v
-    PE32+ writer  ------------------------------>  program.exe / program.dll
-The object model is the single interchange structure inside the compiler: the .obj path serializes it, the .exe path links it directly without a round trip through disk (although --save-temps can write the intermediate .obj for inspection, and the result must be identical). Standalone pcn link reads .obj and .lib files from disk into the same model, so the two paths use the same code.
-Numeric constants in this part follow the published Microsoft PE/COFF specification as I know it; values marked [Verify] deserve a check against the current document. Everything is little-endian.
-C.2 The in-memory object model
-object   := name, machine, sections[], symbols[], directives[], flags
-section  := name, characteristics, alignment, data (bytes | zero-fill size),
-            relocations[], comdat?, associated_with?, order_key
-symbol   := name, section | undefined | absolute | debug, value (offset), type (function | data),
-            storage (external | static | weak_external | label | file | section),
-            aux (section_def | weak_ext | file_name)
-reloc    := offset_in_section, symbol, type, addend
-comdat   := selection (any | same_size | exact_match | largest | no_duplicates | associative), leader_symbol
-Addends are kept explicit in the model (reloc.addend). COFF stores addends in the section bytes, not in the relocation record, so the writer patches the addend into the bytes at the fixup position when it serializes (and the reader extracts them back).
-C.3 COFF object file format
-C.3.1 Layout of an .obj file
-+-----------------------------+
-| COFF file header (20 bytes) |
-+-----------------------------+
-| section headers (40 each)   |
-+-----------------------------+
-| section raw data            |   (each aligned as the writer chooses; 4-byte alignment recommended)
-| relocations (10 each)       |   (immediately after each section's data)
-+-----------------------------+
-| COFF symbol table (18 each) |
-+-----------------------------+
-| string table                |   (first 4 bytes = total size including these 4 bytes)
-+-----------------------------+
-File header (20 bytes): Machine u16 = 0x8664 (AMD64); NumberOfSections u16; TimeDateStamp u32 = 0 (reproducibility, C.12); PointerToSymbolTable u32; NumberOfSymbols u32; SizeOfOptionalHeader u16 = 0; Characteristics u16 = 0.
-Section header (40 bytes): Name[8] (names longer than 8 bytes are written as /n with n the decimal offset into the string table); VirtualSize u32 = 0; VirtualAddress u32 = 0; SizeOfRawData u32; PointerToRawData u32 (0 for zero-fill sections); PointerToRelocations u32; PointerToLinenumbers u32 = 0; NumberOfRelocations u16; NumberOfLinenumbers u16 = 0; Characteristics u32.
-Section characteristics used (bit values, [Verify]):
-Flag
-Value
-Meaning
-IMAGE_SCN_CNT_CODE
-0x00000020
-contains code
-IMAGE_SCN_CNT_INITIALIZED_DATA
-0x00000040
-initialized data
-IMAGE_SCN_CNT_UNINITIALIZED_DATA
-0x00000080
-zero-fill
-IMAGE_SCN_LNK_INFO
-0x00000200
-linker directives (.drectve)
-IMAGE_SCN_LNK_REMOVE
-0x00000800
-not copied to the image
-IMAGE_SCN_LNK_COMDAT
-0x00001000
-COMDAT section
-IMAGE_SCN_ALIGN_{1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192}BYTES
-0x00100000 ... 0x00E00000 (in steps of 0x00100000)
-alignment 2^(n-1)
-IMAGE_SCN_LNK_NRELOC_OVFL
-0x01000000
-more than 65,535 relocations (count held in first reloc)
-IMAGE_SCN_MEM_DISCARDABLE
-0x02000000
-may be discarded after load
-IMAGE_SCN_MEM_EXECUTE
-0x20000000
-executable
-IMAGE_SCN_MEM_READ
-0x40000000
-readable
-IMAGE_SCN_MEM_WRITE
-0x80000000
-writable
-Standard Paracine sections:
-Section
-Content
-Flags
-.text$mn
-hot code (per-function COMDAT sections at opt >= 1)
-code, exec, read, align 16
-.text$x
-cold stubs: trap stubs, rarely executed paths
-code, exec, read, align 16
-.text$thunk
-ABI thunks and import thunks
-code, exec, read, align 16
-.rdata, .rdata$str
-constants, string literals, jump tables, float constants
-init data, read, align per constant
-.data
-initialized mutable statics
-init data, read, write
-.bss
-zero-initialized statics
-uninit data, read, write
-.pdata
-RUNTIME_FUNCTION entries
-init data, read, align 4
-.xdata
-UNWIND_INFO blobs
-init data, read, align 4
-.tls$
-thread-local template data
-init data, read, write
-.drectve
-linker directives (text)
-`LNK_INFO
-.debug$S, .debug$T
-CodeView symbols and types
-init data, read, discardable, align 1
-Typical full flag words: .text = 0x60500020; .rdata = 0x40300040/0x40400040; .data = 0xC0400040; .bss = 0xC0400080; .pdata/.xdata = 0x40300040; .drectve = 0x00100A00; .debug$S = 0x42100040 (with the alignment bits chosen per section). [Verify]
-C.3.2 Relocations
-10-byte records: VirtualAddress u32 (offset of the fixup within the section), SymbolTableIndex u32, Type u16. Types used by Paracine for AMD64 ([Verify]):
-Type
-Value
-Computation (S = symbol address, A = addend in bytes, P = fixup address)
-Used for
-IMAGE_REL_AMD64_ABSOLUTE
-0
-ignored
-padding
-IMAGE_REL_AMD64_ADDR64
-1
-64-bit S + A (virtual address)
-pointers in data
-IMAGE_REL_AMD64_ADDR32
-2
-32-bit VA (not used: not PIC)
-not emitted
-IMAGE_REL_AMD64_ADDR32NB
-3
-32-bit S + A - ImageBase (RVA)
-.pdata, .xdata, switch tables
-IMAGE_REL_AMD64_REL32
-4
-32-bit S + A - (P + 4)
-calls, jumps, RIP-relative data
-IMAGE_REL_AMD64_REL32_1 ... _5
-5-9
-S + A - (P + 4 + n)
-RIP-relative with n trailing immediate bytes (Paracine instead emits REL32 with an adjusted addend)
-IMAGE_REL_AMD64_SECTION
-10
-16-bit section index of S
-debug info
-IMAGE_REL_AMD64_SECREL
-11
-32-bit offset of S within its section
-debug info, TLS offsets
-A section with more than 65,535 relocations sets LNK_NRELOC_OVFL, stores the real count in the first relocation's VirtualAddress field, and the writer sets NumberOfRelocations = 0xFFFF.
-C.3.3 Symbol table
-Each entry is 18 bytes: Name[8] (if the name is at most 8 bytes it is inline, zero-padded; otherwise the first 4 bytes are zero and the next 4 bytes are an offset into the string table); Value u32; SectionNumber i16 (1-based index; 0 = undefined external; -1 = absolute; -2 = debug); Type u16 (0x20 for functions, 0 otherwise); StorageClass u8; NumberOfAuxSymbols u8.
-Storage classes used: IMAGE_SYM_CLASS_EXTERNAL (2), STATIC (3), LABEL (6), FILE (103), WEAK_EXTERNAL (105). [Verify]
-Symbol-table order (deterministic): (1) the .file symbol with one auxiliary record holding the source name; (2) for every section, in section order, a section symbol (STATIC, name = section name, one aux record: Length, NumberOfRelocations, NumberOfLinenumbers, CheckSum, Number, Selection); (3) defined external symbols in section order then by offset; (4) defined static (module-private) symbols that relocations need; (5) undefined externals in first-use order; (6) absolute symbols. Auxiliary section records carry the CRC-32 CheckSum of the section contents for COMDAT sections whose selection is any/same_size/exact_match (this is what lets the linker detect mismatched duplicates), and for associative COMDATs the Number field holds the section number of the leader and Selection = 5.
-COMDAT. A COMDAT section sets LNK_COMDAT; its leader symbol is the first symbol defined in it, EXTERNAL, and the section-symbol aux record carries the selection kind: NODUPLICATES = 1, ANY = 2, SAME_SIZE = 3, EXACT_MATCH = 4, ASSOCIATIVE = 5, LARGEST = 6. Paracine uses: ANY for monomorphized generic instances (language spec 6.6; identical bodies by construction); ASSOCIATIVE for each function's .pdata and .xdata entry (tied to the function's code section so they live and die together); NODUPLICATES for ordinary exported routines at opt >= 1 (one COMDAT section per function, so --gc-sections can remove unused functions); LARGEST is reserved for tentative-definition-like merging and unused by the compiler.
-String table. Starts with a u32 length (including itself); strings are NUL-terminated and appended in first-use order, without deduplication of suffixes (keeps output deterministic and simple). Section names longer than 8 bytes are written as /<decimal offset>.
-Big objects. If an object would exceed 65,279 sections (a heavily generic module with per-function sections), the writer switches to the bigobj variant (an ANON_OBJECT_HEADER_BIGOBJ with 32-bit section numbering and 20-byte symbol records). [Verify] layout details. The reader accepts both.
-C.3.4 .drectve
-A section of ASCII/UTF-8 text of space-separated linker directives, e.g. /DEFAULTLIB:"kernel32" /EXPORT:Add=pcn$acme$net$add /INCLUDE:pcn_start /MERGE:.xdata=.rdata. Paracine writes /DEFAULTLIB for each from "x.dll" import library named by foreign declarations, /EXPORT for export items that need a DLL export, and /INCLUDE for symbols that must be kept alive (e.g. runtime hooks). The linker (C.8) processes directives from every input.
-C.3.5 Unwind sections
-For each function in .text$mn$<fn> the writer emits:
-.xdata$<fn>:  UNWIND_INFO                       (associative COMDAT -> .text$mn$<fn>)
-   byte 0   : Version (bits 0-2) = 1 | Flags (bits 3-7) = 0 (no handler, no chain)
-   byte 1   : SizeOfProlog (offset of the end of the prologue, in bytes)
-   byte 2   : CountOfUnwindCodes (slots, including operand slots)
-   byte 3   : FrameRegister (low 4 bits; 0 if none, 5 = RBP) | FrameOffset/16 (high 4 bits)
-   then CountOfUnwindCodes 16-bit slots, in REVERSE order of prologue execution,
-   padded to an even number of slots
-
-.pdata$<fn>:  RUNTIME_FUNCTION  (12 bytes, associative COMDAT -> .text$mn$<fn>)
-   BeginAddress   u32  : ADDR32NB reloc -> <fn> symbol + 0
-   EndAddress     u32  : ADDR32NB reloc -> <fn> symbol + code size
-   UnwindInfo     u32  : ADDR32NB reloc -> the .xdata$<fn> symbol
-UNWIND_CODE slot (16 bits): byte 0 = CodeOffset (offset in the prologue after the instruction that performed the operation), byte 1 = UnwindOp (low 4 bits) | OpInfo (high 4 bits). Encodings of the operations of B.9.3 ([Verify]):
-• PUSH_NONVOL (0): OpInfo = register number (RAX=0, RCX=1, RDX=2, RBX=3, RSP=4, RBP=5, RSI=6, RDI=7, R8..R15 = 8..15).
-• ALLOC_SMALL (2): OpInfo = (size - 8) / 8 for sizes 8..128.
-• ALLOC_LARGE (1): OpInfo = 0: one extra slot holds size / 8 (sizes 136 .. 512K-8); OpInfo = 1: two extra slots hold the 32-bit size.
-• SET_FPREG (3): no operand; the register and scaled offset are in the header bytes.
-• SAVE_NONVOL (4): OpInfo = register; one extra slot holds the RSP-relative offset / 8; SAVE_NONVOL_FAR (5): two extra slots hold the 32-bit offset.
-• SAVE_XMM128 (8): OpInfo = XMM register; one extra slot holds the offset / 16; SAVE_XMM128_FAR (9): 32-bit offset.
-The writer simulates each function's unwind codes against its prologue bytes and compares the resulting stack-pointer and register state with the frame builder's intent (a compile-time self-check, B.14).
-C.4 COFF writer algorithm
-1. Normalize the model. Order sections by order_key (fixed priority: .text$mn*, .text$x, .text$thunk, .rdata*, .data, .bss, .xdata*, .pdata*, .tls$*, .drectve, .debug$*), preserving the order functions were compiled (module order, then source order). COMDAT functions keep this order.
-2. Assign numbers. Section numbers 1..N; collect symbols in the order of C.3.3; assign symbol indexes (auxiliary records occupy index slots).
-3. Resolve names. Names over 8 bytes go to the string table in order of first use.
-4. Patch addends into section bytes at each relocation offset (for REL32: addend A is stored minus nothing: the stored 32-bit value is A, where the instruction-relative -4 adjustment is implicit in the relocation type). The encoder (B.11) supplies A consistent with that convention.
-5. Compute file offsets: headers; section data in order, each aligned to 4 bytes in the file; after each section its relocations; then symbol table; then string table.
-6. Emit in a single pass with a byte buffer; PointerToRawData = 0 for zero-fill; SizeOfRawData = size.
-7. Self-verify (in debug and CI builds): read the produced bytes back with the independent reader and compare to the model.
-The writer never emits non-deterministic data: timestamp 0, no absolute paths in the .file symbol unless --embed-paths, no uninitialized padding (padding bytes are 0, or 0xCC in code sections for debug-friendliness).
-C.5 Interoperating with foreign toolchains
-A Paracine object must link with Microsoft link.exe and LLVM lld-link, and Paracine's linker must accept their objects. Requirements: use only standard COFF features above; define __ImageBase usage through the linker-provided symbol; supply __chkstk and the runtime entry in pcn_rt.lib when a foreign linker is used (the foreign linker needs /ENTRY:pcn_start /SUBSYSTEM:CONSOLE /NODEFAULTLIB); never require the C runtime. Objects produced by MSVC that reference the CRT (mainCRTStartup, __security_cookie, _fltused, etc.) require the CRT .libs when linked by Paracine's linker; they are simply additional inputs.
-C.6 Archives and import libraries
-Static library .lib (Unix ar format as used by Windows): signature !<arch>\n; then members, each with a 60-byte header (Name[16], Date[12], UID[6], GID[6], Mode[8], Size[10], EndHeader[2] = "\n"), data padded to even length. Special members, in order: (1) **first linker member** /: big-endian count and big-endian offsets of members, followed by the symbol-name strings; (2) **second linker member** /: little-endian member offset table, a sorted array of symbol-to-member indexes, and the strings (this is the one modern linkers use for fast lookup); (3) **longnames member** //for member names over 15 bytes; then the object members. Paracine'spcn lib` writes both linker members with sorted, deterministic symbol tables; member timestamps are 0.
-Import library (.lib made for a DLL). Each import is a short import member rather than a full object: IMPORT_OBJECT_HEADER (Sig1 u16 = 0, Sig2 u16 = 0xFFFF, Version u16, Machine u16 = 0x8664, TimeDateStamp u32, SizeOfData u32, Ordinal/Hint u16, Type:2 | NameType:3 | Reserved:11 u16) followed by the NUL-terminated import name and then the NUL-terminated DLL name. The linker expands each short import into the symbols __imp_<name> (pointing at the IAT slot) and <name> (a small jmp [__imp_<name>] thunk, only materialized if referenced). Type is 0 for code, 1 for data, 2 for const; NameType is 0 for import by ordinal, 1 by name, 2 with prefix removed, 3 undecorated. [Verify]
-pcn lib creates import libraries for Paracine DLLs from their export lists, and reads the import libraries of the Windows SDK as inputs.
-
-
-## *** ##
-
-
+The most consequential design change is the closure resolution: Paracine now gets the ergonomics of lambdas and iterator callbacks without adding GC, std::function, heap closure objects, or dynamic dispatch. That also fixes the earlier thread.scope design cleanly rather than papering over the fact that a capture-free callback could not actually borrow the caller's data.
