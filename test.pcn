@@ -1,0 +1,51 @@
+routine add(a: int, b: int) gives int
+    give a + b
+
+routine answer() gives int
+    let x: int = 20
+    let y: int = 22
+    give add(x, y)
+
+module demo.program
+
+record parse_error
+    @derive(printable)
+    msg: text
+
+routine parse_int(t: text) gives result<int, parse_error>
+    var acc: int = 0
+    for ch in t
+        if ch < '0' or ch > '9'
+            fail parse_error("non-digit")
+        let digit = (ch - '0')
+        acc = acc * 10 + digit
+    give acc
+
+routine sum_numbers(xs: view<text>) gives result<int, parse_error>
+    var total: int = 0
+
+    # zero‑allocation closure capturing `total` by exclusive borrow
+    let add_one = routine(x: int)
+        total = total + x
+
+    for t in xs
+        let value = try parse_int(t)
+        add_one(value)
+
+    give total
+
+routine print_result(r: result<int, parse_error>) gives void
+    choose r
+        when ok(v)
+            std.io.println("sum = " .. v)
+        when err(e)
+            std.io.println("error: " .. e.msg)
+
+routine main(args: view<text>) gives int
+    if args.count == 0
+        std.io.println("no numbers provided")
+        give 1
+
+    let result = sum_numbers(args)
+    print_result(result)
+    give 0
