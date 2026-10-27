@@ -3,6 +3,14 @@
 #include <cctype>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
+#include <functional>
+#include <iomanip>
+#include <limits>
+#include <map>
+#include <set>
+#include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -15,5027 +23,6897 @@
 #include <variant>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 namespace pcn {
 
-	// --- Frontend: lexing -------------------------------------------------------
-	struct SourceLocation {
-		std::size_t line = 1;
-		std::size_t column = 1;
-	};
+// --- Frontend: lexing -------------------------------------------------------
+struct SourceLocation {
+	std::size_t line = 1;
+	std::size_t column = 1;
+};
 
-	struct SourceSpan {
-		SourceLocation start;
-		SourceLocation end;
-	};
+struct SourceSpan {
+	SourceLocation start;
+	SourceLocation end;
+};
 
-	enum class TokenKind {
-		Identifier,
-		Number,
-		String,
-		Keyword,
-		Symbol,
-		Newline,
-		Indent,
-		Dedent,
-		EndOfFile
-	};
+enum class TokenKind {
+	Identifier,
+	Number,
+	String,
+	Keyword,
+	Symbol,
+	Newline,
+	Indent,
+	Dedent,
+	EndOfFile
+};
 
-	struct Token {
-		TokenKind kind = TokenKind::EndOfFile;
-		std::string text;
-		SourceLocation location;
-	};
+struct Token {
+	TokenKind kind = TokenKind::EndOfFile;
+	std::string text;
+	SourceLocation location;
+};
 
-	static const std::unordered_set<std::string> kKeywords = {
-		// Edition-2026 canonical reserved vocabulary.
-		"abi", "alias", "alloc", "and", "as", "break", "capability", "choose",
-		"const", "continue", "defer", "else", "export", "fail", "false", "for",
-		"foreign", "from", "give", "gives", "if", "import", "in", "io", "is",
-		"let", "loop", "module", "move", "not", "nothing", "or", "own", "public",
-		"pure", "raw", "record", "return_", "routine", "static", "test", "then",
-		"thread", "trap", "true", "try", "unsafe", "var", "variant", "when",
-		"where", "while", "with", "yield_",
+static const std::unordered_set<std::string> kKeywords = {
+    // Edition-2026 canonical reserved vocabulary.
+    "abi", "alias", "alloc", "and", "as", "break", "capability", "choose",
+    "const", "continue", "defer", "else", "export", "fail", "false", "for",
+    "foreign", "from", "give", "gives", "if", "import", "in", "io", "is",
+    "let", "loop", "module", "move", "not", "nothing", "or", "own", "public",
+    "pure", "raw", "record", "return_", "routine", "static", "test", "then",
+    "thread", "trap", "true", "try", "unsafe", "var", "variant", "when",
+    "where", "while", "with", "yield_",
 
-		// Compatibility spellings accepted by this bootstrap implementation.
-		"each", "otherwise", "case", "enum", "union", "use", "compile", "layout",
-		"c", "packed", "align", "null", "return"
-	};
+    // Compatibility spellings accepted by this bootstrap implementation.
+    "each", "otherwise", "case", "enum", "union", "use", "compile", "layout",
+    "packed", "align", "null", "return"
+};
 
-	static bool isIdentifierStart(char ch) {
-		return std::isalpha(static_cast<unsigned char>(ch)) != 0 || ch == '_';
+static bool isIdentifierStart(char ch) {
+	return std::isalpha(static_cast<unsigned char>(ch)) != 0 || ch == '_';
+}
+
+static bool isIdentifierPart(char ch) {
+	return std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '_';
+}
+
+class Lexer {
+public:
+    explicit Lexer(std::string source)
+        : source_(normalizeSource(std::move(source))) {}
+
+    std::vector<Token> tokenize() {
+        std::vector<Token> tokens;
+        bool atLineStart = true;
+        bool emittedAnyToken = false;
+
+        while (!isAtEnd()) {
+            SourceLocation loc{line_, column_};
+            char ch = peek();
+
+            if (atLineStart) {
+                if (ch == '\n') {
+                    const bool continuation = delimiterDepth_ == 0 && nextLineBeginsPipeline();
+                    advanceLineBreak(tokens, delimiterDepth_ == 0 && !continuation);
+                    pipelineContinuation_ = continuation;
+                    continue;
+                }
+
+                if (pipelineContinuation_) {
+                    while (!isAtEnd() && (peek() == ' ' || peek() == '\t')) advance();
+                    pipelineContinuation_ = false;
+                    atLineStart = false;
+                    if (isAtEnd()) break;
+                    loc = {line_, column_};
+                    ch = peek();
+                }
+
+                std::size_t indent = 0;
+                const std::size_t startColumn = column_;
+                if (!atLineStart) {
+                    // A pipeline continuation has already consumed indentation for this line.
+                } else if (delimiterDepth_ == 0) {
+                    while (!isAtEnd() && (peek() == ' ' || peek() == '\t')) {
+                        if (peek() == '\t') {
+                            throw lexicalError("E0100", "tabs are forbidden in structural indentation", {line_, column_});
+                        }
+                        advance();
+                        ++indent;
+                    }
+                    if (peek() == '#' || peek() == '\n') {
+                        // Blank/comment-only lines do not alter the layout stack.
+                        atLineStart = false;
+                        continue;
+                    }
+                    if ((indent % kIndentWidth) != 0) {
+                        throw lexicalError("E0100", "indentation width must be divisible by four", {line_, startColumn});
+                    }
+                    const std::size_t current = indentStack_.back();
+                    if (!emittedAnyToken && indent != 0) {
+                        throw lexicalError("E0101", "top-level source may not begin indented", {line_, startColumn});
+                    }
+                    if (indent > current) {
+                        if (indent != current + kIndentWidth) {
+                            throw lexicalError("E0101", "indentation skips a structural level", {line_, startColumn});
+                        }
+                        indentStack_.push_back(indent);
+                        tokens.push_back({TokenKind::Indent, "<indent>", {line_, startColumn}});
+                    } else if (indent < current) {
+                        while (indentStack_.size() > 1 && indent < indentStack_.back()) {
+                            indentStack_.pop_back();
+                            tokens.push_back({TokenKind::Dedent, "<dedent>", {line_, startColumn}});
+                        }
+                        if (indent != indentStack_.back()) {
+                            throw lexicalError("E0102", "inconsistent dedent", {line_, startColumn});
+                        }
+                    }
+                } else {
+                    // Newlines inside (), [] and {} are ordinary whitespace.
+                    while (!isAtEnd() && (peek() == ' ' || peek() == '\t')) {
+                        advance();
+                    }
+                }
+                atLineStart = false;
+                if (isAtEnd()) break;
+                loc = {line_, column_};
+                ch = peek();
+            }
+
+            if (ch == ' ' || ch == '\t') {
+                advance();
+                continue;
+            }
+            if (ch == '\n') {
+                const bool continuation = delimiterDepth_ == 0 && nextLineBeginsPipeline();
+                advanceLineBreak(tokens, delimiterDepth_ == 0 && !continuation);
+                pipelineContinuation_ = continuation;
+                atLineStart = true;
+                continue;
+            }
+
+            if (ch == '#') {
+                while (!isAtEnd() && peek() != '\n') advance();
+                continue;
+            }
+
+            if (ch == '"') {
+                advance();
+                std::string value;
+                while (!isAtEnd() && peek() != '"') {
+                    char c = advance();
+                    if (c == '\\') {
+                        if (isAtEnd()) throw lexicalError("E0110", "unterminated string literal", loc);
+                        char escaped = advance();
+                        switch (escaped) {
+                        case 'n': value.push_back('\n'); break;
+                        case 'r': value.push_back('\r'); break;
+                        case 't': value.push_back('\t'); break;
+                        case '\\': value.push_back('\\'); break;
+                        case '"': value.push_back('"'); break;
+                        default: value.push_back(escaped); break;
+                        }
+                    } else {
+                        if (c == '\n') throw lexicalError("E0110", "newline in string literal", loc);
+                        value.push_back(c);
+                    }
+                }
+                if (isAtEnd()) throw lexicalError("E0110", "unterminated string literal", loc);
+                advance();
+                tokens.push_back({TokenKind::String, value, loc});
+                emittedAnyToken = true;
+                continue;
+            }
+
+            if (std::isdigit(static_cast<unsigned char>(ch)) != 0) {
+                std::string number;
+                while (!isAtEnd() && (std::isalnum(static_cast<unsigned char>(peek())) != 0 || peek() == '_')) {
+                    number.push_back(advance());
+                }
+                if (!isAtEnd() && peek() == '.' && std::isdigit(static_cast<unsigned char>(peekNext())) != 0) {
+                    number.push_back(advance());
+                    while (!isAtEnd() && (std::isdigit(static_cast<unsigned char>(peek())) != 0 || peek() == '_')) {
+                        number.push_back(advance());
+                    }
+                }
+                tokens.push_back({TokenKind::Number, number, loc});
+                emittedAnyToken = true;
+                continue;
+            }
+
+            if (isIdentifierStart(ch)) {
+                std::string ident;
+                while (!isAtEnd() && isIdentifierPart(peek())) ident.push_back(advance());
+                tokens.push_back({kKeywords.count(ident) ? TokenKind::Keyword : TokenKind::Identifier, ident, loc});
+                emittedAnyToken = true;
+                continue;
+            }
+
+            if (isSingleCharSymbol(ch)) {
+                const SourceLocation symbolLoc = loc;
+                std::string symbol;
+                const std::string three = lookahead(3);
+                const std::string two = lookahead(2);
+                if (kThreeCharOperators.count(three)) {
+                    symbol = three;
+                    advance(); advance(); advance();
+                } else if (kTwoCharOperators.count(two)) {
+                    symbol = two;
+                    advance(); advance();
+                } else {
+                    symbol.push_back(advance());
+                }
+
+                if (symbol == "(" || symbol == "[" || symbol == "{") ++delimiterDepth_;
+                if (symbol == ")" || symbol == "]" || symbol == "}") {
+                    if (delimiterDepth_ == 0) throw lexicalError("E0111", "unmatched closing delimiter", symbolLoc);
+                    --delimiterDepth_;
+                }
+                tokens.push_back({TokenKind::Symbol, symbol, symbolLoc});
+                emittedAnyToken = true;
+                continue;
+            }
+
+            throw lexicalError("E0109", "unexpected character '" + std::string(1, ch) + "'", loc);
+        }
+
+        if (delimiterDepth_ != 0) {
+            throw lexicalError("E0112", "unterminated grouping delimiter", {line_, column_});
+        }
+        if (!tokens.empty() && tokens.back().kind != TokenKind::Newline) {
+            tokens.push_back({TokenKind::Newline, "\\n", {line_, column_}});
+        }
+        while (indentStack_.size() > 1) {
+            indentStack_.pop_back();
+            tokens.push_back({TokenKind::Dedent, "<dedent>", {line_, column_}});
+        }
+        tokens.push_back({TokenKind::EndOfFile, "", {line_, column_}});
+        return tokens;
+    }
+
+private:
+    static std::string normalizeSource(std::string source) {
+        if (source.size() >= 3 && static_cast<unsigned char>(source[0]) == 0xEF &&
+            static_cast<unsigned char>(source[1]) == 0xBB && static_cast<unsigned char>(source[2]) == 0xBF) {
+            source.erase(0, 3);
+        }
+        std::string out;
+        out.reserve(source.size() + 1);
+        for (std::size_t i = 0; i < source.size(); ++i) {
+            if (source[i] == '\r') {
+                if (i + 1 < source.size() && source[i + 1] == '\n') ++i;
+                out.push_back('\n');
+            } else {
+                out.push_back(source[i]);
+            }
+        }
+        if (out.empty() || out.back() != '\n') out.push_back('\n');
+        return out;
+    }
+
+    std::runtime_error lexicalError(const std::string& code, const std::string& message, SourceLocation loc) const {
+        return std::runtime_error(code + " at " + std::to_string(loc.line) + ":" + std::to_string(loc.column) + ": " + message);
+    }
+
+    bool isAtEnd() const { return index_ >= source_.size(); }
+    char peek() const { return isAtEnd() ? '\0' : source_[index_]; }
+    char peekNext() const { return index_ + 1 < source_.size() ? source_[index_ + 1] : '\0'; }
+    std::string lookahead(std::size_t n) const {
+        if (index_ + n > source_.size()) return {};
+        return source_.substr(index_, n);
+    }
+    bool nextLineBeginsPipeline() const {
+        std::size_t i = index_;
+        if (i < source_.size() && source_[i] == '\n') ++i;
+        while (i < source_.size() && (source_[i] == ' ' || source_[i] == '\t')) ++i;
+        return i + 1 < source_.size() && source_[i] == '-' && source_[i + 1] == '>';
+    }
+    char advance() {
+        char value = source_[index_++];
+        ++column_;
+        return value;
+    }
+    void advanceLineBreak(std::vector<Token>& tokens, bool emitToken) {
+        const SourceLocation loc{line_, column_};
+        if (!isAtEnd() && peek() == '\n') advance();
+        if (emitToken && (tokens.empty() || tokens.back().kind != TokenKind::Newline)) {
+            tokens.push_back({TokenKind::Newline, "\\n", loc});
+        }
+        ++line_;
+        column_ = 1;
+    }
+
+    static bool isSingleCharSymbol(char ch) {
+        static const std::unordered_set<char> symbols = {
+            '{', '}', '(', ')', '[', ']', ',', ':', ';', '.', '?', '@',
+            '+', '-', '*', '/', '%', '=', '<', '>', '!', '&', '|', '^', '~'
+        };
+        return symbols.count(ch) != 0;
+    }
+
+    inline static const std::unordered_set<std::string> kTwoCharOperators = {
+        "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=",
+        "&=", "|=", "^=", "->", "=>", "::", "<<", ">>", ".."
+    };
+    inline static const std::unordered_set<std::string> kThreeCharOperators = {
+        "<<=", ">>=", "...", "..=" , "..<"
+    };
+
+    std::string source_;
+    std::size_t index_ = 0;
+    std::size_t line_ = 1;
+    std::size_t column_ = 1;
+    std::size_t delimiterDepth_ = 0;
+    bool pipelineContinuation_ = false;
+    std::vector<std::size_t> indentStack_ {0};
+    static constexpr std::size_t kIndentWidth = 4;
+};
+
+struct Parameter {
+	std::string name;
+	std::string typeName;
+	SourceLocation location;
+	std::string mode = "shared";
+};
+
+struct Expr;
+struct Stmt;
+
+using ExprPtr = std::shared_ptr<const Expr>;
+using StmtPtr = std::shared_ptr<const Stmt>;
+
+struct NumberExpr {
+	std::string value;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+
+struct StringExpr {
+	std::string value;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct BoolExpr {
+	bool value = false;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct NullExpr {
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct VariableExpr {
+	std::string name;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct UnaryExpr {
+	std::string op;
+	ExprPtr operand;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct BinaryExpr {
+	std::string op;
+	ExprPtr left;
+	ExprPtr right;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct PipelineExpr {
+	ExprPtr input;
+	std::vector<ExprPtr> stages;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct RangeExpr {
+	ExprPtr start;
+	ExprPtr end;
+	ExprPtr step;
+	bool inclusive = false;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct ChooseCase {
+	ExprPtr condition;
+	ExprPtr value;
+	std::string variantName;
+	std::vector<std::string> bindings;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct ChooseExpr {
+	ExprPtr subject;
+	std::vector<ChooseCase> cases;
+	ExprPtr otherwiseValue;
+	bool hasOtherwise = false;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct CallExpr {
+	ExprPtr callee;
+	std::vector<ExprPtr> arguments;
+	std::vector<std::string> genericArguments;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct TryExpr {
+	ExprPtr operand;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct ClosureExpr {
+	std::vector<Parameter> parameters;
+	std::string returnType;
+	std::vector<std::string> effects;
+	ExprPtr expressionBody;
+	std::vector<StmtPtr> blockBody;
+	bool hasExpressionBody = false;
+	bool moveCapture = false;
+	std::size_t closureId = 0;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct GroupExpr {
+	ExprPtr expression;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct MemberExpr {
+	ExprPtr object;
+	std::string member;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct ConstructField {
+	std::string name;
+	ExprPtr value;
+	SourceLocation location;
+};
+
+struct ConstructExpr {
+	std::string typeName;
+	std::vector<ConstructField> fields;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct Expr {
+	using Node = std::variant<NumberExpr, StringExpr, BoolExpr, NullExpr, VariableExpr, UnaryExpr, BinaryExpr, PipelineExpr, RangeExpr, ChooseExpr, CallExpr, TryExpr, ClosureExpr, GroupExpr, MemberExpr, ConstructExpr>;
+	Node node;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct LetStmt {
+	std::string name;
+	std::string typeName;
+	ExprPtr initializer;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct VarStmt {
+	std::string name;
+	std::string typeName;
+	ExprPtr initializer;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct AssignStmt {
+	std::string name;
+	ExprPtr value;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct ExprStmt {
+	ExprPtr expression;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct ReturnStmt {
+	ExprPtr value;
+	bool hasValue = false;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct GiveStmt {
+	ExprPtr value;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct IfStmt {
+	ExprPtr condition;
+	std::vector<StmtPtr> thenBranch;
+	std::vector<StmtPtr> elseBranch;
+	bool hasElse = false;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct EachStmt {
+	std::vector<std::string> bindings;
+	ExprPtr range;
+	std::vector<StmtPtr> body;
+	SourceSpan span;
+	SourceLocation location;
+	bool bindingsMutable = false;
+};
+
+struct UnsafeStmt {
+	std::vector<StmtPtr> body;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct DeferStmt {
+	ExprPtr expression;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct FailStmt {
+	ExprPtr expression;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct WhileStmt {
+	ExprPtr condition;
+	std::vector<StmtPtr> body;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct BreakStmt {
+	std::string label;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct ContinueStmt {
+	std::string label;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct BlockStmt {
+	std::vector<StmtPtr> statements;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct Stmt {
+	using Node = std::variant<LetStmt, VarStmt, AssignStmt, ExprStmt, ReturnStmt, GiveStmt, IfStmt, EachStmt, UnsafeStmt, DeferStmt, FailStmt, WhileStmt, BreakStmt, ContinueStmt, BlockStmt>;
+	Node node;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct AstFactory {
+	static SourceSpan span(SourceLocation start, SourceLocation end) {
+		return {start, end};
 	}
 
-	static bool isIdentifierPart(char ch) {
-		return std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '_';
+	static ExprPtr makeExpr(Expr node, SourceSpan /*nodeSpan*/) {
+		return std::make_shared<const Expr>(std::move(node));
 	}
 
-	class Lexer {
-	public:
-		explicit Lexer(std::string source)
-			: source_(normalizeSource(std::move(source))) {}
+	static StmtPtr makeStmt(Stmt node, SourceSpan /*nodeSpan*/) {
+		return std::make_shared<const Stmt>(std::move(node));
+	}
 
-		std::vector<Token> tokenize() {
-			std::vector<Token> tokens;
-			bool atLineStart = true;
-			bool emittedAnyToken = false;
+	template <typename T>
+	static ExprPtr makeExpr(T node, SourceSpan nodeSpan) {
+		return std::make_shared<const Expr>(Expr{Expr::Node{std::move(node)}, nodeSpan, nodeSpan.start});
+	}
 
-			while (!isAtEnd()) {
-				SourceLocation loc{ line_, column_ };
-				char ch = peek();
+	template <typename T>
+	static StmtPtr makeStmt(T node, SourceSpan nodeSpan) {
+		return std::make_shared<const Stmt>(Stmt{Stmt::Node{std::move(node)}, nodeSpan, nodeSpan.start});
+	}
+};
 
-				if (atLineStart) {
-					if (ch == '\n') {
-						const bool continuation = delimiterDepth_ == 0 && nextLineBeginsPipeline();
-						advanceLineBreak(tokens, delimiterDepth_ == 0 && !continuation);
-						pipelineContinuation_ = continuation;
-						continue;
-					}
+struct NominalTypeInfo {
+	std::string name;
+	std::string kind;
+	std::vector<std::pair<std::string, std::string>> fields;
+	std::vector<std::pair<std::string, std::string>> members;
+	std::vector<std::string> tags;
+	bool isPublic = false;
+	std::string layout;
+};
 
-					if (pipelineContinuation_) {
-						while (!isAtEnd() && (peek() == ' ' || peek() == '\t')) advance();
-						pipelineContinuation_ = false;
-						atLineStart = false;
-						if (isAtEnd()) break;
-						loc = { line_, column_ };
-						ch = peek();
-					}
+struct GenericParameter {
+	std::string name;
+	bool isConst = false;
+	std::string constType;
+	SourceLocation location;
+};
 
-					std::size_t indent = 0;
-					const std::size_t startColumn = column_;
-					if (!atLineStart) {
-						// A pipeline continuation has already consumed indentation for this line.
-					}
-					else if (delimiterDepth_ == 0) {
-						while (!isAtEnd() && (peek() == ' ' || peek() == '\t')) {
-							if (peek() == '\t') {
-								throw lexicalError("E0100", "tabs are forbidden in structural indentation", { line_, column_ });
-							}
-							advance();
-							++indent;
-						}
-						if (peek() == '#' || peek() == '\n') {
-							// Blank/comment-only lines do not alter the layout stack.
-							atLineStart = false;
-							continue;
-						}
-						if ((indent % kIndentWidth) != 0) {
-							throw lexicalError("E0100", "indentation width must be divisible by four", { line_, startColumn });
-						}
-						const std::size_t current = indentStack_.back();
-						if (!emittedAnyToken && indent != 0) {
-							throw lexicalError("E0101", "top-level source may not begin indented", { line_, startColumn });
-						}
-						if (indent > current) {
-							if (indent != current + kIndentWidth) {
-								throw lexicalError("E0101", "indentation skips a structural level", { line_, startColumn });
-							}
-							indentStack_.push_back(indent);
-							tokens.push_back({ TokenKind::Indent, "<indent>", {line_, startColumn} });
-						}
-						else if (indent < current) {
-							while (indentStack_.size() > 1 && indent < indentStack_.back()) {
-								indentStack_.pop_back();
-								tokens.push_back({ TokenKind::Dedent, "<dedent>", {line_, startColumn} });
-							}
-							if (indent != indentStack_.back()) {
-								throw lexicalError("E0102", "inconsistent dedent", { line_, startColumn });
-							}
-						}
-					}
-					else {
-						// Newlines inside (), [] and {} are ordinary whitespace.
-						while (!isAtEnd() && (peek() == ' ' || peek() == '\t')) {
-							advance();
-						}
-					}
-					atLineStart = false;
-					if (isAtEnd()) break;
-					loc = { line_, column_ };
-					ch = peek();
-				}
+struct CapabilityConstraint {
+	std::string subject;
+	std::string capability;
+	std::vector<std::string> arguments;
+	SourceLocation location;
+};
 
-				if (ch == ' ' || ch == '\t') {
-					advance();
-					continue;
-				}
-				if (ch == '\n') {
-					const bool continuation = delimiterDepth_ == 0 && nextLineBeginsPipeline();
-					advanceLineBreak(tokens, delimiterDepth_ == 0 && !continuation);
-					pipelineContinuation_ = continuation;
-					atLineStart = true;
-					continue;
-				}
+struct Routine {
+	std::string name;
+	bool isPublic = false;
+	bool isCompileTime = false;
+	bool isForeign = false;
+	std::string foreignAbi;
+	std::vector<GenericParameter> genericParameters;
+	std::vector<Parameter> parameters;
+	std::string returnType;
+	std::vector<CapabilityConstraint> constraints;
+	std::vector<std::string> effects;
+	std::vector<StmtPtr> body;
+	SourceSpan span;
+	SourceLocation location;
+};
 
-				if (ch == '#') {
-					while (!isAtEnd() && peek() != '\n') advance();
-					continue;
-				}
+struct FieldDecl {
+	std::string name;
+	std::string typeName;
+	SourceLocation location;
+};
 
-				if (ch == '"') {
-					advance();
-					std::string value;
-					while (!isAtEnd() && peek() != '"') {
-						char c = advance();
-						if (c == '\\') {
-							if (isAtEnd()) throw lexicalError("E0110", "unterminated string literal", loc);
-							char escaped = advance();
-							switch (escaped) {
-							case 'n': value.push_back('\n'); break;
-							case 'r': value.push_back('\r'); break;
-							case 't': value.push_back('\t'); break;
-							case '\\': value.push_back('\\'); break;
-							case '"': value.push_back('"'); break;
-							default: value.push_back(escaped); break;
-							}
-						}
-						else {
-							if (c == '\n') throw lexicalError("E0110", "newline in string literal", loc);
-							value.push_back(c);
-						}
-					}
-					if (isAtEnd()) throw lexicalError("E0110", "unterminated string literal", loc);
-					advance();
-					tokens.push_back({ TokenKind::String, value, loc });
-					emittedAnyToken = true;
-					continue;
-				}
+struct RecordDecl {
+	std::string name;
+	bool isPublic = false;
+	bool isCompileTime = false;
+	std::string layout;
+	std::vector<FieldDecl> fields;
+	SourceSpan span;
+	SourceLocation location;
+};
 
-				if (std::isdigit(static_cast<unsigned char>(ch)) != 0) {
-					std::string number;
-					while (!isAtEnd() && (std::isalnum(static_cast<unsigned char>(peek())) != 0 || peek() == '_')) {
-						number.push_back(advance());
-					}
-					if (!isAtEnd() && peek() == '.' && std::isdigit(static_cast<unsigned char>(peekNext())) != 0) {
-						number.push_back(advance());
-						while (!isAtEnd() && (std::isdigit(static_cast<unsigned char>(peek())) != 0 || peek() == '_')) {
-							number.push_back(advance());
-						}
-					}
-					tokens.push_back({ TokenKind::Number, number, loc });
-					emittedAnyToken = true;
-					continue;
-				}
+struct EnumDecl {
+	std::string name;
+	bool isPublic = false;
+	std::string underlyingType;
+	std::vector<std::pair<std::string, std::optional<std::string>>> members;
+	SourceSpan span;
+	SourceLocation location;
+};
 
-				if (isIdentifierStart(ch)) {
-					std::string ident;
-					while (!isAtEnd() && isIdentifierPart(peek())) ident.push_back(advance());
-					tokens.push_back({ kKeywords.count(ident) ? TokenKind::Keyword : TokenKind::Identifier, ident, loc });
-					emittedAnyToken = true;
-					continue;
-				}
+struct UnionDecl {
+	std::string name;
+	bool isPublic = false;
+	std::string layout;
+	std::vector<FieldDecl> fields;
+	SourceSpan span;
+	SourceLocation location;
+};
 
-				if (isSingleCharSymbol(ch)) {
-					const SourceLocation symbolLoc = loc;
-					std::string symbol;
-					const std::string three = lookahead(3);
-					const std::string two = lookahead(2);
-					if (kThreeCharOperators.count(three)) {
-						symbol = three;
-						advance(); advance(); advance();
-					}
-					else if (kTwoCharOperators.count(two)) {
-						symbol = two;
-						advance(); advance();
-					}
-					else {
-						symbol.push_back(advance());
-					}
+struct VariantCase {
+	std::string name;
+	std::vector<Parameter> fields;
+	SourceLocation location;
+};
 
-					if (symbol == "(" || symbol == "[" || symbol == "{") ++delimiterDepth_;
-					if (symbol == ")" || symbol == "]" || symbol == "}") {
-						if (delimiterDepth_ == 0) throw lexicalError("E0111", "unmatched closing delimiter", symbolLoc);
-						--delimiterDepth_;
-					}
-					tokens.push_back({ TokenKind::Symbol, symbol, symbolLoc });
-					emittedAnyToken = true;
-					continue;
-				}
+struct VariantDecl {
+	std::string name;
+	bool isPublic = false;
+	std::vector<VariantCase> cases;
+	SourceSpan span;
+	SourceLocation location;
+};
 
-				throw lexicalError("E0109", "unexpected character '" + std::string(1, ch) + "'", loc);
+struct ModuleDecl {
+	std::string name;
+	bool isPublic = false;
+	std::vector<struct Declaration> declarations;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct UseDecl {
+	std::vector<std::string> path;
+	std::string alias;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct ConstDecl {
+	std::string name;
+	bool isPublic = false;
+	bool isCompileTime = false;
+	std::string typeName;
+	ExprPtr value;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct CapabilityMemberDecl {
+	std::string name;
+	std::vector<Parameter> parameters;
+	std::string returnType;
+	std::vector<std::string> effects;
+	SourceLocation location;
+};
+
+struct CapabilityDecl {
+	std::string name;
+	bool isPublic = false;
+	std::vector<GenericParameter> genericParameters;
+	std::vector<CapabilityMemberDecl> members;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct ForeignDecl {
+	std::string abi;
+	Routine routine;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct Declaration {
+	using Node = std::variant<Routine, RecordDecl, EnumDecl, UnionDecl, VariantDecl, ModuleDecl, UseDecl, ConstDecl, CapabilityDecl, ForeignDecl>;
+	Node node;
+	SourceSpan span;
+	SourceLocation location;
+};
+
+struct Program {
+	std::vector<Routine> routines;
+	std::vector<Declaration> declarations;
+};
+
+enum class SemanticTypeKind {
+	Unknown,
+	Void,
+	Bool,
+	Number,
+	String,
+	Null,
+	Custom
+};
+
+struct SemanticType {
+	SemanticTypeKind kind = SemanticTypeKind::Unknown;
+	std::string name;
+
+	bool operator==(const SemanticType& other) const {
+		return kind == other.kind && name == other.name;
+	}
+
+	bool operator!=(const SemanticType& other) const {
+		return !(*this == other);
+	}
+};
+
+struct SemanticDiagnostic {
+	SourceLocation location;
+	std::string message;
+};
+
+enum class OwnershipState { Available, Moved };
+
+struct SymbolInfo {
+	SemanticType type;
+	bool isMutable = false;
+	bool isParameter = false;
+	std::string parameterMode = "shared";
+	OwnershipState ownership = OwnershipState::Available;
+};
+
+struct DeclarationInfo {
+	std::string name;
+	std::string kind;
+	bool isPublic = false;
+	bool isCompileTime = false;
+	std::string metadata;
+};
+
+struct RoutineSignature {
+	std::string name;
+	SemanticType returnType;
+	std::vector<SemanticType> parameterTypes;
+	std::vector<std::string> parameterNames;
+	std::vector<std::string> parameterModes;
+	std::vector<std::string> genericParameters;
+	std::vector<CapabilityConstraint> constraints;
+	std::vector<std::string> effects;
+	bool isForeign = false;
+};
+
+struct SemanticScope {
+	std::unordered_map<std::string, SymbolInfo> symbols;
+};
+
+
+struct SKMSymbolFact {
+    std::uint64_t id = 0;
+    std::string routine;
+    std::string name;
+    std::string typeName;
+    std::string parameterMode = "shared";
+    bool isMutable = false;
+    bool isParameter = false;
+    bool initialized = false;
+    SourceLocation declaration;
+    std::size_t firstPoint = 0;
+    std::size_t lastPoint = 0;
+};
+
+enum class BorrowKind { Shared, Exclusive, Owned };
+
+struct SKMBorrowRegionFact {
+    std::uint64_t id = 0;
+    std::uint64_t sourceSymbol = 0;
+    std::string sourceName;
+    BorrowKind kind = BorrowKind::Shared;
+    std::size_t beginPoint = 0;
+    std::size_t endPoint = 0;
+    std::size_t closureId = 0;
+    bool escaping = false;
+    SourceLocation location;
+};
+
+struct SKMEffectEdgeFact {
+    std::string caller;
+    std::string callee;
+    std::set<std::string> effects;
+};
+
+struct SKMClosureCaptureFact {
+    std::size_t closureId = 0;
+    std::uint64_t sourceSymbol = 0;
+    std::string name;
+    std::string typeName;
+    BorrowKind kind = BorrowKind::Shared;
+    bool escaping = false;
+    SourceLocation location;
+};
+
+struct SKMClosureFact {
+    std::size_t closureId = 0;
+    std::vector<std::string> parameterTypes;
+    std::string returnType;
+    std::set<std::string> effects;
+    bool moveCapture = false;
+    SourceLocation location;
+};
+
+struct SKMGenericSpecializationFact {
+    std::string genericRoutine;
+    std::string specializationName;
+    std::map<std::string, std::string> substitutions;
+    SourceLocation location;
+};
+
+struct SKMCapabilityResolutionFact {
+    std::string subjectType;
+    std::string capability;
+    std::vector<std::string> arguments;
+    bool satisfied = false;
+    std::vector<std::string> evidence;
+    SourceLocation location;
+};
+
+struct SKMCallEdgeFact {
+    std::string caller;
+    std::string callee;
+    SourceLocation location;
+};
+
+struct SKMLayoutFact {
+    std::string typeName;
+    std::size_t size = 0;
+    std::size_t alignment = 1;
+    bool nicheOptimized = false;
+    std::vector<std::pair<std::string, std::size_t>> fieldOffsets;
+};
+
+struct SKMAliasFact {
+    std::string routine;
+    std::string left;
+    std::string right;
+    bool mayAlias = true;
+    SourceLocation location;
+};
+
+struct SemanticKnowledgeModel {
+    std::vector<SKMSymbolFact> symbols;
+    std::vector<SKMBorrowRegionFact> borrowRegions;
+    std::vector<SKMEffectEdgeFact> effectEdges;
+    std::vector<SKMClosureCaptureFact> closureCaptures;
+    std::vector<SKMClosureFact> closures;
+    std::vector<SKMGenericSpecializationFact> specializations;
+    std::vector<SKMCapabilityResolutionFact> capabilityResolutions;
+    std::vector<SKMCallEdgeFact> calls;
+    std::vector<SKMLayoutFact> layouts;
+    std::vector<SKMAliasFact> aliases;
+    std::vector<std::string> structuralFacts;
+};
+
+struct SemanticAnalysisResult {
+	std::vector<SemanticDiagnostic> diagnostics;
+	std::vector<DeclarationInfo> declarations;
+	std::unordered_map<std::string, NominalTypeInfo> nominalTypes;
+	std::unordered_map<std::string, std::set<std::string>> resolvedEffects;
+	SemanticKnowledgeModel skm;
+
+	bool succeeded() const { return diagnostics.empty(); }
+};
+
+enum class VReg : std::uint32_t {
+	None = 0
+};
+
+enum class BlockID : std::uint32_t {
+	None = 0
+};
+
+enum class IRValueKind {
+	Unknown,
+	Void,
+	Bool,
+	Int64,
+	String,
+	Null,
+	Function,
+	Aggregate,
+	Result,
+	Option,
+	Closure
+};
+
+struct IRValueType {
+	IRValueKind kind = IRValueKind::Unknown;
+	std::string name;
+};
+
+inline IRValueType makeIRUnknownType() {
+	return {IRValueKind::Unknown, {}};
+}
+
+inline IRValueType makeIRVoidType() {
+	return {IRValueKind::Void, "void"};
+}
+
+inline IRValueType makeIRBoolType() {
+	return {IRValueKind::Bool, "bool"};
+}
+
+inline IRValueType makeIRIntType() {
+	return {IRValueKind::Int64, "int64"};
+}
+
+inline IRValueType makeIRStringType() {
+	return {IRValueKind::String, "string"};
+}
+
+inline IRValueType makeIRNullType() {
+	return {IRValueKind::Null, "null"};
+}
+
+inline std::string irValueTypeName(const IRValueType& type) {
+	if (!type.name.empty()) {
+		return type.name;
+	}
+	switch (type.kind) {
+	case IRValueKind::Unknown: return "unknown";
+	case IRValueKind::Void: return "void";
+	case IRValueKind::Bool: return "bool";
+	case IRValueKind::Int64: return "int64";
+	case IRValueKind::String: return "string";
+	case IRValueKind::Null: return "null";
+	case IRValueKind::Function: return "function";
+	case IRValueKind::Aggregate: return "aggregate";
+	case IRValueKind::Result: return "result";
+	case IRValueKind::Option: return "option";
+	case IRValueKind::Closure: return "closure";
+	}
+	return "unknown";
+}
+
+// --- IR types ---------------------------------------------------------------
+enum class IROpcode {
+	ConstInt,
+	ConstString,
+	ConstBool,
+	ConstNull,
+	Copy,
+	Add,
+	Sub,
+	Mul,
+	Div,
+	Mod,
+	BitAnd,
+	BitOr,
+	BitXor,
+	Shl,
+	Shr,
+	Neg,
+	BitNot,
+	Not,
+	Eq,
+	Ne,
+	Lt,
+	Le,
+	Gt,
+	Ge,
+	And,
+	Or,
+	Phi,
+	Branch,
+	BranchIf,
+	Call,
+	CallClosure,
+	MakeAggregate,
+	ExtractField,
+	ResultOk,
+	ResultErr,
+	ResultTry,
+	OptionSome,
+	OptionNone,
+	MakeClosure,
+	Return,
+	Nop
+};
+
+struct IRInstruction {
+	IROpcode op = IROpcode::Nop;
+	VReg dest = VReg::None;
+	IRValueType valueType = makeIRUnknownType();
+	std::vector<VReg> args;
+	std::vector<BlockID> targetBlocks;
+	std::vector<std::pair<BlockID, VReg>> phiInputs;
+	std::vector<std::string> argumentTypes;
+	std::vector<IRValueType> argumentValueTypes;
+	std::string callee;
+	std::string typeName;
+	std::string literalText;
+	std::string returnType;
+	std::string callSignature;
+	std::string blockLabel;
+	std::int64_t immediate = 0;
+	bool hasImmediate = false;
+};
+
+struct IRBasicBlock {
+	BlockID id = BlockID::None;
+	std::string labelName;
+	IRValueType terminatorType = makeIRVoidType();
+	std::vector<IRInstruction> instructions;
+	std::vector<std::string> predecessors;
+	std::vector<IRInstruction> phiNodes;
+};
+
+struct IRFunction {
+	std::string name;
+	std::string signature;
+	std::vector<std::string> parameterSignature;
+	std::string returnType;
+	IRValueType valueType = makeIRVoidType();
+	std::vector<std::string> parameterNames;
+	std::vector<std::string> parameterTypes;
+	std::vector<IRValueType> parameterValueTypes;
+	std::vector<VReg> parameterVregs;
+	std::vector<IRValueType> localValueTypes;
+	std::vector<IRBasicBlock> blocks;
+	std::uint32_t totalVregs = 0;
+};
+
+struct IRProgram {
+	std::vector<IRFunction> functions;
+	std::vector<DeclarationInfo> declarationSummaries;
+};
+
+inline SemanticType makeUnknownType() {
+	return {SemanticTypeKind::Unknown, {}};
+}
+
+inline SemanticType makeVoidType() {
+	return {SemanticTypeKind::Void, "void"};
+}
+
+inline SemanticType makeBoolType() {
+	return {SemanticTypeKind::Bool, "bool"};
+}
+
+inline SemanticType makeNumberType() {
+	return {SemanticTypeKind::Number, "number"};
+}
+
+inline SemanticType makeStringType() {
+	return {SemanticTypeKind::String, "text"};
+}
+
+inline SemanticType makeNullType() {
+	return {SemanticTypeKind::Null, "null"};
+}
+
+inline SemanticType makeCustomType(std::string name) {
+	return {SemanticTypeKind::Custom, std::move(name)};
+}
+
+inline bool isNumericTypeName(const std::string& name) {
+	static const std::unordered_set<std::string> names = {
+		"byte", "short", "int", "long", "ubyte", "ushort", "uint", "ulong",
+		"size", "ssize", "float", "double", "number"
+	};
+	return names.count(name) != 0;
+}
+
+inline bool isBuiltinTypeName(const std::string& name) {
+	return name == "void" || name == "never" || name == "bool" || name == "char" ||
+		name == "text" || name == "string" || name == "null" || isNumericTypeName(name);
+}
+
+inline bool isRawAuthorityTypeName(const std::string& name) {
+	return name == "raw" || name.rfind("raw<", 0) == 0;
+}
+
+inline SemanticType semanticTypeFromName(const std::string& name) {
+	if (name.empty()) return makeUnknownType();
+	if (name == "void") return makeVoidType();
+	if (name == "bool") return makeBoolType();
+	if (isNumericTypeName(name)) return {SemanticTypeKind::Number, name};
+	if (name == "text" || name == "string") return {SemanticTypeKind::String, name};
+	if (name == "null" || name == "nothing") return makeNullType();
+	return makeCustomType(name);
+}
+
+inline std::string semanticTypeName(const SemanticType& type) {
+	if (!type.name.empty()) {
+		return type.name;
+	}
+	switch (type.kind) {
+	case SemanticTypeKind::Unknown: return "unknown";
+	case SemanticTypeKind::Void: return "void";
+	case SemanticTypeKind::Bool: return "bool";
+	case SemanticTypeKind::Number: return "number";
+	case SemanticTypeKind::String: return "string";
+	case SemanticTypeKind::Null: return "null";
+	case SemanticTypeKind::Custom: return "custom";
+	}
+	return "unknown";
+}
+
+inline bool isNumericType(const SemanticType& type) {
+	return type.kind == SemanticTypeKind::Number;
+}
+
+inline bool isAssignableTo(const SemanticType& target, const SemanticType& value) {
+	if (target.kind == SemanticTypeKind::Unknown || value.kind == SemanticTypeKind::Unknown) {
+		return true;
+	}
+	if (target == value) {
+		return true;
+	}
+	if (target.kind == SemanticTypeKind::Number && value.kind == SemanticTypeKind::Number) {
+		// `number` is the contextual numeric-literal type; typed numerics do not implicitly convert.
+		return target.name == "number" || value.name == "number" || target.name == value.name;
+	}
+	if (target.kind == SemanticTypeKind::Custom && value.kind == SemanticTypeKind::Custom) {
+		if (target.name == value.name) return true;
+		if (target.name.rfind("result<",0)==0 && (value.name.rfind("__ok<",0)==0 || value.name.rfind("__err<",0)==0)) return true;
+		if (target.name.rfind("option<",0)==0 && (value.name.rfind("__some<",0)==0 || value.name=="__none")) return true;
+		return false;
+	}
+	if (target.kind == SemanticTypeKind::Custom || value.kind == SemanticTypeKind::Custom) {
+		return target.name == value.name;
+	}
+	if (target.kind == SemanticTypeKind::Void || value.kind == SemanticTypeKind::Void) {
+		return target.kind == value.kind;
+	}
+	return false;
+}
+
+inline bool isTruthyCompatible(const SemanticType& type) {
+	return type.kind == SemanticTypeKind::Bool || type.kind == SemanticTypeKind::Number || type.kind == SemanticTypeKind::String || type.kind == SemanticTypeKind::Null || type.kind == SemanticTypeKind::Custom || type.kind == SemanticTypeKind::Unknown;
+}
+
+
+struct CanonicalTypeExpr {
+    std::string head;
+    std::vector<CanonicalTypeExpr> args;
+    bool tuple = false;
+};
+
+class CanonicalTypeParser {
+public:
+    explicit CanonicalTypeParser(std::string_view text) : text_(text) {}
+    CanonicalTypeExpr parse() { auto t = parseType(); skip(); if (pos_ != text_.size()) throw std::runtime_error("invalid canonical type: " + std::string(text_)); return t; }
+private:
+    void skip() { while (pos_ < text_.size() && std::isspace(static_cast<unsigned char>(text_[pos_]))) ++pos_; }
+    bool eat(char c) { skip(); if (pos_ < text_.size() && text_[pos_] == c) { ++pos_; return true; } return false; }
+    CanonicalTypeExpr parseType() {
+        skip();
+        CanonicalTypeExpr out;
+        if (eat('(')) {
+            out.tuple = true; out.head = "tuple";
+            if (!eat(')')) {
+                for (;;) { out.args.push_back(parseType()); if (eat(')')) break; if (!eat(',')) throw std::runtime_error("expected ',' in tuple type"); }
+            }
+            return out;
+        }
+        std::size_t start = pos_;
+        while (pos_ < text_.size()) {
+            char c = text_[pos_];
+            if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == ':') ++pos_; else break;
+        }
+        if (start == pos_) throw std::runtime_error("expected type atom");
+        out.head = std::string(text_.substr(start, pos_ - start));
+        if (eat('<')) {
+            if (!eat('>')) {
+                for (;;) { out.args.push_back(parseType()); if (eat('>')) break; if (!eat(',')) throw std::runtime_error("expected ',' in generic type"); }
+            }
+        }
+        return out;
+    }
+    std::string_view text_; std::size_t pos_ = 0;
+};
+
+static std::string canonicalTypeText(const CanonicalTypeExpr& t) {
+    std::ostringstream oss;
+    if (t.tuple) {
+        oss << '(';
+        for (std::size_t i=0;i<t.args.size();++i){if(i)oss<<',';oss<<canonicalTypeText(t.args[i]);}
+        oss << ')'; return oss.str();
+    }
+    oss << t.head;
+    if (!t.args.empty()) { oss << '<'; for(std::size_t i=0;i<t.args.size();++i){if(i)oss<<',';oss<<canonicalTypeText(t.args[i]);} oss << '>'; }
+    return oss.str();
+}
+
+static bool matchGenericTypePattern(const CanonicalTypeExpr& pattern, const CanonicalTypeExpr& actual,
+                                    const std::unordered_set<std::string>& genericNames,
+                                    std::map<std::string,std::string>& substitutions) {
+    if (!pattern.tuple && genericNames.contains(pattern.head) && pattern.args.empty()) {
+        const std::string actualText = canonicalTypeText(actual);
+        auto [it, inserted] = substitutions.emplace(pattern.head, actualText);
+        return inserted || it->second == actualText;
+    }
+    if (pattern.tuple != actual.tuple || pattern.head != actual.head || pattern.args.size() != actual.args.size()) return false;
+    for (std::size_t i=0;i<pattern.args.size();++i)
+        if (!matchGenericTypePattern(pattern.args[i], actual.args[i], genericNames, substitutions)) return false;
+    return true;
+}
+
+static std::string substituteGenericType(const std::string& typeName, const std::map<std::string,std::string>& substitutions) {
+    if (typeName.empty()) return typeName;
+    try {
+        auto root = CanonicalTypeParser(typeName).parse();
+        std::function<void(CanonicalTypeExpr&)> apply = [&](CanonicalTypeExpr& t) {
+            if (!t.tuple && t.args.empty()) {
+                auto it = substitutions.find(t.head);
+                if (it != substitutions.end()) { t = CanonicalTypeParser(it->second).parse(); return; }
+            }
+            for (auto& a : t.args) apply(a);
+        };
+        apply(root); return canonicalTypeText(root);
+    } catch (...) { auto it=substitutions.find(typeName); return it==substitutions.end()?typeName:it->second; }
+}
+
+static bool typeIsResult(const std::string& typeName, std::string* okType=nullptr, std::string* errType=nullptr) {
+    try { auto t=CanonicalTypeParser(typeName).parse(); if(t.head!="result"||t.args.size()!=2)return false; if(okType)*okType=canonicalTypeText(t.args[0]); if(errType)*errType=canonicalTypeText(t.args[1]); return true; } catch(...){ return false; }
+}
+static bool typeIsOption(const std::string& typeName, std::string* valueType=nullptr) {
+    try { auto t=CanonicalTypeParser(typeName).parse(); if(t.head!="option"||t.args.size()!=1)return false; if(valueType)*valueType=canonicalTypeText(t.args[0]); return true; } catch(...){ return false; }
+}
+
+class Parser {
+public:
+	explicit Parser(std::vector<Token> tokens)
+		: tokens_(std::move(tokens)) {}
+
+	Program parse() {
+		Program program;
+		skipNewlines();
+		while (!isAtEnd()) {
+			if (checkKeyword("public") || checkKeyword("compile") || checkKeyword("record") || checkKeyword("enum") || checkKeyword("variant") || checkKeyword("union") || checkKeyword("module") || checkKeyword("use") || checkKeyword("import") || checkKeyword("const") || checkKeyword("capability") || checkKeyword("foreign")) {
+				program.declarations.push_back(parseDeclaration());
+				skipNewlines();
+				continue;
 			}
-
-			if (delimiterDepth_ != 0) {
-				throw lexicalError("E0112", "unterminated grouping delimiter", { line_, column_ });
+			if (checkKeyword("routine")) {
+				program.routines.push_back(parseRoutine());
+				skipNewlines();
+				continue;
 			}
-			if (!tokens.empty() && tokens.back().kind != TokenKind::Newline) {
-				tokens.push_back({ TokenKind::Newline, "\\n", {line_, column_} });
-			}
-			while (indentStack_.size() > 1) {
-				indentStack_.pop_back();
-				tokens.push_back({ TokenKind::Dedent, "<dedent>", {line_, column_} });
-			}
-			tokens.push_back({ TokenKind::EndOfFile, "", {line_, column_} });
-			return tokens;
+			throw std::runtime_error("unexpected top-level token: " + peek().text);
 		}
+		return program;
+	}
 
-	private:
-		static std::string normalizeSource(std::string source) {
-			if (source.size() >= 3 && static_cast<unsigned char>(source[0]) == 0xEF &&
-				static_cast<unsigned char>(source[1]) == 0xBB && static_cast<unsigned char>(source[2]) == 0xBF) {
-				source.erase(0, 3);
-			}
-			std::string out;
-			out.reserve(source.size() + 1);
-			for (std::size_t i = 0; i < source.size(); ++i) {
-				if (source[i] == '\r') {
-					if (i + 1 < source.size() && source[i + 1] == '\n') ++i;
-					out.push_back('\n');
-				}
-				else {
-					out.push_back(source[i]);
-				}
-			}
-			if (out.empty() || out.back() != '\n') out.push_back('\n');
-			return out;
+	Declaration parseDeclaration() {
+		bool isPublic = matchKeyword("public");
+		bool isCompile = matchKeyword("compile");
+		if (matchKeyword("routine")) {
+			return parseRoutineDeclaration(isPublic, isCompile);
 		}
-
-		std::runtime_error lexicalError(const std::string& code, const std::string& message, SourceLocation loc) const {
-			return std::runtime_error(code + " at " + std::to_string(loc.line) + ":" + std::to_string(loc.column) + ": " + message);
+		if (matchKeyword("foreign")) {
+			return parseForeignDeclaration(isPublic, isCompile);
 		}
-
-		bool isAtEnd() const { return index_ >= source_.size(); }
-		char peek() const { return isAtEnd() ? '\0' : source_[index_]; }
-		char peekNext() const { return index_ + 1 < source_.size() ? source_[index_ + 1] : '\0'; }
-		std::string lookahead(std::size_t n) const {
-			if (index_ + n > source_.size()) return {};
-			return source_.substr(index_, n);
+		if (matchKeyword("record")) {
+			return parseRecordDeclaration(isPublic, isCompile);
 		}
-		bool nextLineBeginsPipeline() const {
-			std::size_t i = index_;
-			if (i < source_.size() && source_[i] == '\n') ++i;
-			while (i < source_.size() && (source_[i] == ' ' || source_[i] == '\t')) ++i;
-			return i + 1 < source_.size() && source_[i] == '-' && source_[i + 1] == '>';
+		if (matchKeyword("enum")) {
+			return parseEnumDeclaration(isPublic, isCompile);
 		}
-		char advance() {
-			char value = source_[index_++];
-			++column_;
-			return value;
+		if (matchKeyword("variant")) {
+			return parseVariantDeclaration(isPublic, isCompile);
 		}
-		void advanceLineBreak(std::vector<Token>& tokens, bool emitToken) {
-			const SourceLocation loc{ line_, column_ };
-			if (!isAtEnd() && peek() == '\n') advance();
-			if (emitToken && (tokens.empty() || tokens.back().kind != TokenKind::Newline)) {
-				tokens.push_back({ TokenKind::Newline, "\\n", loc });
-			}
-			++line_;
-			column_ = 1;
+		if (matchKeyword("union")) {
+			return parseUnionDeclaration(isPublic, isCompile);
 		}
-
-		static bool isSingleCharSymbol(char ch) {
-			static const std::unordered_set<char> symbols = {
-				'{', '}', '(', ')', '[', ']', ',', ':', ';', '.', '?', '@',
-				'+', '-', '*', '/', '%', '=', '<', '>', '!', '&', '|', '^', '~'
-			};
-			return symbols.count(ch) != 0;
+		if (matchKeyword("module")) {
+			return parseModuleDeclaration(isPublic, isCompile);
 		}
-
-		inline static const std::unordered_set<std::string> kTwoCharOperators = {
-			"==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=",
-			"&=", "|=", "^=", "->", "=>", "::", "<<", ">>", ".."
-		};
-		inline static const std::unordered_set<std::string> kThreeCharOperators = {
-			"<<=", ">>=", "...", "..=" , "..<"
-		};
-
-		std::string source_;
-		std::size_t index_ = 0;
-		std::size_t line_ = 1;
-		std::size_t column_ = 1;
-		std::size_t delimiterDepth_ = 0;
-		bool pipelineContinuation_ = false;
-		std::vector<std::size_t> indentStack_{ 0 };
-		static constexpr std::size_t kIndentWidth = 4;
-	};
-
-	struct Parameter {
-		std::string name;
-		std::string typeName;
-		SourceLocation location;
-		std::string mode = "shared";
-	};
-
-	struct Expr;
-	struct Stmt;
-
-	using ExprPtr = std::shared_ptr<const Expr>;
-	using StmtPtr = std::shared_ptr<const Stmt>;
-
-	struct NumberExpr {
-		std::string value;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-
-	struct StringExpr {
-		std::string value;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct BoolExpr {
-		bool value = false;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct NullExpr {
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct VariableExpr {
-		std::string name;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct UnaryExpr {
-		std::string op;
-		ExprPtr operand;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct BinaryExpr {
-		std::string op;
-		ExprPtr left;
-		ExprPtr right;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct PipelineExpr {
-		ExprPtr input;
-		std::vector<ExprPtr> stages;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct RangeExpr {
-		ExprPtr start;
-		ExprPtr end;
-		ExprPtr step;
-		bool inclusive = false;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct ChooseCase {
-		ExprPtr condition;
-		ExprPtr value;
-		std::string variantName;
-		std::vector<std::string> bindings;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct ChooseExpr {
-		ExprPtr subject;
-		std::vector<ChooseCase> cases;
-		ExprPtr otherwiseValue;
-		bool hasOtherwise = false;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct CallExpr {
-		ExprPtr callee;
-		std::vector<ExprPtr> arguments;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct GroupExpr {
-		ExprPtr expression;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct MemberExpr {
-		ExprPtr object;
-		std::string member;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct ConstructField {
-		std::string name;
-		ExprPtr value;
-		SourceLocation location;
-	};
-
-	struct ConstructExpr {
-		std::string typeName;
-		std::vector<ConstructField> fields;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct Expr {
-		using Node = std::variant<NumberExpr, StringExpr, BoolExpr, NullExpr, VariableExpr, UnaryExpr, BinaryExpr, PipelineExpr, RangeExpr, ChooseExpr, CallExpr, GroupExpr, MemberExpr, ConstructExpr>;
-		Node node;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct LetStmt {
-		std::string name;
-		std::string typeName;
-		ExprPtr initializer;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct VarStmt {
-		std::string name;
-		std::string typeName;
-		ExprPtr initializer;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct AssignStmt {
-		std::string name;
-		ExprPtr value;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct ExprStmt {
-		ExprPtr expression;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct ReturnStmt {
-		ExprPtr value;
-		bool hasValue = false;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct GiveStmt {
-		ExprPtr value;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct IfStmt {
-		ExprPtr condition;
-		std::vector<StmtPtr> thenBranch;
-		std::vector<StmtPtr> elseBranch;
-		bool hasElse = false;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct EachStmt {
-		std::vector<std::string> bindings;
-		ExprPtr range;
-		std::vector<StmtPtr> body;
-		SourceSpan span;
-		SourceLocation location;
-		bool bindingsMutable = false;
-	};
-
-	struct UnsafeStmt {
-		std::vector<StmtPtr> body;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct DeferStmt {
-		ExprPtr expression;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct FailStmt {
-		ExprPtr expression;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct WhileStmt {
-		ExprPtr condition;
-		std::vector<StmtPtr> body;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct BreakStmt {
-		std::string label;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct ContinueStmt {
-		std::string label;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct BlockStmt {
-		std::vector<StmtPtr> statements;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct Stmt {
-		using Node = std::variant<LetStmt, VarStmt, AssignStmt, ExprStmt, ReturnStmt, GiveStmt, IfStmt, EachStmt, UnsafeStmt, DeferStmt, FailStmt, WhileStmt, BreakStmt, ContinueStmt, BlockStmt>;
-		Node node;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct AstFactory {
-		static SourceSpan span(SourceLocation start, SourceLocation end) {
-			return { start, end };
+		if (matchKeyword("use") || matchKeyword("import")) {
+			return parseUseDeclaration();
 		}
-
-		static ExprPtr makeExpr(Expr node, SourceSpan /*nodeSpan*/) {
-			return std::make_shared<const Expr>(std::move(node));
+		if (matchKeyword("const")) {
+			return parseConstDeclaration(isPublic, isCompile);
 		}
-
-		static StmtPtr makeStmt(Stmt node, SourceSpan /*nodeSpan*/) {
-			return std::make_shared<const Stmt>(std::move(node));
+		if (matchKeyword("capability")) {
+			return parseCapabilityDeclaration(isPublic);
 		}
+		throw std::runtime_error("expected top-level declaration");
+	}
 
-		template <typename T>
-		static ExprPtr makeExpr(T node, SourceSpan nodeSpan) {
-			return std::make_shared<const Expr>(Expr{ Expr::Node{std::move(node)}, nodeSpan, nodeSpan.start });
+private:
+	const Token& peek() const { return tokens_[index_]; }
+	const Token& peek(std::size_t offset) const {
+		std::size_t pos = index_ + offset;
+		if (pos >= tokens_.size()) {
+			return tokens_.back();
 		}
-
-		template <typename T>
-		static StmtPtr makeStmt(T node, SourceSpan nodeSpan) {
-			return std::make_shared<const Stmt>(Stmt{ Stmt::Node{std::move(node)}, nodeSpan, nodeSpan.start });
+		return tokens_[pos];
+	}
+	const Token& previous() const { return tokens_[index_ - 1]; }
+	bool isAtEnd() const { return peek().kind == TokenKind::EndOfFile; }
+	bool checkKeyword(const std::string& value) const { return peek().kind == TokenKind::Keyword && peek().text == value; }
+	bool checkSymbol(const std::string& value) const { return peek().kind == TokenKind::Symbol && peek().text == value; }
+	bool checkKeywordAhead(std::size_t offset, const std::string& value) const { return peek(offset).kind == TokenKind::Keyword && peek(offset).text == value; }
+	bool checkSymbolAhead(std::size_t offset, const std::string& value) const { return peek(offset).kind == TokenKind::Symbol && peek(offset).text == value; }
+	bool matchKeyword(const std::string& value) {
+		if (checkKeyword(value)) {
+			++index_;
+			return true;
 		}
-	};
+		return false;
+	}
+	bool matchSymbol(const std::string& value) {
+		if (checkSymbol(value)) {
+			++index_;
+			return true;
+		}
+		return false;
+	}
+	Token consume() {
+		if (isAtEnd()) {
+			throw std::runtime_error("unexpected end of file");
+		}
+		return tokens_[index_++];
+	}
+	Token expectKeyword(const std::string& value) {
+		if (!matchKeyword(value)) {
+			throw std::runtime_error("expected keyword '" + value + "'");
+		}
+		return previous();
+	}
+	Token expectIdentifier() {
+		if (peek().kind != TokenKind::Identifier) {
+			throw std::runtime_error("expected identifier");
+		}
+		return consume();
+	}
+	Token expectSymbol(const std::string& value) {
+		if (!matchSymbol(value)) {
+			throw std::runtime_error("expected symbol '" + value + "'");
+		}
+		return previous();
+	}
+	Token expectToken(TokenKind kind, const std::string& description) {
+		if (peek().kind != kind) {
+			throw std::runtime_error("expected " + description);
+		}
+		return consume();
+	}
 
-	struct NominalTypeInfo {
-		std::string name;
-		std::string kind;
-		std::vector<std::pair<std::string, std::string>> fields;
-		std::vector<std::pair<std::string, std::string>> members;
-		std::vector<std::string> tags;
-		bool isPublic = false;
-		std::string layout;
-	};
+	std::string parseQualifiedName() {
+		std::string name = expectIdentifier().text;
+		while (matchSymbol("::") || matchSymbol(".")) {
+			name += "::" + expectIdentifier().text;
+		}
+		return name;
+	}
 
-	struct Routine {
-		std::string name;
-		bool isPublic = false;
-		bool isCompileTime = false;
-		bool isForeign = false;
-		std::string foreignAbi;
-		std::vector<Parameter> parameters;
-		std::string returnType;
-		std::vector<std::string> effects;
-		std::vector<StmtPtr> body;
-		SourceSpan span;
-		SourceLocation location;
-	};
+	Declaration parseRoutineDeclaration(bool isPublic, bool isCompile) {
+		Routine routine = parseRoutineCore();
+		routine.isPublic = isPublic;
+		routine.isCompileTime = isCompile;
+		return Declaration{routine, routine.span, routine.location};
+	}
 
-	struct FieldDecl {
-		std::string name;
-		std::string typeName;
-		SourceLocation location;
-	};
-
-	struct RecordDecl {
-		std::string name;
-		bool isPublic = false;
-		bool isCompileTime = false;
-		std::string layout;
-		std::vector<FieldDecl> fields;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct EnumDecl {
-		std::string name;
-		bool isPublic = false;
-		std::string underlyingType;
-		std::vector<std::pair<std::string, std::optional<std::string>>> members;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct UnionDecl {
-		std::string name;
-		bool isPublic = false;
-		std::string layout;
-		std::vector<FieldDecl> fields;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct VariantCase {
-		std::string name;
-		std::vector<Parameter> fields;
-		SourceLocation location;
-	};
-
-	struct VariantDecl {
-		std::string name;
-		bool isPublic = false;
-		std::vector<VariantCase> cases;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct ModuleDecl {
-		std::string name;
-		bool isPublic = false;
-		std::vector<struct Declaration> declarations;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct UseDecl {
-		std::vector<std::string> path;
-		std::string alias;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct ConstDecl {
-		std::string name;
-		bool isPublic = false;
-		bool isCompileTime = false;
-		std::string typeName;
-		ExprPtr value;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct ForeignDecl {
-		std::string abi;
+	Routine parseRoutineCore() {
 		Routine routine;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct Declaration {
-		using Node = std::variant<Routine, RecordDecl, EnumDecl, UnionDecl, VariantDecl, ModuleDecl, UseDecl, ConstDecl, ForeignDecl>;
-		Node node;
-		SourceSpan span;
-		SourceLocation location;
-	};
-
-	struct Program {
-		std::vector<Routine> routines;
-		std::vector<Declaration> declarations;
-	};
-
-	enum class SemanticTypeKind {
-		Unknown,
-		Void,
-		Bool,
-		Number,
-		String,
-		Null,
-		Custom
-	};
-
-	struct SemanticType {
-		SemanticTypeKind kind = SemanticTypeKind::Unknown;
-		std::string name;
-
-		bool operator==(const SemanticType& other) const {
-			return kind == other.kind && name == other.name;
+		routine.location = previous().location;
+		routine.span = {routine.location, routine.location};
+		routine.name = expectIdentifier().text;
+		routine.genericParameters = parseGenericParameterList();
+		routine.parameters = parseParameterList();
+		if (matchKeyword("gives")) {
+			routine.returnType = parseTypeName();
+		} else {
+			routine.returnType = "void";
 		}
+		routine.constraints = parseWhereClause();
+		routine.effects = parseEffectClause();
+		skipNewlines();
+		expectIndent();
+		routine.body = parseBlockStatements();
+		expectDedent();
+		return routine;
+	}
 
-		bool operator!=(const SemanticType& other) const {
-			return !(*this == other);
+	Declaration parseForeignDeclaration(bool isPublic, bool isCompile) {
+		std::string abi = parseTypeName();
+		auto routine = parseRoutineCore();
+		routine.isPublic = isPublic;
+		routine.isCompileTime = isCompile;
+		routine.isForeign = true;
+		routine.foreignAbi = abi;
+		return Declaration{ForeignDecl{abi, routine, routine.span, routine.location}, routine.span, routine.location};
+	}
+
+	std::vector<FieldDecl> parseFieldsBlock() {
+		std::vector<FieldDecl> fields;
+		skipNewlines();
+		expectIndent();
+		while (!checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
+			FieldDecl field;
+			field.name = expectIdentifier().text;
+			field.location = previous().location;
+			expectSymbol(":");
+			field.typeName = parseTypeName();
+			fields.push_back(field);
+			consumeLineBreak();
+			skipNewlines();
 		}
-	};
-
-	struct SemanticDiagnostic {
-		SourceLocation location;
-		std::string message;
-	};
-
-	struct SymbolInfo {
-		SemanticType type;
-		bool isMutable = false;
-		bool isParameter = false;
-	};
-
-	struct DeclarationInfo {
-		std::string name;
-		std::string kind;
-		bool isPublic = false;
-		bool isCompileTime = false;
-		std::string metadata;
-	};
-
-	struct RoutineSignature {
-		std::string name;
-		SemanticType returnType;
-		std::vector<SemanticType> parameterTypes;
-		std::vector<std::string> parameterNames;
-	};
-
-	struct SemanticScope {
-		std::unordered_map<std::string, SymbolInfo> symbols;
-	};
-
-	struct SemanticAnalysisResult {
-		std::vector<SemanticDiagnostic> diagnostics;
-		std::vector<DeclarationInfo> declarations;
-		std::unordered_map<std::string, NominalTypeInfo> nominalTypes;
-
-		bool succeeded() const { return diagnostics.empty(); }
-	};
-
-	enum class VReg : std::uint32_t {
-		None = 0
-	};
-
-	enum class BlockID : std::uint32_t {
-		None = 0
-	};
-
-	enum class IRValueKind {
-		Unknown,
-		Void,
-		Bool,
-		Int64,
-		String,
-		Null,
-		Function
-	};
-
-	struct IRValueType {
-		IRValueKind kind = IRValueKind::Unknown;
-		std::string name;
-	};
-
-	inline IRValueType makeIRUnknownType() {
-		return { IRValueKind::Unknown, {} };
+		expectDedent();
+		return fields;
 	}
 
-	inline IRValueType makeIRVoidType() {
-		return { IRValueKind::Void, "void" };
+	Declaration parseRecordDeclaration(bool isPublic, bool isCompile) {
+		RecordDecl record;
+		record.location = previous().location;
+		record.span = {record.location, record.location};
+		record.isPublic = isPublic;
+		record.isCompileTime = isCompile;
+		record.name = expectIdentifier().text;
+		record.fields = parseFieldsBlock();
+		return Declaration{record, record.span, record.location};
 	}
 
-	inline IRValueType makeIRBoolType() {
-		return { IRValueKind::Bool, "bool" };
+	Declaration parseUnionDeclaration(bool isPublic, bool isCompile) {
+		UnionDecl decl;
+		decl.location = previous().location;
+		decl.span = {decl.location, decl.location};
+		decl.isPublic = isPublic;
+		decl.layout = isCompile ? "packed" : "";
+		decl.name = expectIdentifier().text;
+		decl.fields = parseFieldsBlock();
+		return Declaration{decl, decl.span, decl.location};
 	}
 
-	inline IRValueType makeIRIntType() {
-		return { IRValueKind::Int64, "int64" };
-	}
-
-	inline IRValueType makeIRStringType() {
-		return { IRValueKind::String, "string" };
-	}
-
-	inline IRValueType makeIRNullType() {
-		return { IRValueKind::Null, "null" };
-	}
-
-	inline std::string irValueTypeName(const IRValueType& type) {
-		if (!type.name.empty()) {
-			return type.name;
+	Declaration parseEnumDeclaration(bool isPublic, bool isCompile) {
+		EnumDecl decl;
+		decl.location = previous().location;
+		decl.span = {decl.location, decl.location};
+		decl.isPublic = isPublic;
+		decl.underlyingType = isCompile ? "ubyte" : "";
+		decl.name = expectIdentifier().text;
+		skipNewlines();
+		expectIndent();
+		while (!checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
+			std::string memberName = expectIdentifier().text;
+			std::optional<std::string> value;
+			if (matchSymbol("=")) {
+				value = parseTypeName();
+			}
+			decl.members.emplace_back(memberName, value);
+			consumeLineBreak();
+			skipNewlines();
 		}
-		switch (type.kind) {
-		case IRValueKind::Unknown: return "unknown";
-		case IRValueKind::Void: return "void";
-		case IRValueKind::Bool: return "bool";
-		case IRValueKind::Int64: return "int64";
-		case IRValueKind::String: return "string";
-		case IRValueKind::Null: return "null";
-		case IRValueKind::Function: return "function";
+		expectDedent();
+		return Declaration{decl, decl.span, decl.location};
+	}
+
+	Declaration parseVariantDeclaration(bool isPublic, bool isCompile) {
+		VariantDecl decl;
+		decl.location = previous().location;
+		decl.span = {decl.location, decl.location};
+		decl.isPublic = isPublic;
+		decl.name = expectIdentifier().text;
+		skipNewlines();
+		expectIndent();
+		while (!checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
+			VariantCase c;
+			c.name = expectIdentifier().text;
+			c.location = previous().location;
+			if (matchSymbol("(")) {
+				if (!checkSymbol(")")) {
+					for (;;) {
+						Parameter p;
+						if (checkKeyword("var") || checkKeyword("own") || checkKeyword("raw")) p.mode = consume().text;
+						p.name = expectIdentifier().text;
+						p.location = previous().location;
+						expectSymbol(":");
+						p.typeName = parseTypeName();
+						c.fields.push_back(p);
+						if (!matchSymbol(",")) break;
+					}
+				}
+				expectSymbol(")");
+			}
+			decl.cases.push_back(std::move(c));
+			consumeLineBreak();
+			skipNewlines();
 		}
-		return "unknown";
+		expectDedent();
+		(void)isCompile;
+		return Declaration{decl, decl.span, decl.location};
 	}
 
-	// --- IR types ---------------------------------------------------------------
-	enum class IROpcode {
-		ConstInt,
-		ConstString,
-		ConstBool,
-		ConstNull,
-		Copy,
-		Add,
-		Sub,
-		Mul,
-		Div,
-		Mod,
-		BitAnd,
-		BitOr,
-		BitXor,
-		Shl,
-		Shr,
-		Neg,
-		BitNot,
-		Not,
-		Eq,
-		Ne,
-		Lt,
-		Le,
-		Gt,
-		Ge,
-		And,
-		Or,
-		Phi,
-		Branch,
-		BranchIf,
-		Call,
-		Return,
-		Nop
-	};
-
-	struct IRInstruction {
-		IROpcode op = IROpcode::Nop;
-		VReg dest = VReg::None;
-		IRValueType valueType = makeIRUnknownType();
-		std::vector<VReg> args;
-		std::vector<BlockID> targetBlocks;
-		std::vector<std::pair<BlockID, VReg>> phiInputs;
-		std::vector<std::string> argumentTypes;
-		std::vector<IRValueType> argumentValueTypes;
-		std::string callee;
-		std::string typeName;
-		std::string literalText;
-		std::string returnType;
-		std::string callSignature;
-		std::string blockLabel;
-		std::int64_t immediate = 0;
-		bool hasImmediate = false;
-	};
-
-	struct IRBasicBlock {
-		BlockID id = BlockID::None;
-		std::string labelName;
-		IRValueType terminatorType = makeIRVoidType();
-		std::vector<IRInstruction> instructions;
-		std::vector<std::string> predecessors;
-		std::vector<IRInstruction> phiNodes;
-	};
-
-	struct IRFunction {
-		std::string name;
-		std::string signature;
-		std::vector<std::string> parameterSignature;
-		std::string returnType;
-		IRValueType valueType = makeIRVoidType();
-		std::vector<std::string> parameterNames;
-		std::vector<std::string> parameterTypes;
-		std::vector<IRValueType> parameterValueTypes;
-		std::vector<VReg> parameterVregs;
-		std::vector<IRValueType> localValueTypes;
-		std::vector<IRBasicBlock> blocks;
-		std::uint32_t totalVregs = 0;
-	};
-
-	struct IRProgram {
-		std::vector<IRFunction> functions;
-		std::vector<DeclarationInfo> declarationSummaries;
-	};
-
-	inline SemanticType makeUnknownType() {
-		return { SemanticTypeKind::Unknown, {} };
-	}
-
-	inline SemanticType makeVoidType() {
-		return { SemanticTypeKind::Void, "void" };
-	}
-
-	inline SemanticType makeBoolType() {
-		return { SemanticTypeKind::Bool, "bool" };
-	}
-
-	inline SemanticType makeNumberType() {
-		return { SemanticTypeKind::Number, "number" };
-	}
-
-	inline SemanticType makeStringType() {
-		return { SemanticTypeKind::String, "string" };
-	}
-
-	inline SemanticType makeNullType() {
-		return { SemanticTypeKind::Null, "null" };
-	}
-
-	inline SemanticType makeCustomType(std::string name) {
-		return { SemanticTypeKind::Custom, std::move(name) };
-	}
-
-	inline bool isNumericTypeName(const std::string& name) {
-		static const std::unordered_set<std::string> names = {
-			"byte", "short", "int", "long", "ubyte", "ushort", "uint", "ulong",
-			"size", "ssize", "float", "double", "number"
-		};
-		return names.count(name) != 0;
-	}
-
-	inline bool isBuiltinTypeName(const std::string& name) {
-		return name == "void" || name == "never" || name == "bool" || name == "char" ||
-			name == "text" || name == "string" || name == "null" || isNumericTypeName(name);
-	}
-
-	inline SemanticType semanticTypeFromName(const std::string& name) {
-		if (name.empty()) return makeUnknownType();
-		if (name == "void") return makeVoidType();
-		if (name == "bool") return makeBoolType();
-		if (isNumericTypeName(name)) return { SemanticTypeKind::Number, name };
-		if (name == "text" || name == "string") return { SemanticTypeKind::String, name };
-		if (name == "null" || name == "nothing") return makeNullType();
-		return makeCustomType(name);
-	}
-
-	inline std::string semanticTypeName(const SemanticType& type) {
-		if (!type.name.empty()) {
-			return type.name;
+	Declaration parseCapabilityDeclaration(bool isPublic) {
+		CapabilityDecl decl;
+		decl.location = previous().location;
+		decl.span = {decl.location, decl.location};
+		decl.isPublic = isPublic;
+		decl.name = expectIdentifier().text;
+		decl.genericParameters = parseGenericParameterList();
+		consumeLineBreak();
+		skipNewlines();
+		expectIndent();
+		while (!checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
+			expectKeyword("routine");
+			CapabilityMemberDecl member;
+			member.location = previous().location;
+			member.name = expectIdentifier().text;
+			member.parameters = parseParameterList();
+			member.returnType = matchKeyword("gives") ? parseTypeName() : "void";
+			member.effects = parseEffectClause();
+			decl.members.push_back(std::move(member));
+			consumeLineBreak();
+			skipNewlines();
 		}
-		switch (type.kind) {
-		case SemanticTypeKind::Unknown: return "unknown";
-		case SemanticTypeKind::Void: return "void";
-		case SemanticTypeKind::Bool: return "bool";
-		case SemanticTypeKind::Number: return "number";
-		case SemanticTypeKind::String: return "string";
-		case SemanticTypeKind::Null: return "null";
-		case SemanticTypeKind::Custom: return "custom";
+		expectDedent();
+		return Declaration{decl, decl.span, decl.location};
+	}
+
+	Declaration parseModuleDeclaration(bool isPublic, bool isCompile) {
+		ModuleDecl decl;
+		decl.location = previous().location;
+		decl.span = {decl.location, decl.location};
+		decl.isPublic = isPublic;
+		decl.name = expectIdentifier().text;
+		consumeLineBreak();
+		skipNewlines();
+		expectIndent();
+		while (!checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
+			decl.declarations.push_back(parseDeclaration());
+			skipNewlines();
 		}
-		return "unknown";
+		expectDedent();
+		(void)isCompile;
+		return Declaration{decl, decl.span, decl.location};
 	}
 
-	inline bool isNumericType(const SemanticType& type) {
-		return type.kind == SemanticTypeKind::Number;
+	Declaration parseUseDeclaration() {
+		UseDecl decl;
+		decl.location = previous().location;
+		decl.span = {decl.location, decl.location};
+		decl.path.push_back(parseQualifiedName());
+		if (matchKeyword("as")) {
+			decl.alias = expectIdentifier().text;
+		}
+		consumeLineBreak();
+		return Declaration{decl, decl.span, decl.location};
 	}
 
-	inline bool isAssignableTo(const SemanticType& target, const SemanticType& value) {
-		if (target.kind == SemanticTypeKind::Unknown || value.kind == SemanticTypeKind::Unknown) {
+	Declaration parseConstDeclaration(bool isPublic, bool isCompile) {
+		ConstDecl decl;
+		decl.location = previous().location;
+		decl.span = {decl.location, decl.location};
+		decl.isPublic = isPublic;
+		decl.isCompileTime = isCompile;
+		decl.name = expectIdentifier().text;
+		if (matchSymbol(":")) {
+			decl.typeName = parseTypeName();
+		}
+		expectSymbol("=");
+		decl.value = parseExpression();
+		consumeLineBreak();
+		return Declaration{decl, decl.span, decl.location};
+	}
+	void skipNewlines() {
+		while (peek().kind == TokenKind::Newline) {
+			++index_;
+		}
+	}
+
+	bool matchIndent() {
+		if (peek().kind == TokenKind::Indent) {
+			++index_;
 			return true;
-		}
-		if (target == value) {
-			return true;
-		}
-		if (target.kind == SemanticTypeKind::Number && value.kind == SemanticTypeKind::Number) {
-			// `number` is the contextual numeric-literal type; typed numerics do not implicitly convert.
-			return target.name == "number" || value.name == "number" || target.name == value.name;
-		}
-		if (target.kind == SemanticTypeKind::Custom && value.kind == SemanticTypeKind::Custom) {
-			return target.name == value.name;
-		}
-		if (target.kind == SemanticTypeKind::Custom || value.kind == SemanticTypeKind::Custom) {
-			return target.name == value.name;
-		}
-		if (target.kind == SemanticTypeKind::Void || value.kind == SemanticTypeKind::Void) {
-			return target.kind == value.kind;
 		}
 		return false;
 	}
 
-	inline bool isTruthyCompatible(const SemanticType& type) {
-		return type.kind == SemanticTypeKind::Bool || type.kind == SemanticTypeKind::Number || type.kind == SemanticTypeKind::String || type.kind == SemanticTypeKind::Null || type.kind == SemanticTypeKind::Custom || type.kind == SemanticTypeKind::Unknown;
+	bool matchDedent() {
+		if (peek().kind == TokenKind::Dedent) {
+			++index_;
+			return true;
+		}
+		return false;
 	}
 
-	class Parser {
-	public:
-		explicit Parser(std::vector<Token> tokens)
-			: tokens_(std::move(tokens)) {}
+	void expectIndent() {
+		if (!matchIndent()) {
+			throw std::runtime_error("expected indentation block");
+		}
+	}
 
-		Program parse() {
-			Program program;
-			skipNewlines();
-			while (!isAtEnd()) {
-				if (checkKeyword("public") || checkKeyword("compile") || checkKeyword("record") || checkKeyword("enum") || checkKeyword("variant") || checkKeyword("union") || checkKeyword("module") || checkKeyword("use") || checkKeyword("import") || checkKeyword("const") || checkKeyword("foreign")) {
-					program.declarations.push_back(parseDeclaration());
-					skipNewlines();
-					continue;
-				}
-				if (checkKeyword("routine")) {
-					program.routines.push_back(parseRoutine());
-					skipNewlines();
-					continue;
-				}
-				throw std::runtime_error("unexpected top-level token: " + peek().text);
-			}
-			return program;
+	void expectDedent() {
+		if (!matchDedent()) {
+			throw std::runtime_error("expected end of indented block");
 		}
+	}
 
-		Declaration parseDeclaration() {
-			bool isPublic = matchKeyword("public");
-			bool isCompile = matchKeyword("compile");
-			if (matchKeyword("routine")) {
-				return parseRoutineDeclaration(isPublic, isCompile);
-			}
-			if (matchKeyword("foreign")) {
-				return parseForeignDeclaration(isPublic, isCompile);
-			}
-			if (matchKeyword("record")) {
-				return parseRecordDeclaration(isPublic, isCompile);
-			}
-			if (matchKeyword("enum")) {
-				return parseEnumDeclaration(isPublic, isCompile);
-			}
-			if (matchKeyword("variant")) {
-				return parseVariantDeclaration(isPublic, isCompile);
-			}
-			if (matchKeyword("union")) {
-				return parseUnionDeclaration(isPublic, isCompile);
-			}
-			if (matchKeyword("module")) {
-				return parseModuleDeclaration(isPublic, isCompile);
-			}
-			if (matchKeyword("use") || matchKeyword("import")) {
-				return parseUseDeclaration();
-			}
-			if (matchKeyword("const")) {
-				return parseConstDeclaration(isPublic, isCompile);
-			}
-			throw std::runtime_error("expected top-level declaration");
+	std::vector<GenericParameter> parseGenericParameterList() {
+		std::vector<GenericParameter> params;
+		if (!matchSymbol("<")) return params;
+		while (!typeCloseAhead()) {
+			GenericParameter p;
+			p.isConst = matchKeyword("const");
+			auto name = expectIdentifier();
+			p.name = name.text; p.location = name.location;
+			if (p.isConst) { expectSymbol(":"); p.constType = parseTypeName(); }
+			params.push_back(std::move(p));
+			if (!matchSymbol(",")) break;
 		}
+		consumeTypeClose();
+		return params;
+	}
 
-	private:
-		const Token& peek() const { return tokens_[index_]; }
-		const Token& peek(std::size_t offset) const {
-			std::size_t pos = index_ + offset;
-			if (pos >= tokens_.size()) {
-				return tokens_.back();
-			}
-			return tokens_[pos];
-		}
-		const Token& previous() const { return tokens_[index_ - 1]; }
-		bool isAtEnd() const { return peek().kind == TokenKind::EndOfFile; }
-		bool checkKeyword(const std::string& value) const { return peek().kind == TokenKind::Keyword && peek().text == value; }
-		bool checkSymbol(const std::string& value) const { return peek().kind == TokenKind::Symbol && peek().text == value; }
-		bool checkKeywordAhead(std::size_t offset, const std::string& value) const { return peek(offset).kind == TokenKind::Keyword && peek(offset).text == value; }
-		bool checkSymbolAhead(std::size_t offset, const std::string& value) const { return peek(offset).kind == TokenKind::Symbol && peek(offset).text == value; }
-		bool matchKeyword(const std::string& value) {
-			if (checkKeyword(value)) {
-				++index_;
-				return true;
-			}
-			return false;
-		}
-		bool matchSymbol(const std::string& value) {
-			if (checkSymbol(value)) {
-				++index_;
-				return true;
-			}
-			return false;
-		}
-		Token consume() {
-			if (isAtEnd()) {
-				throw std::runtime_error("unexpected end of file");
-			}
-			return tokens_[index_++];
-		}
-		Token expectKeyword(const std::string& value) {
-			if (!matchKeyword(value)) {
-				throw std::runtime_error("expected keyword '" + value + "'");
-			}
-			return previous();
-		}
-		Token expectIdentifier() {
-			if (peek().kind != TokenKind::Identifier) {
-				throw std::runtime_error("expected identifier");
-			}
-			return consume();
-		}
-		Token expectSymbol(const std::string& value) {
-			if (!matchSymbol(value)) {
-				throw std::runtime_error("expected symbol '" + value + "'");
-			}
-			return previous();
-		}
-		Token expectToken(TokenKind kind, const std::string& description) {
-			if (peek().kind != kind) {
-				throw std::runtime_error("expected " + description);
-			}
-			return consume();
-		}
-
-		std::string parseQualifiedName() {
-			std::string name = expectIdentifier().text;
-			while (matchSymbol("::") || matchSymbol(".")) {
-				name += "::" + expectIdentifier().text;
-			}
-			return name;
-		}
-
-		Declaration parseRoutineDeclaration(bool isPublic, bool isCompile) {
-			Routine routine = parseRoutineCore();
-			routine.isPublic = isPublic;
-			routine.isCompileTime = isCompile;
-			return Declaration{ routine, routine.span, routine.location };
-		}
-
-		Routine parseRoutineCore() {
-			Routine routine;
-			routine.location = previous().location;
-			routine.span = { routine.location, routine.location };
-			routine.name = expectIdentifier().text;
-			routine.parameters = parseParameterList();
-			if (matchKeyword("gives")) {
-				routine.returnType = parseTypeName();
-			}
-			else {
-				routine.returnType = "void";
-			}
-			routine.effects = parseEffectClause();
-			skipNewlines();
-			expectIndent();
-			routine.body = parseBlockStatements();
-			expectDedent();
-			return routine;
-		}
-
-		Declaration parseForeignDeclaration(bool isPublic, bool isCompile) {
-			std::string abi = parseTypeName();
-			auto routine = parseRoutineCore();
-			routine.isPublic = isPublic;
-			routine.isCompileTime = isCompile;
-			routine.isForeign = true;
-			routine.foreignAbi = abi;
-			return Declaration{ ForeignDecl{abi, routine, routine.span, routine.location}, routine.span, routine.location };
-		}
-
-		std::vector<FieldDecl> parseFieldsBlock() {
-			std::vector<FieldDecl> fields;
-			skipNewlines();
-			expectIndent();
-			while (!checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
-				FieldDecl field;
-				field.name = expectIdentifier().text;
-				field.location = previous().location;
-				expectSymbol(":");
-				field.typeName = parseTypeName();
-				fields.push_back(field);
-				consumeLineBreak();
-				skipNewlines();
-			}
-			expectDedent();
-			return fields;
-		}
-
-		Declaration parseRecordDeclaration(bool isPublic, bool isCompile) {
-			RecordDecl record;
-			record.location = previous().location;
-			record.span = { record.location, record.location };
-			record.isPublic = isPublic;
-			record.isCompileTime = isCompile;
-			record.name = expectIdentifier().text;
-			record.fields = parseFieldsBlock();
-			return Declaration{ record, record.span, record.location };
-		}
-
-		Declaration parseUnionDeclaration(bool isPublic, bool isCompile) {
-			UnionDecl decl;
-			decl.location = previous().location;
-			decl.span = { decl.location, decl.location };
-			decl.isPublic = isPublic;
-			decl.layout = isCompile ? "packed" : "";
-			decl.name = expectIdentifier().text;
-			decl.fields = parseFieldsBlock();
-			return Declaration{ decl, decl.span, decl.location };
-		}
-
-		Declaration parseEnumDeclaration(bool isPublic, bool isCompile) {
-			EnumDecl decl;
-			decl.location = previous().location;
-			decl.span = { decl.location, decl.location };
-			decl.isPublic = isPublic;
-			decl.underlyingType = isCompile ? "ubyte" : "";
-			decl.name = expectIdentifier().text;
-			skipNewlines();
-			expectIndent();
-			while (!checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
-				std::string memberName = expectIdentifier().text;
-				std::optional<std::string> value;
-				if (matchSymbol("=")) {
-					value = parseTypeName();
-				}
-				decl.members.emplace_back(memberName, value);
-				consumeLineBreak();
-				skipNewlines();
-			}
-			expectDedent();
-			return Declaration{ decl, decl.span, decl.location };
-		}
-
-		Declaration parseVariantDeclaration(bool isPublic, bool isCompile) {
-			VariantDecl decl;
-			decl.location = previous().location;
-			decl.span = { decl.location, decl.location };
-			decl.isPublic = isPublic;
-			decl.name = expectIdentifier().text;
-			skipNewlines();
-			expectIndent();
-			while (!checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
-				VariantCase c;
-				c.name = expectIdentifier().text;
-				c.location = previous().location;
-				if (matchSymbol("(")) {
-					if (!checkSymbol(")")) {
-						for (;;) {
-							Parameter p;
-							if (checkKeyword("var") || checkKeyword("own") || checkKeyword("raw")) p.mode = consume().text;
-							p.name = expectIdentifier().text;
-							p.location = previous().location;
-							expectSymbol(":");
-							p.typeName = parseTypeName();
-							c.fields.push_back(p);
-							if (!matchSymbol(",")) break;
-						}
-					}
-					expectSymbol(")");
-				}
-				decl.cases.push_back(std::move(c));
-				consumeLineBreak();
-				skipNewlines();
-			}
-			expectDedent();
-			(void)isCompile;
-			return Declaration{ decl, decl.span, decl.location };
-		}
-
-		Declaration parseModuleDeclaration(bool isPublic, bool isCompile) {
-			ModuleDecl decl;
-			decl.location = previous().location;
-			decl.span = { decl.location, decl.location };
-			decl.isPublic = isPublic;
-			decl.name = expectIdentifier().text;
-			consumeLineBreak();
-			skipNewlines();
-			expectIndent();
-			while (!checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
-				decl.declarations.push_back(parseDeclaration());
-				skipNewlines();
-			}
-			expectDedent();
-			(void)isCompile;
-			return Declaration{ decl, decl.span, decl.location };
-		}
-
-		Declaration parseUseDeclaration() {
-			UseDecl decl;
-			decl.location = previous().location;
-			decl.span = { decl.location, decl.location };
-			decl.path.push_back(parseQualifiedName());
-			if (matchKeyword("as")) {
-				decl.alias = expectIdentifier().text;
-			}
-			consumeLineBreak();
-			return Declaration{ decl, decl.span, decl.location };
-		}
-
-		Declaration parseConstDeclaration(bool isPublic, bool isCompile) {
-			ConstDecl decl;
-			decl.location = previous().location;
-			decl.span = { decl.location, decl.location };
-			decl.isPublic = isPublic;
-			decl.isCompileTime = isCompile;
-			decl.name = expectIdentifier().text;
-			if (matchSymbol(":")) {
-				decl.typeName = parseTypeName();
-			}
-			expectSymbol("=");
-			decl.value = parseExpression();
-			consumeLineBreak();
-			return Declaration{ decl, decl.span, decl.location };
-		}
-		void skipNewlines() {
-			while (peek().kind == TokenKind::Newline) {
-				++index_;
-			}
-		}
-
-		bool matchIndent() {
-			if (peek().kind == TokenKind::Indent) {
-				++index_;
-				return true;
-			}
-			return false;
-		}
-
-		bool matchDedent() {
-			if (peek().kind == TokenKind::Dedent) {
-				++index_;
-				return true;
-			}
-			return false;
-		}
-
-		void expectIndent() {
-			if (!matchIndent()) {
-				throw std::runtime_error("expected indentation block");
-			}
-		}
-
-		void expectDedent() {
-			if (!matchDedent()) {
-				throw std::runtime_error("expected end of indented block");
-			}
-		}
-
-		std::vector<Parameter> parseParameterList() {
-			std::vector<Parameter> params;
-			auto listLocation = peek().location;
-			expectSymbol("(");
-			if (!checkSymbol(")")) {
-				for (;;) {
-					Parameter parameter;
-					if (checkKeyword("var") || checkKeyword("own") || checkKeyword("raw")) {
-						parameter.mode = consume().text;
-					}
-					parameter.name = expectIdentifier().text;
-					parameter.location = previous().location;
-					expectSymbol(":");
-					parameter.typeName = parseTypeName();
-					params.push_back(parameter);
-					if (matchSymbol(",")) {
-						continue;
-					}
-					break;
-				}
-			}
-			expectSymbol(")");
-			(void)listLocation;
-			return params;
-		}
-
-		std::string parseTypeName() {
-			if (matchSymbol("(")) {
-				std::string tuple = "(";
-				bool first = true;
-				while (!checkSymbol(")")) {
-					if (!first) { expectSymbol(","); tuple += ","; }
-					tuple += parseTypeName();
-					first = false;
-				}
-				expectSymbol(")");
-				return tuple + ")";
-			}
-			if (peek().kind != TokenKind::Identifier && peek().kind != TokenKind::Keyword) {
-				throw std::runtime_error("expected type name");
-			}
-			std::string name = consume().text;
-			while (matchSymbol("::")) {
-				name += "::" + expectIdentifier().text;
-			}
+	std::vector<CapabilityConstraint> parseWhereClause() {
+		std::vector<CapabilityConstraint> constraints;
+		if (!matchKeyword("where")) return constraints;
+		for (;;) {
+			CapabilityConstraint c;
+			auto subject = expectIdentifier(); c.subject = subject.text; c.location = subject.location;
+			expectKeyword("is");
+			if (peek().kind != TokenKind::Identifier && peek().kind != TokenKind::Keyword) throw std::runtime_error("expected capability name");
+			c.capability = consume().text;
 			if (matchSymbol("<")) {
-				name += "<";
-				bool first = true;
 				while (!typeCloseAhead()) {
-					if (!first) { expectSymbol(","); name += ","; }
-					name += parseTypeName();
-					first = false;
+					c.arguments.push_back(parseTypeName());
+					if (!matchSymbol(",")) break;
 				}
 				consumeTypeClose();
-				name += ">";
 			}
-			return name;
+			constraints.push_back(std::move(c));
+			if (!matchSymbol(",")) break;
 		}
+		return constraints;
+	}
 
-		bool typeCloseAhead() const {
-			return pendingTypeClosers_ != 0 || checkSymbol(">") || checkSymbol(">>");
-		}
-
-		void consumeTypeClose() {
-			if (pendingTypeClosers_ != 0) { --pendingTypeClosers_; return; }
-			if (matchSymbol(">")) return;
-			if (matchSymbol(">>")) { pendingTypeClosers_ = 1; return; }
-			throw std::runtime_error("expected '>' to close generic type");
-		}
-
-		std::vector<std::string> parseEffectClause() {
-			std::vector<std::string> effects;
-			if (!matchKeyword("with")) return effects;
+	std::vector<Parameter> parseParameterList() {
+		std::vector<Parameter> params;
+		auto listLocation = peek().location;
+		expectSymbol("(");
+		if (!checkSymbol(")")) {
 			for (;;) {
-				if (peek().kind != TokenKind::Keyword && peek().kind != TokenKind::Identifier)
-					throw std::runtime_error("expected effect name after 'with'");
-				std::string effect = consume().text;
-				static const std::unordered_set<std::string> allowed = { "alloc", "io", "thread", "trap", "unsafe", "pure" };
-				if (!allowed.count(effect)) throw std::runtime_error("unknown effect: " + effect);
-				effects.push_back(effect);
-				if (!matchSymbol(",")) break;
+				Parameter parameter;
+				if (checkKeyword("var") || checkKeyword("own") || checkKeyword("raw")) {
+					parameter.mode = consume().text;
+				}
+				parameter.name = expectIdentifier().text;
+				parameter.location = previous().location;
+				expectSymbol(":");
+				parameter.typeName = parseTypeName();
+				params.push_back(parameter);
+				if (matchSymbol(",")) {
+					continue;
+				}
+				break;
 			}
-			if (std::find(effects.begin(), effects.end(), "pure") != effects.end() && effects.size() != 1)
-				throw std::runtime_error("'pure' cannot be combined with another effect");
-			return effects;
+		}
+		expectSymbol(")");
+		(void)listLocation;
+		return params;
+	}
+
+	std::string parseTypeName() {
+		if (matchSymbol("(")) {
+			std::string tuple = "(";
+			bool first = true;
+			while (!checkSymbol(")")) {
+				if (!first) { expectSymbol(","); tuple += ","; }
+				tuple += parseTypeName();
+				first = false;
+			}
+			expectSymbol(")");
+			return tuple + ")";
+		}
+		if (peek().kind != TokenKind::Identifier && peek().kind != TokenKind::Keyword) {
+			throw std::runtime_error("expected type name");
+		}
+		std::string name = consume().text;
+		while (matchSymbol("::")) {
+			name += "::" + expectIdentifier().text;
+		}
+		if (matchSymbol("<")) {
+			name += "<";
+			bool first = true;
+			while (!typeCloseAhead()) {
+				if (!first) { expectSymbol(","); name += ","; }
+				name += parseTypeName();
+				first = false;
+			}
+			consumeTypeClose();
+			name += ">";
+		}
+		return name;
+	}
+
+	bool typeCloseAhead() const {
+		return pendingTypeClosers_ != 0 || checkSymbol(">") || checkSymbol(">>");
+	}
+
+	void consumeTypeClose() {
+		if (pendingTypeClosers_ != 0) { --pendingTypeClosers_; return; }
+		if (matchSymbol(">")) return;
+		if (matchSymbol(">>")) { pendingTypeClosers_ = 1; return; }
+		throw std::runtime_error("expected '>' to close generic type");
+	}
+
+	std::vector<std::string> parseEffectClause() {
+		std::vector<std::string> effects;
+		if (!matchKeyword("with")) return effects;
+		for (;;) {
+			if (peek().kind != TokenKind::Keyword && peek().kind != TokenKind::Identifier)
+				throw std::runtime_error("expected effect name after 'with'");
+			std::string effect = consume().text;
+			static const std::unordered_set<std::string> allowed = {"alloc", "io", "thread", "trap", "unsafe", "pure"};
+			if (!allowed.count(effect)) throw std::runtime_error("unknown effect: " + effect);
+			effects.push_back(effect);
+			if (!matchSymbol(",")) break;
+		}
+		if (std::find(effects.begin(), effects.end(), "pure") != effects.end() && effects.size() != 1)
+			throw std::runtime_error("'pure' cannot be combined with another effect");
+		return effects;
+	}
+
+	Routine parseRoutine() {
+		expectKeyword("routine");
+		Routine routine;
+		routine.location = previous().location;
+		routine.span = {routine.location, routine.location};
+		routine.name = expectIdentifier().text;
+		routine.genericParameters = parseGenericParameterList();
+		routine.parameters = parseParameterList();
+		if (matchKeyword("gives")) {
+			routine.returnType = parseTypeName();
+		} else {
+			routine.returnType = "void";
+		}
+		routine.constraints = parseWhereClause();
+		routine.effects = parseEffectClause();
+		skipNewlines();
+		expectIndent();
+		routine.body = parseBlockStatements();
+		expectDedent();
+		return routine;
+	}
+
+	std::vector<StmtPtr> parseBlockStatements() {
+		std::vector<StmtPtr> statements;
+		skipNewlines();
+		while (!isAtEnd() && !checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
+			statements.push_back(parseStatement());
+			skipNewlines();
+		}
+		return statements;
+	}
+
+	bool checkToken(TokenKind kind) const {
+		return peek().kind == kind;
+	}
+
+	StmtPtr makeStmt(Stmt::Node node, SourceSpan span, SourceLocation location) const {
+		return std::visit([&](const auto& value) -> StmtPtr {
+			using T = std::decay_t<decltype(value)>;
+			if constexpr (std::is_same_v<T, LetStmt>) {
+				return AstFactory::makeStmt(Stmt{LetStmt{value.name, value.typeName, value.initializer, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, VarStmt>) {
+				return AstFactory::makeStmt(Stmt{VarStmt{value.name, value.typeName, value.initializer, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, AssignStmt>) {
+				return AstFactory::makeStmt(Stmt{AssignStmt{value.name, value.value, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, ExprStmt>) {
+				return AstFactory::makeStmt(Stmt{ExprStmt{value.expression, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, ReturnStmt>) {
+				return AstFactory::makeStmt(Stmt{ReturnStmt{value.value, value.hasValue, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, GiveStmt>) {
+				return AstFactory::makeStmt(Stmt{GiveStmt{value.value, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, IfStmt>) {
+				return AstFactory::makeStmt(Stmt{IfStmt{value.condition, value.thenBranch, value.elseBranch, value.hasElse, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, EachStmt>) {
+				return AstFactory::makeStmt(Stmt{EachStmt{value.bindings, value.range, value.body, span, location, value.bindingsMutable}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, UnsafeStmt>) {
+				return AstFactory::makeStmt(Stmt{UnsafeStmt{value.body, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, DeferStmt>) {
+				return AstFactory::makeStmt(Stmt{DeferStmt{value.expression, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, FailStmt>) {
+				return AstFactory::makeStmt(Stmt{FailStmt{value.expression, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, WhileStmt>) {
+				return AstFactory::makeStmt(Stmt{WhileStmt{value.condition, value.body, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, BreakStmt>) {
+				return AstFactory::makeStmt(Stmt{BreakStmt{value.label, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, ContinueStmt>) {
+				return AstFactory::makeStmt(Stmt{ContinueStmt{value.label, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, BlockStmt>) {
+				return AstFactory::makeStmt(Stmt{BlockStmt{value.statements, span, location}, span, location}, span);
+			} else {
+				return AstFactory::makeStmt(Stmt{BlockStmt{{}, span, location}, span, location}, span);
+			}
+		}, node);
+	}
+
+	ExprPtr makeExpr(Expr::Node node, SourceSpan span, SourceLocation location) const {
+		return std::visit([&](const auto& value) -> ExprPtr {
+			using T = std::decay_t<decltype(value)>;
+			if constexpr (std::is_same_v<T, NumberExpr>) {
+				return AstFactory::makeExpr(Expr{NumberExpr{value.value, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, StringExpr>) {
+				return AstFactory::makeExpr(Expr{StringExpr{value.value, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, BoolExpr>) {
+				return AstFactory::makeExpr(Expr{BoolExpr{value.value, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, NullExpr>) {
+				return AstFactory::makeExpr(Expr{NullExpr{span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, VariableExpr>) {
+				return AstFactory::makeExpr(Expr{VariableExpr{value.name, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, UnaryExpr>) {
+				return AstFactory::makeExpr(Expr{UnaryExpr{value.op, value.operand, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, BinaryExpr>) {
+				return AstFactory::makeExpr(Expr{BinaryExpr{value.op, value.left, value.right, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, PipelineExpr>) {
+				return AstFactory::makeExpr(Expr{PipelineExpr{value.input, value.stages, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, RangeExpr>) {
+				return AstFactory::makeExpr(Expr{RangeExpr{value.start, value.end, value.step, value.inclusive, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, ChooseExpr>) {
+				return AstFactory::makeExpr(Expr{ChooseExpr{value.subject, value.cases, value.otherwiseValue, value.hasOtherwise, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, CallExpr>) {
+				return AstFactory::makeExpr(Expr{CallExpr{value.callee, value.arguments, value.genericArguments, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, TryExpr>) {
+				return AstFactory::makeExpr(Expr{TryExpr{value.operand, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, ClosureExpr>) {
+				return AstFactory::makeExpr(Expr{ClosureExpr{value.parameters, value.returnType, value.effects, value.expressionBody, value.blockBody, value.hasExpressionBody, value.moveCapture, value.closureId, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, GroupExpr>) {
+				return AstFactory::makeExpr(Expr{GroupExpr{value.expression, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, MemberExpr>) {
+				return AstFactory::makeExpr(Expr{MemberExpr{value.object, value.member, span, location}, span, location}, span);
+			} else if constexpr (std::is_same_v<T, ConstructExpr>) {
+				return AstFactory::makeExpr(Expr{ConstructExpr{value.typeName, value.fields, span, location}, span, location}, span);
+			} else {
+				return AstFactory::makeExpr(Expr{GroupExpr{value.expression, span, location}, span, location}, span);
+			}
+		}, node);
+	}
+
+	std::string parseOperatorText() {
+		Token token = consume();
+		return token.text;
+	}
+
+	StmtPtr parseStatement() {
+		if (matchKeyword("let")) {
+			auto location = previous().location;
+			auto start = location;
+			const std::string name = expectIdentifier().text;
+			std::string typeName;
+			if (matchSymbol(":")) {
+				typeName = parseTypeName();
+			}
+			expectSymbol("=");
+			auto initializer = parseExpression();
+			consumeLineBreak();
+			return makeStmt(LetStmt{name, typeName, initializer, {start, location}, location}, {start, location}, location);
 		}
 
-		Routine parseRoutine() {
-			expectKeyword("routine");
-			Routine routine;
-			routine.location = previous().location;
-			routine.span = { routine.location, routine.location };
-			routine.name = expectIdentifier().text;
-			routine.parameters = parseParameterList();
-			if (matchKeyword("gives")) {
-				routine.returnType = parseTypeName();
+		if (matchKeyword("var")) {
+			auto location = previous().location;
+			auto start = location;
+			const std::string name = expectIdentifier().text;
+			std::string typeName;
+			if (matchSymbol(":")) {
+				typeName = parseTypeName();
 			}
-			else {
-				routine.returnType = "void";
+			auto initializer = ExprPtr{};
+			if (matchSymbol("=")) {
+				initializer = parseExpression();
 			}
-			routine.effects = parseEffectClause();
+			consumeLineBreak();
+			return makeStmt(VarStmt{name, typeName, initializer, {start, location}, location}, {start, location}, location);
+		}
+
+		if (matchKeyword("if")) {
+			auto location = previous().location;
+			auto start = location;
+			auto condition = parseExpression();
+			consumeLineBreak();
 			skipNewlines();
 			expectIndent();
-			routine.body = parseBlockStatements();
+			auto thenBranch = parseBlockStatements();
 			expectDedent();
-			return routine;
-		}
-
-		std::vector<StmtPtr> parseBlockStatements() {
-			std::vector<StmtPtr> statements;
+			std::vector<StmtPtr> elseBranch;
+			bool hasElse = false;
 			skipNewlines();
-			while (!isAtEnd() && !checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
-				statements.push_back(parseStatement());
-				skipNewlines();
-			}
-			return statements;
-		}
-
-		bool checkToken(TokenKind kind) const {
-			return peek().kind == kind;
-		}
-
-		StmtPtr makeStmt(Stmt::Node node, SourceSpan span, SourceLocation location) const {
-			return std::visit([&](const auto& value) -> StmtPtr {
-				using T = std::decay_t<decltype(value)>;
-				if constexpr (std::is_same_v<T, LetStmt>) {
-					return AstFactory::makeStmt(Stmt{ LetStmt{value.name, value.typeName, value.initializer, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, VarStmt>) {
-					return AstFactory::makeStmt(Stmt{ VarStmt{value.name, value.typeName, value.initializer, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, AssignStmt>) {
-					return AstFactory::makeStmt(Stmt{ AssignStmt{value.name, value.value, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, ExprStmt>) {
-					return AstFactory::makeStmt(Stmt{ ExprStmt{value.expression, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, ReturnStmt>) {
-					return AstFactory::makeStmt(Stmt{ ReturnStmt{value.value, value.hasValue, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, GiveStmt>) {
-					return AstFactory::makeStmt(Stmt{ GiveStmt{value.value, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, IfStmt>) {
-					return AstFactory::makeStmt(Stmt{ IfStmt{value.condition, value.thenBranch, value.elseBranch, value.hasElse, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, EachStmt>) {
-					return AstFactory::makeStmt(Stmt{ EachStmt{value.bindings, value.range, value.body, span, location, value.bindingsMutable}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, UnsafeStmt>) {
-					return AstFactory::makeStmt(Stmt{ UnsafeStmt{value.body, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, DeferStmt>) {
-					return AstFactory::makeStmt(Stmt{ DeferStmt{value.expression, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, FailStmt>) {
-					return AstFactory::makeStmt(Stmt{ FailStmt{value.expression, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, WhileStmt>) {
-					return AstFactory::makeStmt(Stmt{ WhileStmt{value.condition, value.body, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, BreakStmt>) {
-					return AstFactory::makeStmt(Stmt{ BreakStmt{value.label, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, ContinueStmt>) {
-					return AstFactory::makeStmt(Stmt{ ContinueStmt{value.label, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, BlockStmt>) {
-					return AstFactory::makeStmt(Stmt{ BlockStmt{value.statements, span, location}, span, location }, span);
-				}
-				else {
-					return AstFactory::makeStmt(Stmt{ BlockStmt{{}, span, location}, span, location }, span);
-				}
-				}, node);
-		}
-
-		ExprPtr makeExpr(Expr::Node node, SourceSpan span, SourceLocation location) const {
-			return std::visit([&](const auto& value) -> ExprPtr {
-				using T = std::decay_t<decltype(value)>;
-				if constexpr (std::is_same_v<T, NumberExpr>) {
-					return AstFactory::makeExpr(Expr{ NumberExpr{value.value, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, StringExpr>) {
-					return AstFactory::makeExpr(Expr{ StringExpr{value.value, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, BoolExpr>) {
-					return AstFactory::makeExpr(Expr{ BoolExpr{value.value, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, NullExpr>) {
-					return AstFactory::makeExpr(Expr{ NullExpr{span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, VariableExpr>) {
-					return AstFactory::makeExpr(Expr{ VariableExpr{value.name, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, UnaryExpr>) {
-					return AstFactory::makeExpr(Expr{ UnaryExpr{value.op, value.operand, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, BinaryExpr>) {
-					return AstFactory::makeExpr(Expr{ BinaryExpr{value.op, value.left, value.right, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, PipelineExpr>) {
-					return AstFactory::makeExpr(Expr{ PipelineExpr{value.input, value.stages, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, RangeExpr>) {
-					return AstFactory::makeExpr(Expr{ RangeExpr{value.start, value.end, value.step, value.inclusive, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, ChooseExpr>) {
-					return AstFactory::makeExpr(Expr{ ChooseExpr{value.subject, value.cases, value.otherwiseValue, value.hasOtherwise, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, CallExpr>) {
-					return AstFactory::makeExpr(Expr{ CallExpr{value.callee, value.arguments, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, GroupExpr>) {
-					return AstFactory::makeExpr(Expr{ GroupExpr{value.expression, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, MemberExpr>) {
-					return AstFactory::makeExpr(Expr{ MemberExpr{value.object, value.member, span, location}, span, location }, span);
-				}
-				else if constexpr (std::is_same_v<T, ConstructExpr>) {
-					return AstFactory::makeExpr(Expr{ ConstructExpr{value.typeName, value.fields, span, location}, span, location }, span);
-				}
-				else {
-					return AstFactory::makeExpr(Expr{ GroupExpr{value.expression, span, location}, span, location }, span);
-				}
-				}, node);
-		}
-
-		std::string parseOperatorText() {
-			Token token = consume();
-			return token.text;
-		}
-
-		StmtPtr parseStatement() {
-			if (matchKeyword("let")) {
-				auto location = previous().location;
-				auto start = location;
-				const std::string name = expectIdentifier().text;
-				std::string typeName;
-				if (matchSymbol(":")) {
-					typeName = parseTypeName();
-				}
-				expectSymbol("=");
-				auto initializer = parseExpression();
-				consumeLineBreak();
-				return makeStmt(LetStmt{ name, typeName, initializer, {start, location}, location }, { start, location }, location);
-			}
-
-			if (matchKeyword("var")) {
-				auto location = previous().location;
-				auto start = location;
-				const std::string name = expectIdentifier().text;
-				std::string typeName;
-				if (matchSymbol(":")) {
-					typeName = parseTypeName();
-				}
-				auto initializer = ExprPtr{};
-				if (matchSymbol("=")) {
-					initializer = parseExpression();
-				}
-				consumeLineBreak();
-				return makeStmt(VarStmt{ name, typeName, initializer, {start, location}, location }, { start, location }, location);
-			}
-
-			if (matchKeyword("if")) {
-				auto location = previous().location;
-				auto start = location;
-				auto condition = parseExpression();
+			if (matchKeyword("else")) {
 				consumeLineBreak();
 				skipNewlines();
 				expectIndent();
-				auto thenBranch = parseBlockStatements();
+				elseBranch = parseBlockStatements();
 				expectDedent();
-				std::vector<StmtPtr> elseBranch;
-				bool hasElse = false;
-				skipNewlines();
-				if (matchKeyword("else")) {
-					consumeLineBreak();
-					skipNewlines();
-					expectIndent();
-					elseBranch = parseBlockStatements();
-					expectDedent();
-					hasElse = true;
-				}
-				return makeStmt(IfStmt{ condition, std::move(thenBranch), std::move(elseBranch), hasElse, {start, location}, location }, { start, location }, location);
+				hasElse = true;
 			}
+			return makeStmt(IfStmt{condition, std::move(thenBranch), std::move(elseBranch), hasElse, {start, location}, location}, {start, location}, location);
+		}
 
-			if (matchKeyword("while")) {
-				auto location = previous().location;
-				auto start = location;
-				auto condition = parseExpression();
-				consumeLineBreak();
-				skipNewlines();
-				expectIndent();
-				auto body = parseBlockStatements();
-				expectDedent();
-				return makeStmt(WhileStmt{ condition, std::move(body), {start, location}, location }, { start, location }, location);
-			}
+		if (matchKeyword("while")) {
+			auto location = previous().location;
+			auto start = location;
+			auto condition = parseExpression();
+			consumeLineBreak();
+			skipNewlines();
+			expectIndent();
+			auto body = parseBlockStatements();
+			expectDedent();
+			return makeStmt(WhileStmt{condition, std::move(body), {start, location}, location}, {start, location}, location);
+		}
 
 
-			if (matchKeyword("loop")) {
-				auto location = previous().location;
-				auto start = location;
-				consumeLineBreak();
-				skipNewlines();
-				expectIndent();
-				auto body = parseBlockStatements();
-				expectDedent();
-				auto condition = makeExpr(BoolExpr{ true, {location, location}, location }, { location, location }, location);
-				return makeStmt(WhileStmt{ condition, std::move(body), {start, location}, location }, { start, location }, location);
-			}
+        if (matchKeyword("loop")) {
+            auto location = previous().location;
+            auto start = location;
+            consumeLineBreak();
+            skipNewlines();
+            expectIndent();
+            auto body = parseBlockStatements();
+            expectDedent();
+            auto condition = makeExpr(BoolExpr{true, {location, location}, location}, {location, location}, location);
+            return makeStmt(WhileStmt{condition, std::move(body), {start, location}, location}, {start, location}, location);
+        }
 
-			if (matchKeyword("break") || matchKeyword("continue")) {
-				const bool isBreak = previous().text == "break";
-				auto location = previous().location;
-				std::string label;
-				if (matchSymbol("@")) label = expectIdentifier().text;
-				consumeLineBreak();
-				if (isBreak) return makeStmt(BreakStmt{ label, {location, location}, location }, { location, location }, location);
-				return makeStmt(ContinueStmt{ label, {location, location}, location }, { location, location }, location);
-			}
+        if (matchKeyword("break") || matchKeyword("continue")) {
+            const bool isBreak = previous().text == "break";
+            auto location = previous().location;
+            std::string label;
+            if (matchSymbol("@")) label = expectIdentifier().text;
+            consumeLineBreak();
+            if (isBreak) return makeStmt(BreakStmt{label, {location, location}, location}, {location, location}, location);
+            return makeStmt(ContinueStmt{label, {location, location}, location}, {location, location}, location);
+        }
 
-			if (matchKeyword("each") || matchKeyword("for")) {
-				auto location = previous().location;
-				auto start = location;
-				bool bindingsMutable = matchKeyword("var");
-				std::vector<std::string> bindings;
+		if (matchKeyword("each") || matchKeyword("for")) {
+			auto location = previous().location;
+			auto start = location;
+			bool bindingsMutable = matchKeyword("var");
+			std::vector<std::string> bindings;
+			bindings.push_back(expectIdentifier().text);
+			while (matchSymbol(",")) {
 				bindings.push_back(expectIdentifier().text);
-				while (matchSymbol(",")) {
-					bindings.push_back(expectIdentifier().text);
-				}
-				expectKeyword("in");
-				auto range = parseExpression();
-				consumeLineBreak();
-				skipNewlines();
-				expectIndent();
-				auto body = parseBlockStatements();
-				expectDedent();
-				return makeStmt(EachStmt{ std::move(bindings), range, std::move(body), {start, location}, location, bindingsMutable }, { start, location }, location);
 			}
+			expectKeyword("in");
+			auto range = parseExpression();
+			consumeLineBreak();
+			skipNewlines();
+			expectIndent();
+			auto body = parseBlockStatements();
+			expectDedent();
+			return makeStmt(EachStmt{std::move(bindings), range, std::move(body), {start, location}, location, bindingsMutable}, {start, location}, location);
+		}
 
-			if (matchKeyword("unsafe")) {
-				auto location = previous().location;
-				auto start = location;
-				consumeLineBreak();
-				skipNewlines();
-				expectIndent();
-				auto body = parseBlockStatements();
-				expectDedent();
-				return makeStmt(UnsafeStmt{ std::move(body), {start, location}, location }, { start, location }, location);
-			}
+		if (matchKeyword("unsafe")) {
+			auto location = previous().location;
+			auto start = location;
+			consumeLineBreak();
+			skipNewlines();
+			expectIndent();
+			auto body = parseBlockStatements();
+			expectDedent();
+			return makeStmt(UnsafeStmt{std::move(body), {start, location}, location}, {start, location}, location);
+		}
 
-			if (matchKeyword("defer")) {
-				auto location = previous().location;
-				auto start = location;
-				auto expression = parseExpression();
-				consumeLineBreak();
-				return makeStmt(DeferStmt{ expression, {start, location}, location }, { start, location }, location);
-			}
-
-			if (matchKeyword("fail")) {
-				auto location = previous().location;
-				auto start = location;
-				auto expression = parseExpression();
-				consumeLineBreak();
-				return makeStmt(FailStmt{ expression, {start, location}, location }, { start, location }, location);
-			}
-
-			if (matchKeyword("give")) {
-				auto location = previous().location;
-				auto start = location;
-				auto value = parseExpression();
-				consumeLineBreak();
-				return makeStmt(GiveStmt{ value, {start, location}, location }, { start, location }, location);
-			}
-
-			if (matchKeyword("return")) {
-				auto location = previous().location;
-				auto start = location;
-				if (peek().kind == TokenKind::Newline || peek().kind == TokenKind::Dedent || peek().kind == TokenKind::EndOfFile) {
-					consumeLineBreak();
-					return makeStmt(ReturnStmt{ nullptr, false, {start, location}, location }, { start, location }, location);
-				}
-				auto value = parseExpression();
-				consumeLineBreak();
-				return makeStmt(ReturnStmt{ value, true, {start, location}, location }, { start, location }, location);
-			}
-
-			if (peek().kind == TokenKind::Identifier && isAssignmentOperator(peek(1).text)) {
-				auto location = peek().location;
-				auto start = location;
-				std::string name = expectIdentifier().text;
-				std::string assignOp = consume().text;
-				auto value = parseExpression();
-				if (assignOp != "=") {
-					std::string binaryOp = assignOp.substr(0, assignOp.size() - 1);
-					auto lhs = makeExpr(VariableExpr{ name, {start, location}, location }, { start, location }, location);
-					value = makeExpr(BinaryExpr{ binaryOp, lhs, value, {start, value ? value->span.end : location}, location }, { start, value ? value->span.end : location }, location);
-				}
-				consumeLineBreak();
-				return makeStmt(AssignStmt{ name, value, {start, location}, location }, { start, location }, location);
-			}
-
-			auto location = peek().location;
+		if (matchKeyword("defer")) {
+			auto location = previous().location;
 			auto start = location;
 			auto expression = parseExpression();
 			consumeLineBreak();
-			return makeStmt(ExprStmt{ expression, {start, location}, location }, { start, location }, location);
+			return makeStmt(DeferStmt{expression, {start, location}, location}, {start, location}, location);
 		}
 
-		static bool isAssignmentOperator(const std::string& op) {
-			static const std::unordered_set<std::string> ops = {
-				"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="
-			};
-			return ops.count(op) != 0;
+		if (matchKeyword("fail")) {
+			auto location = previous().location;
+			auto start = location;
+			auto expression = parseExpression();
+			consumeLineBreak();
+			return makeStmt(FailStmt{expression, {start, location}, location}, {start, location}, location);
 		}
 
-		void consumeLineBreak() {
-			if (peek().kind == TokenKind::Newline) {
-				++index_;
-				return;
-			}
-			if (peek().kind == TokenKind::Dedent || peek().kind == TokenKind::EndOfFile) {
-				return;
-			}
-			throw std::runtime_error("expected end of line");
+		if (matchKeyword("give")) {
+			auto location = previous().location;
+			auto start = location;
+			auto value = parseExpression();
+			consumeLineBreak();
+			return makeStmt(GiveStmt{value, {start, location}, location}, {start, location}, location);
 		}
 
-		ExprPtr parseExpression() { return parseChoose(); }
-
-		ExprPtr parseChoose() {
-			if (matchKeyword("choose")) {
-				auto location = previous().location;
-				auto start = location;
-				ExprPtr subject;
-				if (!(checkToken(TokenKind::Newline) || checkToken(TokenKind::Indent) || checkToken(TokenKind::Dedent) || checkToken(TokenKind::EndOfFile))) {
-					subject = parsePipeline();
-				}
+		if (matchKeyword("return")) {
+			auto location = previous().location;
+			auto start = location;
+			if (peek().kind == TokenKind::Newline || peek().kind == TokenKind::Dedent || peek().kind == TokenKind::EndOfFile) {
 				consumeLineBreak();
-				skipNewlines();
-				expectIndent();
-				std::vector<ChooseCase> cases;
-				ExprPtr otherwiseValue;
-				bool hasOtherwise = false;
-				while (!checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
-					if (matchKeyword("when") || matchKeyword("case")) {
-						auto clauseLoc = previous().location;
-						auto clauseStart = clauseLoc;
-						auto condition = parseExpression();
-						consumeLineBreak();
-						skipNewlines();
-						expectIndent();
-						auto value = parseExpression();
-						consumeLineBreak();
-						expectDedent();
-						cases.push_back(ChooseCase{ condition, value, {}, {}, {clauseStart, clauseLoc}, clauseLoc });
-						continue;
-					}
-					if (matchKeyword("otherwise")) {
-						consumeLineBreak();
-						skipNewlines();
-						expectIndent();
-						otherwiseValue = parseExpression();
-						consumeLineBreak();
-						expectDedent();
-						hasOtherwise = true;
-						continue;
-					}
-					throw std::runtime_error("expected choose clause");
+				return makeStmt(ReturnStmt{nullptr, false, {start, location}, location}, {start, location}, location);
+			}
+			auto value = parseExpression();
+			consumeLineBreak();
+			return makeStmt(ReturnStmt{value, true, {start, location}, location}, {start, location}, location);
+		}
+
+		if (peek().kind == TokenKind::Identifier && isAssignmentOperator(peek(1).text)) {
+			auto location = peek().location;
+			auto start = location;
+			std::string name = expectIdentifier().text;
+			std::string assignOp = consume().text;
+			auto value = parseExpression();
+			if (assignOp != "=") {
+				std::string binaryOp = assignOp.substr(0, assignOp.size() - 1);
+				auto lhs = makeExpr(VariableExpr{name, {start, location}, location}, {start, location}, location);
+				value = makeExpr(BinaryExpr{binaryOp, lhs, value, {start, value ? value->span.end : location}, location}, {start, value ? value->span.end : location}, location);
+			}
+			consumeLineBreak();
+			return makeStmt(AssignStmt{name, value, {start, location}, location}, {start, location}, location);
+		}
+
+		auto location = peek().location;
+		auto start = location;
+		auto expression = parseExpression();
+		consumeLineBreak();
+		return makeStmt(ExprStmt{expression, {start, location}, location}, {start, location}, location);
+	}
+
+	static bool isAssignmentOperator(const std::string& op) {
+		static const std::unordered_set<std::string> ops = {
+			"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="
+		};
+		return ops.count(op) != 0;
+	}
+
+	void consumeLineBreak() {
+		if (peek().kind == TokenKind::Newline) {
+			++index_;
+			return;
+		}
+		if (peek().kind == TokenKind::Dedent || peek().kind == TokenKind::EndOfFile) {
+			return;
+		}
+		throw std::runtime_error("expected end of line");
+	}
+
+	ExprPtr parseExpression() { return parseChoose(); }
+
+	ExprPtr parseChoose() {
+		if (matchKeyword("choose")) {
+			auto location = previous().location;
+			auto start = location;
+			ExprPtr subject;
+			if (!(checkToken(TokenKind::Newline) || checkToken(TokenKind::Indent) || checkToken(TokenKind::Dedent) || checkToken(TokenKind::EndOfFile))) {
+				subject = parsePipeline();
+			}
+			consumeLineBreak();
+			skipNewlines();
+			expectIndent();
+			std::vector<ChooseCase> cases;
+			ExprPtr otherwiseValue;
+			bool hasOtherwise = false;
+			while (!checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
+				if (matchKeyword("when") || matchKeyword("case")) {
+					auto clauseLoc = previous().location;
+					auto clauseStart = clauseLoc;
+					auto condition = parseExpression();
+					consumeLineBreak();
+					skipNewlines();
+					expectIndent();
+					auto value = parseExpression();
+					consumeLineBreak();
+					expectDedent();
+					cases.push_back(ChooseCase{condition, value, {}, {}, {clauseStart, clauseLoc}, clauseLoc});
+					continue;
 				}
-				expectDedent();
-				return makeExpr(ChooseExpr{ subject, std::move(cases), otherwiseValue, hasOtherwise, {start, location}, location }, { start, location }, location);
+				if (matchKeyword("otherwise")) {
+					consumeLineBreak();
+					skipNewlines();
+					expectIndent();
+					otherwiseValue = parseExpression();
+					consumeLineBreak();
+					expectDedent();
+					hasOtherwise = true;
+					continue;
+				}
+				throw std::runtime_error("expected choose clause");
 			}
-			return parsePipeline();
+			expectDedent();
+			return makeExpr(ChooseExpr{subject, std::move(cases), otherwiseValue, hasOtherwise, {start, location}, location}, {start, location}, location);
 		}
+		return parsePipeline();
+	}
 
-		ExprPtr parsePipeline() {
-			auto expr = parseLogicalOr();
-			while (matchSymbol("->")) {
-				auto location = previous().location;
-				std::vector<ExprPtr> stages;
-				stages.push_back(parseCall());
-				auto start = expr ? expr->span.start : location;
-				auto end = stages.back() ? stages.back()->span.end : location;
-				auto nodeSpan = SourceSpan{ start, end };
-				expr = makeExpr(PipelineExpr{ expr, std::move(stages), nodeSpan, location }, nodeSpan, location);
+	ExprPtr parsePipeline() {
+		auto expr = parseLogicalOr();
+		while (matchSymbol("->")) {
+			auto location = previous().location;
+			std::vector<ExprPtr> stages;
+			stages.push_back(parseCall());
+			auto start = expr ? expr->span.start : location;
+			auto end = stages.back() ? stages.back()->span.end : location;
+			auto nodeSpan = SourceSpan{start, end};
+			expr = makeExpr(PipelineExpr{expr, std::move(stages), nodeSpan, location}, nodeSpan, location);
+		}
+		return expr;
+	}
+
+	ExprPtr parseLogicalOr() {
+		auto expr = parseLogicalAnd();
+		while (matchKeyword("or") || matchSymbol("||")) {
+			std::string op = previous().text;
+			auto location = previous().location;
+			auto right = parseLogicalAnd();
+			expr = makeExpr(BinaryExpr{op, expr, right, {location, right ? right->span.end : location}, location}, {location, right ? right->span.end : location}, location);
+		}
+		return expr;
+	}
+
+	ExprPtr parseLogicalAnd() {
+		auto expr = parseBitwiseOr();
+		while (matchKeyword("and") || matchSymbol("&&")) {
+			std::string op = previous().text;
+			auto location = previous().location;
+			auto right = parseBitwiseOr();
+			expr = makeExpr(BinaryExpr{op, expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location}, {expr ? expr->span.start : location, right ? right->span.end : location}, location);
+		}
+		return expr;
+	}
+
+
+    ExprPtr parseBitwiseOr() {
+        auto expr = parseBitwiseXor();
+        while (matchSymbol("|")) {
+            auto location = previous().location; auto right = parseBitwiseXor();
+            expr = makeExpr(BinaryExpr{"|", expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location}, {expr ? expr->span.start : location, right ? right->span.end : location}, location);
+        }
+        return expr;
+    }
+
+    ExprPtr parseBitwiseXor() {
+        auto expr = parseBitwiseAnd();
+        while (matchSymbol("^")) {
+            auto location = previous().location; auto right = parseBitwiseAnd();
+            expr = makeExpr(BinaryExpr{"^", expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location}, {expr ? expr->span.start : location, right ? right->span.end : location}, location);
+        }
+        return expr;
+    }
+
+    ExprPtr parseBitwiseAnd() {
+        auto expr = parseEquality();
+        while (matchSymbol("&")) {
+            auto location = previous().location; auto right = parseEquality();
+            expr = makeExpr(BinaryExpr{"&", expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location}, {expr ? expr->span.start : location, right ? right->span.end : location}, location);
+        }
+        return expr;
+    }
+
+	ExprPtr parseEquality() {
+		auto expr = parseComparison();
+		while (matchSymbol("==") || matchSymbol("!=")) {
+			std::string op = previous().text;
+			auto location = previous().location;
+			auto right = parseComparison();
+			expr = makeExpr(BinaryExpr{op, expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location}, {expr ? expr->span.start : location, right ? right->span.end : location}, location);
+		}
+		return expr;
+	}
+
+	ExprPtr parseComparison() {
+		auto expr = parseRange();
+		while (matchSymbol("<") || matchSymbol("<=") || matchSymbol(">") || matchSymbol(">=")) {
+			std::string op = previous().text;
+			auto location = previous().location;
+			auto right = parseTerm();
+			expr = makeExpr(BinaryExpr{op, expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location}, {expr ? expr->span.start : location, right ? right->span.end : location}, location);
+		}
+		return expr;
+	}
+
+	ExprPtr parseRange() {
+		auto expr = parseShift();
+		while (matchSymbol("..") || matchSymbol("..=") || matchSymbol("..<")) {
+			auto location = previous().location;
+			std::string rangeOp = previous().text;
+			auto start = expr ? expr->span.start : location;
+			auto right = parseShift();
+			bool inclusive = rangeOp == "..=";
+			expr = makeExpr(RangeExpr{expr, right, nullptr, inclusive, {start, right ? right->span.end : location}, location}, {start, right ? right->span.end : location}, location);
+		}
+		return expr;
+	}
+
+
+    ExprPtr parseShift() {
+        auto expr = parseTerm();
+        while (matchSymbol("<<") || matchSymbol(">>")) {
+            std::string op = previous().text;
+            auto location = previous().location;
+            auto right = parseTerm();
+            expr = makeExpr(BinaryExpr{op, expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location}, {expr ? expr->span.start : location, right ? right->span.end : location}, location);
+        }
+        return expr;
+    }
+
+	ExprPtr parseTerm() {
+		auto expr = parseFactor();
+		while (matchSymbol("+") || matchSymbol("-")) {
+			std::string op = previous().text;
+			auto location = previous().location;
+			auto right = parseFactor();
+			expr = makeExpr(BinaryExpr{op, expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location}, {expr ? expr->span.start : location, right ? right->span.end : location}, location);
+		}
+		return expr;
+	}
+
+	ExprPtr parseFactor() {
+		auto expr = parseUnary();
+		while (matchSymbol("*") || matchSymbol("/") || matchSymbol("%")) {
+			std::string op = previous().text;
+			auto location = previous().location;
+			auto right = parseUnary();
+			expr = makeExpr(BinaryExpr{op, expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location}, {expr ? expr->span.start : location, right ? right->span.end : location}, location);
+		}
+		return expr;
+	}
+
+	ExprPtr parseUnary() {
+		if (matchKeyword("try")) {
+			auto location = previous().location;
+			auto operand = parseUnary();
+			return makeExpr(TryExpr{operand, {location, operand ? operand->span.end : location}, location}, {location, operand ? operand->span.end : location}, location);
+		}
+		if (matchSymbol("-") || matchSymbol("!") || matchSymbol("~") || matchKeyword("not")) {
+			std::string op = previous().text;
+			auto location = previous().location;
+			auto operand = parseUnary();
+			return makeExpr(UnaryExpr{op, operand, {location, operand ? operand->span.end : location}, location}, {location, operand ? operand->span.end : location}, location);
+		}
+		return parseCall();
+	}
+
+	bool genericCallAhead() const {
+		if (!checkSymbol("<")) return false;
+		std::size_t depth = 0;
+		for (std::size_t i = index_; i < tokens_.size(); ++i) {
+			const auto& t = tokens_[i];
+			if (t.kind == TokenKind::Newline || t.kind == TokenKind::EndOfFile) return false;
+			if (t.kind == TokenKind::Symbol && t.text == "<") ++depth;
+			else if (t.kind == TokenKind::Symbol && t.text == ">") { if (--depth == 0) return i + 1 < tokens_.size() && tokens_[i+1].kind == TokenKind::Symbol && tokens_[i+1].text == "("; }
+			else if (t.kind == TokenKind::Symbol && t.text == ">>") { if (depth <= 2) return i + 1 < tokens_.size() && tokens_[i+1].kind == TokenKind::Symbol && tokens_[i+1].text == "("; depth -= 2; }
+		}
+		return false;
+	}
+
+	std::vector<std::string> parseCallGenericArguments() {
+		std::vector<std::string> args;
+		expectSymbol("<");
+		while (!typeCloseAhead()) {
+			args.push_back(parseTypeName());
+			if (!matchSymbol(",")) break;
+		}
+		consumeTypeClose();
+		return args;
+	}
+
+	ExprPtr parseCall() {
+		auto expr = parsePrimary();
+		for (;;) {
+			std::vector<std::string> genericArguments;
+			if (std::holds_alternative<VariableExpr>(expr->node) && genericCallAhead()) genericArguments = parseCallGenericArguments();
+			if (!matchSymbol("(")) {
+				if (!genericArguments.empty()) throw std::runtime_error("generic arguments must be followed by a call");
+				break;
 			}
-			return expr;
-		}
-
-		ExprPtr parseLogicalOr() {
-			auto expr = parseLogicalAnd();
-			while (matchKeyword("or") || matchSymbol("||")) {
-				std::string op = previous().text;
-				auto location = previous().location;
-				auto right = parseLogicalAnd();
-				expr = makeExpr(BinaryExpr{ op, expr, right, {location, right ? right->span.end : location}, location }, { location, right ? right->span.end : location }, location);
+			auto location = previous().location;
+			auto start = expr ? expr->span.start : location;
+			std::vector<ExprPtr> arguments;
+			if (!checkSymbol(")")) {
+				for (;;) { arguments.push_back(parseExpression()); if (!matchSymbol(",")) break; }
 			}
-			return expr;
+			auto close = expectSymbol(")");
+			expr = makeExpr(CallExpr{expr, std::move(arguments), std::move(genericArguments), {start, close.location}, location}, {start, close.location}, location);
 		}
+		return expr;
+	}
 
-		ExprPtr parseLogicalAnd() {
-			auto expr = parseBitwiseOr();
-			while (matchKeyword("and") || matchSymbol("&&")) {
-				std::string op = previous().text;
-				auto location = previous().location;
-				auto right = parseBitwiseOr();
-				expr = makeExpr(BinaryExpr{ op, expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location }, { expr ? expr->span.start : location, right ? right->span.end : location }, location);
+	ExprPtr parseClosureExpression(bool moveCapture, SourceLocation start) {
+		ClosureExpr closure; closure.moveCapture = moveCapture; closure.location = start; closure.closureId = ++nextClosureId_;
+		expectSymbol("(");
+		if (!checkSymbol(")")) {
+			for (;;) {
+				Parameter p;
+				if (checkKeyword("var") || checkKeyword("own") || checkKeyword("raw")) p.mode = consume().text;
+				auto n = expectIdentifier(); p.name = n.text; p.location = n.location;
+				if (matchSymbol(":")) p.typeName = parseTypeName();
+				closure.parameters.push_back(std::move(p));
+				if (!matchSymbol(",")) break;
 			}
-			return expr;
 		}
+		expectSymbol(")");
+		closure.returnType = matchKeyword("gives") ? parseTypeName() : std::string{};
+		closure.effects = parseEffectClause();
+		if (matchSymbol("=>")) {
+			closure.expressionBody = parseExpression(); closure.hasExpressionBody = true;
+			auto end = closure.expressionBody ? closure.expressionBody->span.end : start; closure.span = {start,end};
+		} else {
+			consumeLineBreak(); skipNewlines(); expectIndent(); closure.blockBody = parseBlockStatements(); expectDedent(); closure.span = {start,start};
+		}
+		return makeExpr(std::move(closure), closure.span, start);
+	}
 
-
-		ExprPtr parseBitwiseOr() {
-			auto expr = parseBitwiseXor();
-			while (matchSymbol("|")) {
-				auto location = previous().location; auto right = parseBitwiseXor();
-				expr = makeExpr(BinaryExpr{ "|", expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location }, { expr ? expr->span.start : location, right ? right->span.end : location }, location);
+	ExprPtr parsePrimary() {
+		if (matchKeyword("move")) { auto start = previous().location; expectKeyword("routine"); return parseClosureExpression(true, start); }
+		if (matchKeyword("routine")) { auto start = previous().location; return parseClosureExpression(false, start); }
+		if (matchSymbol("(")) {
+			auto location = previous().location;
+			auto start = location;
+			auto expr = parseExpression();
+			expectSymbol(")");
+			return makeExpr(GroupExpr{expr, {start, location}, location}, {start, location}, location);
+		}
+		if (peek().kind == TokenKind::Number) {
+			auto token = consume();
+			return makeExpr(NumberExpr{token.text, {token.location, token.location}, token.location}, {token.location, token.location}, token.location);
+		}
+		if (peek().kind == TokenKind::String) {
+			auto token = consume();
+			return makeExpr(StringExpr{token.text, {token.location, token.location}, token.location}, {token.location, token.location}, token.location);
+		}
+		if (matchKeyword("true")) {
+			auto token = previous();
+			return makeExpr(BoolExpr{true, {token.location, token.location}, token.location}, {token.location, token.location}, token.location);
+		}
+		if (matchKeyword("false")) {
+			auto token = previous();
+			return makeExpr(BoolExpr{false, {token.location, token.location}, token.location}, {token.location, token.location}, token.location);
+		}
+		if (matchKeyword("null") || matchKeyword("nothing")) {
+			auto token = previous();
+			return makeExpr(NullExpr{{token.location, token.location}, token.location}, {token.location, token.location}, token.location);
+		}
+		if (peek().kind == TokenKind::Identifier) {
+			auto token = consume();
+			auto expr = makeExpr(VariableExpr{token.text, {token.location, token.location}, token.location}, {token.location, token.location}, token.location);
+			while (matchSymbol(".")) {
+				auto memberToken = expectIdentifier();
+				auto span = SourceSpan{expr ? expr->span.start : token.location, memberToken.location};
+				expr = makeExpr(MemberExpr{expr, memberToken.text, span, memberToken.location}, span, memberToken.location);
 			}
-			return expr;
-		}
-
-		ExprPtr parseBitwiseXor() {
-			auto expr = parseBitwiseAnd();
-			while (matchSymbol("^")) {
-				auto location = previous().location; auto right = parseBitwiseAnd();
-				expr = makeExpr(BinaryExpr{ "^", expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location }, { expr ? expr->span.start : location, right ? right->span.end : location }, location);
-			}
-			return expr;
-		}
-
-		ExprPtr parseBitwiseAnd() {
-			auto expr = parseEquality();
-			while (matchSymbol("&")) {
-				auto location = previous().location; auto right = parseEquality();
-				expr = makeExpr(BinaryExpr{ "&", expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location }, { expr ? expr->span.start : location, right ? right->span.end : location }, location);
-			}
-			return expr;
-		}
-
-		ExprPtr parseEquality() {
-			auto expr = parseComparison();
-			while (matchSymbol("==") || matchSymbol("!=")) {
-				std::string op = previous().text;
-				auto location = previous().location;
-				auto right = parseComparison();
-				expr = makeExpr(BinaryExpr{ op, expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location }, { expr ? expr->span.start : location, right ? right->span.end : location }, location);
-			}
-			return expr;
-		}
-
-		ExprPtr parseComparison() {
-			auto expr = parseRange();
-			while (matchSymbol("<") || matchSymbol("<=") || matchSymbol(">") || matchSymbol(">=")) {
-				std::string op = previous().text;
-				auto location = previous().location;
-				auto right = parseTerm();
-				expr = makeExpr(BinaryExpr{ op, expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location }, { expr ? expr->span.start : location, right ? right->span.end : location }, location);
-			}
-			return expr;
-		}
-
-		ExprPtr parseRange() {
-			auto expr = parseShift();
-			while (matchSymbol("..") || matchSymbol("..=") || matchSymbol("..<")) {
-				auto location = previous().location;
-				std::string rangeOp = previous().text;
-				auto start = expr ? expr->span.start : location;
-				auto right = parseShift();
-				bool inclusive = rangeOp == "..=";
-				expr = makeExpr(RangeExpr{ expr, right, nullptr, inclusive, {start, right ? right->span.end : location}, location }, { start, right ? right->span.end : location }, location);
-			}
-			return expr;
-		}
-
-
-		ExprPtr parseShift() {
-			auto expr = parseTerm();
-			while (matchSymbol("<<") || matchSymbol(">>")) {
-				std::string op = previous().text;
-				auto location = previous().location;
-				auto right = parseTerm();
-				expr = makeExpr(BinaryExpr{ op, expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location }, { expr ? expr->span.start : location, right ? right->span.end : location }, location);
-			}
-			return expr;
-		}
-
-		ExprPtr parseTerm() {
-			auto expr = parseFactor();
-			while (matchSymbol("+") || matchSymbol("-")) {
-				std::string op = previous().text;
-				auto location = previous().location;
-				auto right = parseFactor();
-				expr = makeExpr(BinaryExpr{ op, expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location }, { expr ? expr->span.start : location, right ? right->span.end : location }, location);
-			}
-			return expr;
-		}
-
-		ExprPtr parseFactor() {
-			auto expr = parseUnary();
-			while (matchSymbol("*") || matchSymbol("/") || matchSymbol("%")) {
-				std::string op = previous().text;
-				auto location = previous().location;
-				auto right = parseUnary();
-				expr = makeExpr(BinaryExpr{ op, expr, right, {expr ? expr->span.start : location, right ? right->span.end : location}, location }, { expr ? expr->span.start : location, right ? right->span.end : location }, location);
-			}
-			return expr;
-		}
-
-		ExprPtr parseUnary() {
-			if (matchSymbol("-") || matchSymbol("!") || matchSymbol("~") || matchKeyword("not")) {
-				std::string op = previous().text;
-				auto location = previous().location;
-				auto operand = parseUnary();
-				return makeExpr(UnaryExpr{ op, operand, {location, operand ? operand->span.end : location}, location }, { location, operand ? operand->span.end : location }, location);
-			}
-			return parseCall();
-		}
-
-		ExprPtr parseCall() {
-			auto expr = parsePrimary();
-			while (matchSymbol("(")) {
-				auto location = previous().location;
-				auto start = expr ? expr->span.start : location;
-				std::vector<ExprPtr> arguments;
-				if (!checkSymbol(")")) {
+			if (matchSymbol("{")) {
+				std::vector<ConstructField> fields;
+				if (!checkSymbol("}")) {
 					for (;;) {
-						arguments.push_back(parseExpression());
+						auto fieldName = expectIdentifier();
+						expectSymbol(":");
+						auto value = parseExpression();
+						fields.push_back(ConstructField{fieldName.text, value, fieldName.location});
 						if (!matchSymbol(",")) {
 							break;
 						}
 					}
 				}
-				expectSymbol(")");
-				expr = makeExpr(CallExpr{ expr, std::move(arguments), {start, location}, location }, { start, location }, location);
+				auto close = expectSymbol("}");
+				std::string typeName = token.text;
+				auto span = SourceSpan{token.location, close.location};
+				expr = makeExpr(ConstructExpr{typeName, std::move(fields), span, close.location}, span, close.location);
 			}
 			return expr;
 		}
+		throw std::runtime_error("expected expression");
+	}
 
-		ExprPtr parsePrimary() {
-			if (matchSymbol("(")) {
-				auto location = previous().location;
-				auto start = location;
-				auto expr = parseExpression();
-				expectSymbol(")");
-				return makeExpr(GroupExpr{ expr, {start, location}, location }, { start, location }, location);
-			}
-			if (peek().kind == TokenKind::Number) {
-				auto token = consume();
-				return makeExpr(NumberExpr{ token.text, {token.location, token.location}, token.location }, { token.location, token.location }, token.location);
-			}
-			if (peek().kind == TokenKind::String) {
-				auto token = consume();
-				return makeExpr(StringExpr{ token.text, {token.location, token.location}, token.location }, { token.location, token.location }, token.location);
-			}
-			if (matchKeyword("true")) {
-				auto token = previous();
-				return makeExpr(BoolExpr{ true, {token.location, token.location}, token.location }, { token.location, token.location }, token.location);
-			}
-			if (matchKeyword("false")) {
-				auto token = previous();
-				return makeExpr(BoolExpr{ false, {token.location, token.location}, token.location }, { token.location, token.location }, token.location);
-			}
-			if (matchKeyword("null") || matchKeyword("nothing")) {
-				auto token = previous();
-				return makeExpr(NullExpr{ {token.location, token.location}, token.location }, { token.location, token.location }, token.location);
-			}
-			if (peek().kind == TokenKind::Identifier) {
-				auto token = consume();
-				auto expr = makeExpr(VariableExpr{ token.text, {token.location, token.location}, token.location }, { token.location, token.location }, token.location);
-				while (matchSymbol(".")) {
-					auto memberToken = expectIdentifier();
-					auto span = SourceSpan{ expr ? expr->span.start : token.location, memberToken.location };
-					expr = makeExpr(MemberExpr{ expr, memberToken.text, span, memberToken.location }, span, memberToken.location);
-				}
-				if (matchSymbol("{")) {
-					std::vector<ConstructField> fields;
-					if (!checkSymbol("}")) {
-						for (;;) {
-							auto fieldName = expectIdentifier();
-							expectSymbol(":");
-							auto value = parseExpression();
-							fields.push_back(ConstructField{ fieldName.text, value, fieldName.location });
-							if (!matchSymbol(",")) {
-								break;
-							}
-						}
-					}
-					auto close = expectSymbol("}");
-					std::string typeName = token.text;
-					auto span = SourceSpan{ token.location, close.location };
-					expr = makeExpr(ConstructExpr{ typeName, std::move(fields), span, close.location }, span, close.location);
-				}
-				return expr;
-			}
-			throw std::runtime_error("expected expression");
+	std::vector<Token> tokens_;
+	std::size_t index_ = 0;
+	std::size_t pendingTypeClosers_ = 0;
+	std::size_t nextClosureId_ = 0;
+};
+
+// --- Frontend: parsing and semantic analysis --------------------------------
+class SemanticAnalyzer {
+public:
+	SemanticAnalysisResult analyze(const Program& program) {
+		result_ = {};
+		routines_.clear();
+		nominalTypes_.clear();
+		closureSignatures_.clear();
+		declarationScopes_.clear();
+		pushDeclarationScope();
+		for (const auto& declaration : program.declarations) {
+			registerDeclaration(declaration);
 		}
+		for (const auto& routine : program.routines) {
+			registerRoutine(routine);
+		}
+		for (const auto& declaration : program.declarations) {
+			analyzeDeclaration(declaration);
+		}
+		for (const auto& routine : program.routines) {
+			analyzeRoutine(routine);
+		}
+		return result_;
+	}
 
-		std::vector<Token> tokens_;
-		std::size_t index_ = 0;
-		std::size_t pendingTypeClosers_ = 0;
+private:
+	struct NominalRecord {
+		NominalTypeInfo info;
 	};
 
-	// --- Frontend: parsing and semantic analysis --------------------------------
-	class SemanticAnalyzer {
-	public:
-		SemanticAnalysisResult analyze(const Program& program) {
-			result_ = {};
-			routines_.clear();
-			nominalTypes_.clear();
-			declarationScopes_.clear();
+	void registerNominal(const std::string& name, const std::string& kind, bool isPublic, bool isCompileTime, SourceLocation location) {
+		DeclarationInfo info{name, kind, isPublic, isCompileTime, {}};
+		result_.declarations.push_back(std::move(info));
+		if (declarationScopes_.empty()) {
 			pushDeclarationScope();
-			for (const auto& declaration : program.declarations) {
-				registerDeclaration(declaration);
-			}
-			for (const auto& routine : program.routines) {
-				registerRoutine(routine);
-			}
-			for (const auto& declaration : program.declarations) {
-				analyzeDeclaration(declaration);
-			}
-			for (const auto& routine : program.routines) {
-				analyzeRoutine(routine);
-			}
-			return result_;
 		}
+		auto& scope = declarationScopes_.back();
+		if (scope.contains(name)) {
+			report(location, "duplicate top-level declaration: " + name);
+			return;
+		}
+		scope.insert(name);
+		auto& record = nominalTypes_[name];
+		record.info.name = name;
+		record.info.kind = kind;
+		record.info.isPublic = isPublic;
+	}
 
-	private:
-		struct NominalRecord {
-			NominalTypeInfo info;
-		};
+	void pushDeclarationScope() {
+		declarationScopes_.push_back({});
+	}
 
-		void registerNominal(const std::string& name, const std::string& kind, bool isPublic, bool isCompileTime, SourceLocation location) {
-			DeclarationInfo info{ name, kind, isPublic, isCompileTime, {} };
-			result_.declarations.push_back(std::move(info));
-			if (declarationScopes_.empty()) {
+	void popDeclarationScope() {
+		if (!declarationScopes_.empty()) {
+			declarationScopes_.pop_back();
+		}
+	}
+
+	std::string joinPath(const std::vector<std::string>& path) const {
+		std::string text;
+		for (std::size_t i = 0; i < path.size(); ++i) {
+			if (i != 0) text += "::";
+			text += path[i];
+		}
+		return text;
+	}
+
+	void registerRoutine(const Routine& routine) {
+		RoutineSignature signature;
+		signature.name = routine.name;
+		signature.returnType = semanticTypeFromName(routine.returnType);
+		for (const auto& gp : routine.genericParameters) signature.genericParameters.push_back(gp.name);
+		signature.constraints = routine.constraints;
+		signature.effects = routine.effects;
+		signature.isForeign = routine.isForeign;
+		for (const auto& parameter : routine.parameters) {
+			if (std::find(signature.parameterNames.begin(), signature.parameterNames.end(), parameter.name) != signature.parameterNames.end()) {
+				report(parameter.location, "duplicate parameter name in routine '" + routine.name + "': " + parameter.name);
+				continue;
+			}
+			signature.parameterNames.push_back(parameter.name);
+			signature.parameterTypes.push_back(semanticTypeFromName(parameter.typeName));
+		}
+		auto& overloads = routines_[routine.name];
+		for (const auto& existing : overloads) {
+			if (sameSignature(existing, signature)) {
+				report(routine.location, "duplicate routine overload: " + routine.name + formatSignature(signature));
+				return;
+			}
+		}
+		overloads.push_back(std::move(signature));
+	}
+
+	void registerDeclaration(const Declaration& declaration) {
+		std::visit([&](const auto& node) {
+			using T = std::decay_t<decltype(node)>;
+			if constexpr (std::is_same_v<T, RecordDecl>) {
+				registerNominal(node.name, "record", node.isPublic, node.isCompileTime, node.location);
+				NominalTypeInfo info;
+				info.name = node.name;
+				info.kind = "record";
+				info.isPublic = node.isPublic;
+				info.layout = node.layout;
+				for (const auto& field : node.fields) {
+					info.fields.emplace_back(field.name, field.typeName);
+				}
+				result_.nominalTypes[node.name] = std::move(info);
+			} else if constexpr (std::is_same_v<T, EnumDecl>) {
+				registerNominal(node.name, "enum", node.isPublic, false, node.location);
+				NominalTypeInfo info;
+				info.name = node.name;
+				info.kind = "enum";
+				info.isPublic = node.isPublic;
+				info.layout = node.underlyingType;
+				for (const auto& member : node.members) {
+					info.members.emplace_back(member.first, member.second.value_or("unknown"));
+				}
+				result_.nominalTypes[node.name] = std::move(info);
+			} else if constexpr (std::is_same_v<T, UnionDecl>) {
+				registerNominal(node.name, "union", node.isPublic, false, node.location);
+				NominalTypeInfo info;
+				info.name = node.name;
+				info.kind = "union";
+				info.isPublic = node.isPublic;
+				info.layout = node.layout;
+				for (const auto& field : node.fields) {
+					info.fields.emplace_back(field.name, field.typeName);
+				}
+				result_.nominalTypes[node.name] = std::move(info);
+			} else if constexpr (std::is_same_v<T, VariantDecl>) {
+				registerNominal(node.name, "variant", node.isPublic, false, node.location);
+				NominalTypeInfo info;
+				info.name = node.name;
+				info.kind = "variant";
+				info.isPublic = node.isPublic;
+				for (const auto& c : node.cases) {
+					info.tags.push_back(c.name);
+				}
+				result_.nominalTypes[node.name] = std::move(info);
+			} else if constexpr (std::is_same_v<T, ModuleDecl>) {
+				registerNominal(node.name, "module", node.isPublic, false, node.location);
+				DeclarationInfo info{node.name, "module", node.isPublic, false, "module"};
+				result_.declarations.push_back(std::move(info));
+			} else if constexpr (std::is_same_v<T, UseDecl>) {
+				DeclarationInfo info{node.alias.empty() ? node.path.back() : node.alias, "use", false, false, joinPath(node.path)};
+				result_.declarations.push_back(std::move(info));
+			} else if constexpr (std::is_same_v<T, ConstDecl>) {
+				DeclarationInfo info{node.name, "const", node.isPublic, node.isCompileTime, node.typeName};
+				result_.declarations.push_back(std::move(info));
+				declareSymbol(node.location, node.name, {semanticTypeFromName(node.typeName), false, false});
+			} else if constexpr (std::is_same_v<T, CapabilityDecl>) {
+				registerNominal(node.name, "capability", node.isPublic, false, node.location);
+				DeclarationInfo info{node.name, "capability", node.isPublic, false, std::to_string(node.members.size()) + " member(s)"};
+				result_.declarations.push_back(std::move(info));
+			} else if constexpr (std::is_same_v<T, ForeignDecl>) {
+				registerRoutine(node.routine);
+				DeclarationInfo info{node.routine.name, "foreign", node.routine.isPublic, node.routine.isCompileTime, node.abi};
+				result_.declarations.push_back(std::move(info));
+			} else if constexpr (std::is_same_v<T, Routine>) {
+				DeclarationInfo info{node.name, "routine", node.isPublic, node.isCompileTime, node.isForeign ? node.foreignAbi : std::string{}};
+				result_.declarations.push_back(std::move(info));
+			}
+		}, declaration.node);
+	}
+
+	void analyzeDeclaration(const Declaration& declaration) {
+		std::visit([&](const auto& node) {
+			using T = std::decay_t<decltype(node)>;
+			if constexpr (std::is_same_v<T, ConstDecl>) {
+				if (node.value) analyzeExpr(node.value);
+			} else if constexpr (std::is_same_v<T, ModuleDecl>) {
 				pushDeclarationScope();
+				for (const auto& nested : node.declarations) {
+					registerDeclaration(nested);
+				}
+				for (const auto& nested : node.declarations) {
+					analyzeDeclaration(nested);
+				}
+				popDeclarationScope();
+			} else if constexpr (std::is_same_v<T, CapabilityDecl>) {
+				for (const auto& member : node.members) {
+					if (member.name.empty()) report(node.location, "capability member requires a name");
+				}
+			} else if constexpr (std::is_same_v<T, ForeignDecl>) {
+				analyzeRoutine(node.routine);
 			}
-			auto& scope = declarationScopes_.back();
-			if (scope.contains(name)) {
-				report(location, "duplicate top-level declaration: " + name);
-				return;
-			}
-			scope.insert(name);
-			auto& record = nominalTypes_[name];
-			record.info.name = name;
-			record.info.kind = kind;
-			record.info.isPublic = isPublic;
+		}, declaration.node);
+	}
+
+	void analyzeRoutine(const Routine& routine) {
+		auto routineIt = routines_.find(routine.name);
+		if (routineIt == routines_.end()) {
+			return;
 		}
 
-		void pushDeclarationScope() {
-			declarationScopes_.push_back({});
+		currentRoutine_ = &routine;
+		currentReturnType_ = makeUnknownType();
+		const RoutineSignature* matchingSignature = findSignatureByArity(routineIt->second, routine.parameters.size());
+		std::vector<SemanticType> parameterTypes = matchingSignature ? matchingSignature->parameterTypes : std::vector<SemanticType>{};
+		if (matchingSignature) {
+			currentReturnType_ = matchingSignature->returnType;
 		}
-
-		void popDeclarationScope() {
-			if (!declarationScopes_.empty()) {
-				declarationScopes_.pop_back();
+		scopes_.clear();
+		pushScope();
+		for (std::size_t i = 0; i < routine.parameters.size(); ++i) {
+			SemanticType parameterType = i < parameterTypes.size() ? parameterTypes[i] : makeUnknownType();
+			const auto& parameter = routine.parameters[i];
+			if (parameter.mode == "raw" && !isRawAuthorityTypeName(parameter.typeName)) {
+				report(parameter.location, "E0408 meaningless raw parameter mode: this bootstrap accepts raw authority for the raw pointer type; @raw_authority aggregates are not implemented yet");
 			}
+			declareSymbol(parameter.location, parameter.name, {parameterType, parameter.mode == "var", true});
 		}
+		analyzeStatementList(routine.body);
+		popScope();
+		currentRoutine_ = nullptr;
+	}
 
-		std::string joinPath(const std::vector<std::string>& path) const {
-			std::string text;
-			for (std::size_t i = 0; i < path.size(); ++i) {
-				if (i != 0) text += "::";
-				text += path[i];
-			}
-			return text;
-		}
-
-		void registerRoutine(const Routine& routine) {
-			RoutineSignature signature;
-			signature.name = routine.name;
-			signature.returnType = semanticTypeFromName(routine.returnType);
-			for (const auto& parameter : routine.parameters) {
-				if (std::find(signature.parameterNames.begin(), signature.parameterNames.end(), parameter.name) != signature.parameterNames.end()) {
-					report(parameter.location, "duplicate parameter name in routine '" + routine.name + "': " + parameter.name);
-					continue;
-				}
-				signature.parameterNames.push_back(parameter.name);
-				signature.parameterTypes.push_back(semanticTypeFromName(parameter.typeName));
-			}
-			auto& overloads = routines_[routine.name];
-			for (const auto& existing : overloads) {
-				if (sameSignature(existing, signature)) {
-					report(routine.location, "duplicate routine overload: " + routine.name + formatSignature(signature));
-					return;
-				}
-			}
-			overloads.push_back(std::move(signature));
-		}
-
-		void registerDeclaration(const Declaration& declaration) {
-			std::visit([&](const auto& node) {
-				using T = std::decay_t<decltype(node)>;
-				if constexpr (std::is_same_v<T, RecordDecl>) {
-					registerNominal(node.name, "record", node.isPublic, node.isCompileTime, node.location);
-					NominalTypeInfo info;
-					info.name = node.name;
-					info.kind = "record";
-					info.isPublic = node.isPublic;
-					info.layout = node.layout;
-					for (const auto& field : node.fields) {
-						info.fields.emplace_back(field.name, field.typeName);
-					}
-					result_.nominalTypes[node.name] = std::move(info);
-				}
-				else if constexpr (std::is_same_v<T, EnumDecl>) {
-					registerNominal(node.name, "enum", node.isPublic, false, node.location);
-					NominalTypeInfo info;
-					info.name = node.name;
-					info.kind = "enum";
-					info.isPublic = node.isPublic;
-					info.layout = node.underlyingType;
-					for (const auto& member : node.members) {
-						info.members.emplace_back(member.first, member.second.value_or("unknown"));
-					}
-					result_.nominalTypes[node.name] = std::move(info);
-				}
-				else if constexpr (std::is_same_v<T, UnionDecl>) {
-					registerNominal(node.name, "union", node.isPublic, false, node.location);
-					NominalTypeInfo info;
-					info.name = node.name;
-					info.kind = "union";
-					info.isPublic = node.isPublic;
-					info.layout = node.layout;
-					for (const auto& field : node.fields) {
-						info.fields.emplace_back(field.name, field.typeName);
-					}
-					result_.nominalTypes[node.name] = std::move(info);
-				}
-				else if constexpr (std::is_same_v<T, VariantDecl>) {
-					registerNominal(node.name, "variant", node.isPublic, false, node.location);
-					NominalTypeInfo info;
-					info.name = node.name;
-					info.kind = "variant";
-					info.isPublic = node.isPublic;
-					for (const auto& c : node.cases) {
-						info.tags.push_back(c.name);
-					}
-					result_.nominalTypes[node.name] = std::move(info);
-				}
-				else if constexpr (std::is_same_v<T, ModuleDecl>) {
-					registerNominal(node.name, "module", node.isPublic, false, node.location);
-					DeclarationInfo info{ node.name, "module", node.isPublic, false, "module" };
-					result_.declarations.push_back(std::move(info));
-				}
-				else if constexpr (std::is_same_v<T, UseDecl>) {
-					DeclarationInfo info{ node.alias.empty() ? node.path.back() : node.alias, "use", false, false, joinPath(node.path) };
-					result_.declarations.push_back(std::move(info));
-				}
-				else if constexpr (std::is_same_v<T, ConstDecl>) {
-					DeclarationInfo info{ node.name, "const", node.isPublic, node.isCompileTime, node.typeName };
-					result_.declarations.push_back(std::move(info));
-					declareSymbol(node.location, node.name, { semanticTypeFromName(node.typeName), false, false });
-				}
-				else if constexpr (std::is_same_v<T, ForeignDecl>) {
-					registerRoutine(node.routine);
-					DeclarationInfo info{ node.routine.name, "foreign", node.routine.isPublic, node.routine.isCompileTime, node.abi };
-					result_.declarations.push_back(std::move(info));
-				}
-				else if constexpr (std::is_same_v<T, Routine>) {
-					DeclarationInfo info{ node.name, "routine", node.isPublic, node.isCompileTime, node.isForeign ? node.foreignAbi : std::string{} };
-					result_.declarations.push_back(std::move(info));
-				}
-				}, declaration.node);
-		}
-
-		void analyzeDeclaration(const Declaration& declaration) {
-			std::visit([&](const auto& node) {
-				using T = std::decay_t<decltype(node)>;
-				if constexpr (std::is_same_v<T, ConstDecl>) {
-					if (node.value) analyzeExpr(node.value);
-				}
-				else if constexpr (std::is_same_v<T, ModuleDecl>) {
-					pushDeclarationScope();
-					for (const auto& nested : node.declarations) {
-						registerDeclaration(nested);
-					}
-					for (const auto& nested : node.declarations) {
-						analyzeDeclaration(nested);
-					}
-					popDeclarationScope();
-				}
-				else if constexpr (std::is_same_v<T, ForeignDecl>) {
-					analyzeRoutine(node.routine);
-				}
-				}, declaration.node);
-		}
-
-		void analyzeRoutine(const Routine& routine) {
-			auto routineIt = routines_.find(routine.name);
-			if (routineIt == routines_.end()) {
-				return;
-			}
-
-			currentRoutine_ = &routine;
-			currentReturnType_ = makeUnknownType();
-			const RoutineSignature* matchingSignature = findSignatureByArity(routineIt->second, routine.parameters.size());
-			std::vector<SemanticType> parameterTypes = matchingSignature ? matchingSignature->parameterTypes : std::vector<SemanticType>{};
-			if (matchingSignature) {
-				currentReturnType_ = matchingSignature->returnType;
-			}
-			scopes_.clear();
-			pushScope();
-			for (std::size_t i = 0; i < routine.parameters.size(); ++i) {
-				SemanticType parameterType = i < parameterTypes.size() ? parameterTypes[i] : makeUnknownType();
-				const auto& parameter = routine.parameters[i];
-				if (parameter.mode == "raw" && parameter.typeName != "raw") {
-					report(parameter.location, "E0408 meaningless raw parameter mode: this bootstrap accepts raw authority for the raw pointer type; @raw_authority aggregates are not implemented yet");
-				}
-				declareSymbol(parameter.location, parameter.name, { parameterType, parameter.mode == "var", true });
-			}
-			analyzeStatementList(routine.body);
-			popScope();
-			currentRoutine_ = nullptr;
-		}
-
-		bool analyzeStatementList(const std::vector<StmtPtr>& statements, bool reachable = true) {
-			bool fallsThrough = true;
-			for (const auto& stmt : statements) {
-				if (!reachable) {
-					if (stmt) {
-						report(stmt->location, "unreachable code");
-						analyzeUnreachableStatement(stmt);
-					}
-					continue;
-				}
+	bool analyzeStatementList(const std::vector<StmtPtr>& statements, bool reachable = true) {
+		bool fallsThrough = true;
+		for (const auto& stmt : statements) {
+			if (!reachable) {
 				if (stmt) {
-					fallsThrough = analyzeStatementNode(stmt);
-					if (!fallsThrough) {
-						reachable = false;
-					}
+					report(stmt->location, "unreachable code");
+					analyzeUnreachableStatement(stmt);
+				}
+				continue;
+			}
+			if (stmt) {
+				fallsThrough = analyzeStatementNode(stmt);
+				if (!fallsThrough) {
+					reachable = false;
 				}
 			}
-			return fallsThrough;
+		}
+		return fallsThrough;
+	}
+
+	bool analyzeStatementNode(const StmtPtr& stmt) {
+		if (!stmt) {
+			return true;
 		}
 
-		bool analyzeStatementNode(const StmtPtr& stmt) {
-			if (!stmt) {
+		return std::visit([&](const auto& node) -> bool {
+			return analyzeReachableStatement(node);
+		}, stmt->node);
+	}
+
+	void analyzeUnreachableStatement(const StmtPtr& stmt) {
+		if (!stmt) {
+			return;
+		}
+		std::visit([&](const auto& node) {
+			using T = std::decay_t<decltype(node)>;
+			if constexpr (std::is_same_v<T, LetStmt>) {
+				analyzeUnreachableLet(node);
+			} else if constexpr (std::is_same_v<T, VarStmt>) {
+				analyzeUnreachableVar(node);
+			} else if constexpr (std::is_same_v<T, AssignStmt>) {
+				analyzeUnreachableAssign(node);
+			} else if constexpr (std::is_same_v<T, ExprStmt>) {
+				analyzeExpr(node.expression);
+			} else if constexpr (std::is_same_v<T, ReturnStmt>) {
+				analyzeUnreachableReturn(node);
+			} else if constexpr (std::is_same_v<T, GiveStmt>) {
+				analyzeUnreachableGive(node);
+			} else if constexpr (std::is_same_v<T, IfStmt>) {
+				analyzeUnreachableIf(node);
+			} else if constexpr (std::is_same_v<T, EachStmt>) {
+				analyzeUnreachableEach(node);
+			} else if constexpr (std::is_same_v<T, UnsafeStmt>) {
+				analyzeUnreachableUnsafe(node);
+			} else if constexpr (std::is_same_v<T, DeferStmt>) {
+				analyzeUnreachableDefer(node);
+			} else if constexpr (std::is_same_v<T, FailStmt>) {
+				analyzeUnreachableFail(node);
+			} else if constexpr (std::is_same_v<T, WhileStmt>) {
+				analyzeUnreachableWhile(node);
+			} else if constexpr (std::is_same_v<T, BreakStmt> || std::is_same_v<T, ContinueStmt>) {
+				// No expression payload to analyze in unreachable jump statements.
+			} else if constexpr (std::is_same_v<T, BlockStmt>) {
+				analyzeUnreachableBlock(node);
+			}
+		}, stmt->node);
+	}
+
+	bool analyzeReachableStatement(const Stmt::Node& node) {
+		return std::visit([&](const auto& statement) -> bool {
+			using T = std::decay_t<decltype(statement)>;
+			if constexpr (std::is_same_v<T, LetStmt>) {
+				return analyzeLet(statement);
+			} else if constexpr (std::is_same_v<T, VarStmt>) {
+				return analyzeVar(statement);
+			} else if constexpr (std::is_same_v<T, AssignStmt>) {
+				return analyzeAssign(statement);
+			} else if constexpr (std::is_same_v<T, ExprStmt>) {
+				analyzeExpr(statement.expression);
+				return true;
+			} else if constexpr (std::is_same_v<T, ReturnStmt>) {
+				return analyzeReturn(statement);
+			} else if constexpr (std::is_same_v<T, GiveStmt>) {
+				return analyzeGive(statement);
+			} else if constexpr (std::is_same_v<T, IfStmt>) {
+				return analyzeIf(statement);
+			} else if constexpr (std::is_same_v<T, EachStmt>) {
+				return analyzeEach(statement);
+			} else if constexpr (std::is_same_v<T, UnsafeStmt>) {
+				return analyzeUnsafe(statement);
+			} else if constexpr (std::is_same_v<T, DeferStmt>) {
+				return analyzeDefer(statement);
+			} else if constexpr (std::is_same_v<T, FailStmt>) {
+				return analyzeFail(statement);
+			} else if constexpr (std::is_same_v<T, WhileStmt>) {
+				return analyzeWhile(statement);
+			} else if constexpr (std::is_same_v<T, BreakStmt>) {
+				return analyzeBreak(statement);
+			} else if constexpr (std::is_same_v<T, ContinueStmt>) {
+				return analyzeContinue(statement);
+			} else if constexpr (std::is_same_v<T, BlockStmt>) {
+				return analyzeBlock(statement);
+			} else {
 				return true;
 			}
+		}, node);
+	}
 
-			return std::visit([&](const auto& node) -> bool {
-				return analyzeReachableStatement(node);
-				}, stmt->node);
+	bool analyzeLet(const LetStmt& node) {
+		if (!node.initializer) {
+			report(node.location, "let binding requires an initializer");
+			declareSymbol(node.location, node.name, {makeUnknownType(), false, false});
+			return true;
 		}
-
-		void analyzeUnreachableStatement(const StmtPtr& stmt) {
-			if (!stmt) {
-				return;
+		auto valueType = analyzeExpr(node.initializer);
+		SemanticType declaredType = semanticTypeFromName(node.typeName);
+		if (declaredType.kind != SemanticTypeKind::Unknown) {
+			if (!isAssignableTo(declaredType, valueType)) {
+				report(node.location, "let '" + node.name + "' initializer type mismatch: expected " + semanticTypeName(declaredType) + ", got " + semanticTypeName(valueType));
 			}
-			std::visit([&](const auto& node) {
-				using T = std::decay_t<decltype(node)>;
-				if constexpr (std::is_same_v<T, LetStmt>) {
-					analyzeUnreachableLet(node);
-				}
-				else if constexpr (std::is_same_v<T, VarStmt>) {
-					analyzeUnreachableVar(node);
-				}
-				else if constexpr (std::is_same_v<T, AssignStmt>) {
-					analyzeUnreachableAssign(node);
-				}
-				else if constexpr (std::is_same_v<T, ExprStmt>) {
-					analyzeExpr(node.expression);
-				}
-				else if constexpr (std::is_same_v<T, ReturnStmt>) {
-					analyzeUnreachableReturn(node);
-				}
-				else if constexpr (std::is_same_v<T, GiveStmt>) {
-					analyzeUnreachableGive(node);
-				}
-				else if constexpr (std::is_same_v<T, IfStmt>) {
-					analyzeUnreachableIf(node);
-				}
-				else if constexpr (std::is_same_v<T, EachStmt>) {
-					analyzeUnreachableEach(node);
-				}
-				else if constexpr (std::is_same_v<T, UnsafeStmt>) {
-					analyzeUnreachableUnsafe(node);
-				}
-				else if constexpr (std::is_same_v<T, DeferStmt>) {
-					analyzeUnreachableDefer(node);
-				}
-				else if constexpr (std::is_same_v<T, FailStmt>) {
-					analyzeUnreachableFail(node);
-				}
-				else if constexpr (std::is_same_v<T, WhileStmt>) {
-					analyzeUnreachableWhile(node);
-				}
-				else if constexpr (std::is_same_v<T, BreakStmt> || std::is_same_v<T, ContinueStmt>) {
-					// No expression payload to analyze in unreachable jump statements.
-				}
-				else if constexpr (std::is_same_v<T, BlockStmt>) {
-					analyzeUnreachableBlock(node);
-				}
-				}, stmt->node);
-		}
-
-		bool analyzeReachableStatement(const Stmt::Node& node) {
-			return std::visit([&](const auto& statement) -> bool {
-				using T = std::decay_t<decltype(statement)>;
-				if constexpr (std::is_same_v<T, LetStmt>) {
-					return analyzeLet(statement);
-				}
-				else if constexpr (std::is_same_v<T, VarStmt>) {
-					return analyzeVar(statement);
-				}
-				else if constexpr (std::is_same_v<T, AssignStmt>) {
-					return analyzeAssign(statement);
-				}
-				else if constexpr (std::is_same_v<T, ExprStmt>) {
-					analyzeExpr(statement.expression);
-					return true;
-				}
-				else if constexpr (std::is_same_v<T, ReturnStmt>) {
-					return analyzeReturn(statement);
-				}
-				else if constexpr (std::is_same_v<T, GiveStmt>) {
-					return analyzeGive(statement);
-				}
-				else if constexpr (std::is_same_v<T, IfStmt>) {
-					return analyzeIf(statement);
-				}
-				else if constexpr (std::is_same_v<T, EachStmt>) {
-					return analyzeEach(statement);
-				}
-				else if constexpr (std::is_same_v<T, UnsafeStmt>) {
-					return analyzeUnsafe(statement);
-				}
-				else if constexpr (std::is_same_v<T, DeferStmt>) {
-					return analyzeDefer(statement);
-				}
-				else if constexpr (std::is_same_v<T, FailStmt>) {
-					return analyzeFail(statement);
-				}
-				else if constexpr (std::is_same_v<T, WhileStmt>) {
-					return analyzeWhile(statement);
-				}
-				else if constexpr (std::is_same_v<T, BreakStmt>) {
-					return analyzeBreak(statement);
-				}
-				else if constexpr (std::is_same_v<T, ContinueStmt>) {
-					return analyzeContinue(statement);
-				}
-				else if constexpr (std::is_same_v<T, BlockStmt>) {
-					return analyzeBlock(statement);
-				}
-				else {
-					return true;
-				}
-				}, node);
-		}
-
-		bool analyzeLet(const LetStmt& node) {
-			if (!node.initializer) {
-				report(node.location, "let binding requires an initializer");
-				declareSymbol(node.location, node.name, { makeUnknownType(), false, false });
-				return true;
+			declareSymbol(node.location, node.name, {declaredType, false, false});
+		} else {
+			if (valueType.kind == SemanticTypeKind::Unknown) {
+				report(node.location, "cannot infer type of let binding '" + node.name + "'");
 			}
+			declareSymbol(node.location, node.name, {valueType, false, false});
+		}
+		return true;
+	}
+
+	bool analyzeVar(const VarStmt& node) {
+		SemanticType declaredType = semanticTypeFromName(node.typeName);
+		if (node.initializer) {
 			auto valueType = analyzeExpr(node.initializer);
-			SemanticType declaredType = semanticTypeFromName(node.typeName);
 			if (declaredType.kind != SemanticTypeKind::Unknown) {
 				if (!isAssignableTo(declaredType, valueType)) {
-					report(node.location, "let '" + node.name + "' initializer type mismatch: expected " + semanticTypeName(declaredType) + ", got " + semanticTypeName(valueType));
+					report(node.location, "var '" + node.name + "' initializer type mismatch: expected " + semanticTypeName(declaredType) + ", got " + semanticTypeName(valueType));
 				}
-				declareSymbol(node.location, node.name, { declaredType, false, false });
-			}
-			else {
+				declareSymbol(node.location, node.name, {declaredType, true, false});
+			} else {
 				if (valueType.kind == SemanticTypeKind::Unknown) {
-					report(node.location, "cannot infer type of let binding '" + node.name + "'");
+					report(node.location, "cannot infer type of var binding '" + node.name + "'");
 				}
-				declareSymbol(node.location, node.name, { valueType, false, false });
+				declareSymbol(node.location, node.name, {valueType, true, false});
 			}
+		} else {
+			if (declaredType.kind == SemanticTypeKind::Unknown) {
+				report(node.location, "var '" + node.name + "' requires a type or initializer");
+				declareSymbol(node.location, node.name, {makeUnknownType(), true, false});
+			} else {
+				declareSymbol(node.location, node.name, {declaredType, true, false});
+			}
+		}
+		return true;
+	}
+
+	bool analyzeAssign(const AssignStmt& node) {
+		auto* symbol = lookupSymbol(node.name);
+		if (!symbol) {
+			report(node.location, "assignment to undeclared name: " + node.name);
+			analyzeExpr(node.value);
 			return true;
 		}
+		if (!symbol->isMutable) {
+			report(node.location, "cannot assign to immutable binding: " + node.name);
+		}
+		auto valueType = analyzeExpr(node.value);
+		if (!isAssignableTo(symbol->type, valueType)) {
+			report(node.location, "assignment type mismatch for '" + node.name + "': expected " + semanticTypeName(symbol->type) + ", got " + semanticTypeName(valueType));
+		}
+		return true;
+	}
 
-		bool analyzeVar(const VarStmt& node) {
-			SemanticType declaredType = semanticTypeFromName(node.typeName);
-			if (node.initializer) {
-				auto valueType = analyzeExpr(node.initializer);
-				if (declaredType.kind != SemanticTypeKind::Unknown) {
-					if (!isAssignableTo(declaredType, valueType)) {
-						report(node.location, "var '" + node.name + "' initializer type mismatch: expected " + semanticTypeName(declaredType) + ", got " + semanticTypeName(valueType));
-					}
-					declareSymbol(node.location, node.name, { declaredType, true, false });
-				}
-				else {
-					if (valueType.kind == SemanticTypeKind::Unknown) {
-						report(node.location, "cannot infer type of var binding '" + node.name + "'");
-					}
-					declareSymbol(node.location, node.name, { valueType, true, false });
-				}
-			}
-			else {
-				if (declaredType.kind == SemanticTypeKind::Unknown) {
-					report(node.location, "var '" + node.name + "' requires a type or initializer");
-					declareSymbol(node.location, node.name, { makeUnknownType(), true, false });
-				}
-				else {
-					declareSymbol(node.location, node.name, { declaredType, true, false });
-				}
-			}
+	bool analyzeReturn(const ReturnStmt& node) {
+		if (!currentRoutine_) {
+			report(node.location, "return outside of routine");
 			return true;
 		}
-
-		bool analyzeAssign(const AssignStmt& node) {
-			auto* symbol = lookupSymbol(node.name);
-			if (!symbol) {
-				report(node.location, "assignment to undeclared name: " + node.name);
-				analyzeExpr(node.value);
-				return true;
-			}
-			if (!symbol->isMutable) {
-				report(node.location, "cannot assign to immutable binding: " + node.name);
-			}
-			auto valueType = analyzeExpr(node.value);
-			if (!isAssignableTo(symbol->type, valueType)) {
-				report(node.location, "assignment type mismatch for '" + node.name + "': expected " + semanticTypeName(symbol->type) + ", got " + semanticTypeName(valueType));
-			}
-			return true;
-		}
-
-		bool analyzeReturn(const ReturnStmt& node) {
-			if (!currentRoutine_) {
-				report(node.location, "return outside of routine");
-				return true;
-			}
-			if (node.hasValue) {
-				auto valueType = analyzeExpr(node.value);
-				if (currentReturnType_.kind == SemanticTypeKind::Void) {
-					report(node.location, "routine '" + currentRoutine_->name + "' returns void, but return provides a value");
-				}
-				else if (!isAssignableTo(currentReturnType_, valueType)) {
-					report(node.location, "return type mismatch in routine '" + currentRoutine_->name + "': expected " + semanticTypeName(currentReturnType_) + ", got " + semanticTypeName(valueType));
-				}
-			}
-			else if (currentReturnType_.kind != SemanticTypeKind::Void) {
-				report(node.location, "routine '" + currentRoutine_->name + "' must return " + semanticTypeName(currentReturnType_));
-			}
-			return false;
-		}
-
-		bool analyzeGive(const GiveStmt& node) {
-			if (!currentRoutine_) {
-				report(node.location, "give outside of routine");
-				return true;
-			}
+		if (node.hasValue) {
 			auto valueType = analyzeExpr(node.value);
 			if (currentReturnType_.kind == SemanticTypeKind::Void) {
-				report(node.location, "routine '" + currentRoutine_->name + "' returns void, but give provides a value");
+				report(node.location, "routine '" + currentRoutine_->name + "' returns void, but return provides a value");
+			} else if (!isAssignableTo(currentReturnType_, valueType)) {
+				report(node.location, "return type mismatch in routine '" + currentRoutine_->name + "': expected " + semanticTypeName(currentReturnType_) + ", got " + semanticTypeName(valueType));
 			}
-			else if (!isAssignableTo(currentReturnType_, valueType)) {
-				report(node.location, "give type mismatch in routine '" + currentRoutine_->name + "': expected " + semanticTypeName(currentReturnType_) + ", got " + semanticTypeName(valueType));
-			}
-			return false;
+		} else if (currentReturnType_.kind != SemanticTypeKind::Void) {
+			report(node.location, "routine '" + currentRoutine_->name + "' must return " + semanticTypeName(currentReturnType_));
 		}
+		return false;
+	}
 
-		bool analyzeIf(const IfStmt& node) {
-			auto conditionType = analyzeExpr(node.condition);
-			if (conditionType.kind != SemanticTypeKind::Bool && conditionType.kind != SemanticTypeKind::Unknown) {
-				report(node.location, "if condition must be bool, got " + semanticTypeName(conditionType));
-			}
-			auto constant = evaluateConstantBool(node.condition);
-			if (constant.has_value()) {
-				if (*constant) {
-					pushScope();
-					auto thenFallsThrough = analyzeStatementList(node.thenBranch, true);
-					popScope();
-					if (node.hasElse) {
-						report(node.location, "else branch is unreachable because condition is always true");
-						pushScope();
-						analyzeStatementList(node.elseBranch, false);
-						popScope();
-					}
-					return thenFallsThrough;
-				}
-				report(node.location, "then branch is unreachable because condition is always false");
+	bool analyzeGive(const GiveStmt& node) {
+		if (!currentRoutine_) { report(node.location, "give outside of routine"); return true; }
+		auto valueType = analyzeExpr(node.value);
+		if (currentReturnType_.kind == SemanticTypeKind::Void) {
+			report(node.location, "routine '" + currentRoutine_->name + "' returns void, but give provides a value");
+        } else {
+            std::string okType, errType, optionType;
+            if (typeIsResult(currentRoutine_->returnType,&okType,&errType)) {
+                if (valueType.name.rfind("__err<",0)==0) report(node.location,"give cannot produce err; use fail for result failure");
+                else if (valueType.name.rfind("__ok<",0)==0) { /* explicit ok accepted; detailed wrapper checked by result lowering */ }
+                else if (!isAssignableTo(semanticTypeFromName(okType), valueType)) report(node.location,"give value cannot be wrapped as ok<"+okType+">");
+            } else if (typeIsOption(currentRoutine_->returnType,&optionType)) {
+                if (valueType.name!="__none" && valueType.name.rfind("__some<",0)!=0 && !isAssignableTo(semanticTypeFromName(optionType),valueType)) report(node.location,"give value cannot be wrapped as some<"+optionType+">");
+            } else if (!isAssignableTo(currentReturnType_, valueType)) {
+                report(node.location, "give type mismatch in routine '" + currentRoutine_->name + "': expected " + semanticTypeName(currentReturnType_) + ", got " + semanticTypeName(valueType));
+            }
+        }
+		return false;
+	}
+
+	bool analyzeIf(const IfStmt& node) {
+		auto conditionType = analyzeExpr(node.condition);
+		if (conditionType.kind != SemanticTypeKind::Bool && conditionType.kind != SemanticTypeKind::Unknown) {
+			report(node.location, "if condition must be bool, got " + semanticTypeName(conditionType));
+		}
+		auto constant = evaluateConstantBool(node.condition);
+		if (constant.has_value()) {
+			if (*constant) {
 				pushScope();
-				analyzeStatementList(node.thenBranch, false);
+				auto thenFallsThrough = analyzeStatementList(node.thenBranch, true);
 				popScope();
 				if (node.hasElse) {
+					report(node.location, "else branch is unreachable because condition is always true");
 					pushScope();
-					auto elseFallsThrough = analyzeStatementList(node.elseBranch, true);
+					analyzeStatementList(node.elseBranch, false);
 					popScope();
-					return elseFallsThrough;
 				}
-				return true;
+				return thenFallsThrough;
 			}
+			report(node.location, "then branch is unreachable because condition is always false");
 			pushScope();
-			auto thenFallsThrough = analyzeStatementList(node.thenBranch, true);
+			analyzeStatementList(node.thenBranch, false);
 			popScope();
-			bool elseFallsThrough = true;
 			if (node.hasElse) {
 				pushScope();
-				elseFallsThrough = analyzeStatementList(node.elseBranch, true);
+				auto elseFallsThrough = analyzeStatementList(node.elseBranch, true);
 				popScope();
+				return elseFallsThrough;
 			}
-			return node.hasElse ? (thenFallsThrough || elseFallsThrough) : true;
-		}
-
-		bool analyzeEach(const EachStmt& node) {
-			analyzeExpr(node.range);
-			pushScope();
-			for (const auto& binding : node.bindings) {
-				declareSymbol(node.location, binding, { makeUnknownType(), node.bindingsMutable, false });
-			}
-			++currentLoopDepth_;
-			auto fallsThrough = analyzeStatementList(node.body, true);
-			--currentLoopDepth_;
-			popScope();
-			return fallsThrough;
-		}
-
-		bool analyzeUnsafe(const UnsafeStmt& node) {
-			pushScope();
-			auto fallsThrough = analyzeStatementList(node.body, true);
-			popScope();
-			return fallsThrough;
-		}
-
-		bool analyzeDefer(const DeferStmt& node) {
-			analyzeExpr(node.expression);
 			return true;
 		}
-
-		bool analyzeFail(const FailStmt& node) {
-			analyzeExpr(node.expression);
-			return false;
-		}
-
-		bool analyzeWhile(const WhileStmt& node) {
-			auto conditionType = analyzeExpr(node.condition);
-			if (conditionType.kind != SemanticTypeKind::Bool && conditionType.kind != SemanticTypeKind::Unknown) {
-				report(node.location, "while condition must be bool, got " + semanticTypeName(conditionType));
-			}
-			auto constant = evaluateConstantBool(node.condition);
+		pushScope();
+		auto thenFallsThrough = analyzeStatementList(node.thenBranch, true);
+		popScope();
+		bool elseFallsThrough = true;
+		if (node.hasElse) {
 			pushScope();
-			if (constant.has_value() && !*constant) {
-				report(node.location, "while body is unreachable because condition is always false");
-				analyzeStatementList(node.body, false);
-				popScope();
-				return true;
-			}
-			++currentLoopDepth_;
-			analyzeStatementList(node.body, true);
-			--currentLoopDepth_;
+			elseFallsThrough = analyzeStatementList(node.elseBranch, true);
+			popScope();
+		}
+		return node.hasElse ? (thenFallsThrough || elseFallsThrough) : true;
+	}
+
+	bool analyzeEach(const EachStmt& node) {
+		analyzeExpr(node.range);
+		pushScope();
+		for (const auto& binding : node.bindings) {
+			declareSymbol(node.location, binding, {makeUnknownType(), node.bindingsMutable, false});
+		}
+		++currentLoopDepth_;
+		auto fallsThrough = analyzeStatementList(node.body, true);
+		--currentLoopDepth_;
+		popScope();
+		return fallsThrough;
+	}
+
+	bool analyzeUnsafe(const UnsafeStmt& node) {
+		pushScope();
+		auto fallsThrough = analyzeStatementList(node.body, true);
+		popScope();
+		return fallsThrough;
+	}
+
+	bool analyzeDefer(const DeferStmt& node) {
+		analyzeExpr(node.expression);
+		return true;
+	}
+
+	bool analyzeFail(const FailStmt& node) {
+        auto errorType = analyzeExpr(node.expression);
+        if (!currentRoutine_) { report(node.location,"fail outside of routine"); return false; }
+        std::string okType, expectedError;
+        if (!typeIsResult(currentRoutine_->returnType,&okType,&expectedError)) report(node.location,"E0502 fail requires a result<T,E> return type");
+        else if (!isAssignableTo(semanticTypeFromName(expectedError),errorType)) report(node.location,"fail error type mismatch: expected "+expectedError+", got "+semanticTypeName(errorType));
+		return false;
+	}
+
+	bool analyzeWhile(const WhileStmt& node) {
+		auto conditionType = analyzeExpr(node.condition);
+		if (conditionType.kind != SemanticTypeKind::Bool && conditionType.kind != SemanticTypeKind::Unknown) {
+			report(node.location, "while condition must be bool, got " + semanticTypeName(conditionType));
+		}
+		auto constant = evaluateConstantBool(node.condition);
+		pushScope();
+		if (constant.has_value() && !*constant) {
+			report(node.location, "while body is unreachable because condition is always false");
+			analyzeStatementList(node.body, false);
 			popScope();
 			return true;
 		}
+		++currentLoopDepth_;
+		analyzeStatementList(node.body, true);
+		--currentLoopDepth_;
+		popScope();
+		return true;
+	}
 
-		bool analyzeBreak(const BreakStmt& node) {
-			if (currentLoopDepth_ == 0) report(node.location, "break outside of loop");
-			if (!node.label.empty()) report(node.location, "labeled break is parsed but label resolution is not yet implemented in this bootstrap compiler");
-			return false;
+	bool analyzeBreak(const BreakStmt& node) {
+		if (currentLoopDepth_ == 0) report(node.location, "break outside of loop");
+		if (!node.label.empty()) report(node.location, "labeled break is parsed but label resolution is not yet implemented in this bootstrap compiler");
+		return false;
+	}
+
+	bool analyzeContinue(const ContinueStmt& node) {
+		if (currentLoopDepth_ == 0) report(node.location, "continue outside of loop");
+		if (!node.label.empty()) report(node.location, "labeled continue is parsed but label resolution is not yet implemented in this bootstrap compiler");
+		return false;
+	}
+
+	bool analyzeBlock(const BlockStmt& node) {
+		pushScope();
+		auto fallsThrough = analyzeStatementList(node.statements, true);
+		popScope();
+		return fallsThrough;
+	}
+
+	void analyzeUnreachableLet(const LetStmt& node) {
+		if (node.initializer) analyzeExpr(node.initializer);
+	}
+
+	void analyzeUnreachableVar(const VarStmt& node) {
+		if (node.initializer) analyzeExpr(node.initializer);
+	}
+
+	void analyzeUnreachableAssign(const AssignStmt& node) {
+		analyzeExpr(node.value);
+	}
+
+	void analyzeUnreachableReturn(const ReturnStmt& node) {
+		if (node.hasValue) analyzeExpr(node.value);
+	}
+
+	void analyzeUnreachableGive(const GiveStmt& node) {
+		analyzeExpr(node.value);
+	}
+
+	void analyzeUnreachableIf(const IfStmt& node) {
+		analyzeExpr(node.condition);
+		analyzeStatementList(node.thenBranch, false);
+		if (node.hasElse) {
+			analyzeStatementList(node.elseBranch, false);
 		}
+	}
 
-		bool analyzeContinue(const ContinueStmt& node) {
-			if (currentLoopDepth_ == 0) report(node.location, "continue outside of loop");
-			if (!node.label.empty()) report(node.location, "labeled continue is parsed but label resolution is not yet implemented in this bootstrap compiler");
-			return false;
+	void analyzeUnreachableEach(const EachStmt& node) {
+		analyzeExpr(node.range);
+		analyzeStatementList(node.body, false);
+	}
+
+	void analyzeUnreachableUnsafe(const UnsafeStmt& node) {
+		analyzeStatementList(node.body, false);
+	}
+
+	void analyzeUnreachableDefer(const DeferStmt& node) {
+		analyzeExpr(node.expression);
+	}
+
+	void analyzeUnreachableFail(const FailStmt& node) {
+		analyzeExpr(node.expression);
+	}
+
+	void analyzeUnreachableWhile(const WhileStmt& node) {
+		analyzeExpr(node.condition);
+		analyzeStatementList(node.body, false);
+	}
+
+	void analyzeUnreachableBlock(const BlockStmt& node) {
+		analyzeStatementList(node.statements, false);
+	}
+
+	std::optional<bool> evaluateConstantBool(const ExprPtr& expr) {
+		if (!expr) {
+			return std::nullopt;
 		}
-
-		bool analyzeBlock(const BlockStmt& node) {
-			pushScope();
-			auto fallsThrough = analyzeStatementList(node.statements, true);
-			popScope();
-			return fallsThrough;
-		}
-
-		void analyzeUnreachableLet(const LetStmt& node) {
-			if (node.initializer) analyzeExpr(node.initializer);
-		}
-
-		void analyzeUnreachableVar(const VarStmt& node) {
-			if (node.initializer) analyzeExpr(node.initializer);
-		}
-
-		void analyzeUnreachableAssign(const AssignStmt& node) {
-			analyzeExpr(node.value);
-		}
-
-		void analyzeUnreachableReturn(const ReturnStmt& node) {
-			if (node.hasValue) analyzeExpr(node.value);
-		}
-
-		void analyzeUnreachableGive(const GiveStmt& node) {
-			analyzeExpr(node.value);
-		}
-
-		void analyzeUnreachableIf(const IfStmt& node) {
-			analyzeExpr(node.condition);
-			analyzeStatementList(node.thenBranch, false);
-			if (node.hasElse) {
-				analyzeStatementList(node.elseBranch, false);
-			}
-		}
-
-		void analyzeUnreachableEach(const EachStmt& node) {
-			analyzeExpr(node.range);
-			analyzeStatementList(node.body, false);
-		}
-
-		void analyzeUnreachableUnsafe(const UnsafeStmt& node) {
-			analyzeStatementList(node.body, false);
-		}
-
-		void analyzeUnreachableDefer(const DeferStmt& node) {
-			analyzeExpr(node.expression);
-		}
-
-		void analyzeUnreachableFail(const FailStmt& node) {
-			analyzeExpr(node.expression);
-		}
-
-		void analyzeUnreachableWhile(const WhileStmt& node) {
-			analyzeExpr(node.condition);
-			analyzeStatementList(node.body, false);
-		}
-
-		void analyzeUnreachableBlock(const BlockStmt& node) {
-			analyzeStatementList(node.statements, false);
-		}
-
-		std::optional<bool> evaluateConstantBool(const ExprPtr& expr) {
-			if (!expr) {
+		return std::visit([&](const auto& node) -> std::optional<bool> {
+			using T = std::decay_t<decltype(node)>;
+			if constexpr (std::is_same_v<T, BoolExpr>) {
+				return node.value;
+			} else if constexpr (std::is_same_v<T, GroupExpr>) {
+				return evaluateConstantBool(node.expression);
+			} else if constexpr (std::is_same_v<T, UnaryExpr>) {
+				if (node.op == "!" || node.op == "not") {
+					auto value = evaluateConstantBool(node.operand);
+					if (value.has_value()) {
+						return !*value;
+					}
+				}
+				return std::nullopt;
+			} else if constexpr (std::is_same_v<T, BinaryExpr>) {
+				auto left = evaluateConstantBool(node.left);
+				auto right = evaluateConstantBool(node.right);
+				if ((node.op == "and" || node.op == "&&") && left.has_value() && right.has_value()) {
+					return *left && *right;
+				}
+				if ((node.op == "or" || node.op == "||") && left.has_value() && right.has_value()) {
+					return *left || *right;
+				}
+				if (node.op == "==" && left.has_value() && right.has_value()) {
+					return *left == *right;
+				}
+				if (node.op == "!=" && left.has_value() && right.has_value()) {
+					return *left != *right;
+				}
+				return std::nullopt;
+			} else {
 				return std::nullopt;
 			}
-			return std::visit([&](const auto& node) -> std::optional<bool> {
-				using T = std::decay_t<decltype(node)>;
-				if constexpr (std::is_same_v<T, BoolExpr>) {
-					return node.value;
-				}
-				else if constexpr (std::is_same_v<T, GroupExpr>) {
-					return evaluateConstantBool(node.expression);
-				}
-				else if constexpr (std::is_same_v<T, UnaryExpr>) {
-					if (node.op == "!" || node.op == "not") {
-						auto value = evaluateConstantBool(node.operand);
-						if (value.has_value()) {
-							return !*value;
-						}
-					}
-					return std::nullopt;
-				}
-				else if constexpr (std::is_same_v<T, BinaryExpr>) {
-					auto left = evaluateConstantBool(node.left);
-					auto right = evaluateConstantBool(node.right);
-					if ((node.op == "and" || node.op == "&&") && left.has_value() && right.has_value()) {
-						return *left && *right;
-					}
-					if ((node.op == "or" || node.op == "||") && left.has_value() && right.has_value()) {
-						return *left || *right;
-					}
-					if (node.op == "==" && left.has_value() && right.has_value()) {
-						return *left == *right;
-					}
-					if (node.op == "!=" && left.has_value() && right.has_value()) {
-						return *left != *right;
-					}
-					return std::nullopt;
-				}
-				else {
-					return std::nullopt;
-				}
-				}, expr->node);
+		}, expr->node);
+	}
+
+	IRValueType binaryValueType(const std::string& op) const {
+		if (op == "and" || op == "or" || op == "&&" || op == "||" || op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") {
+			return makeIRBoolType();
 		}
-
-		IRValueType binaryValueType(const std::string& op) const {
-			if (op == "and" || op == "or" || op == "&&" || op == "||" || op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") {
-				return makeIRBoolType();
-			}
-			if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%" ||
-				op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
-				return makeIRIntType();
-			}
-			return makeIRUnknownType();
+		if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%" ||
+			op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
+			return makeIRIntType();
 		}
+		return makeIRUnknownType();
+	}
 
-		std::string calleeSignature(const ExprPtr& callee) const {
-			if (!callee) {
-				return "<unknown>()";
-			}
-			if (const auto* variable = std::get_if<VariableExpr>(&callee->node)) {
-				return variable->name + "()";
-			}
-			return "<expr>()";
+	std::string calleeSignature(const ExprPtr& callee) const {
+		if (!callee) {
+			return "<unknown>()";
 		}
-
-		SemanticType analyzeUnaryExpr(const UnaryExpr& node) {
-			auto operandType = analyzeExpr(node.operand);
-			if (node.op == "-" || node.op == "~") {
-				if (!isNumericType(operandType) && operandType.kind != SemanticTypeKind::Unknown) {
-					report(node.location, "unary '" + node.op + "' requires a numeric operand, got " + semanticTypeName(operandType));
-				}
-				return isNumericType(operandType) ? operandType : (operandType.kind == SemanticTypeKind::Unknown ? makeNumberType() : makeUnknownType());
-			}
-			if (node.op == "!" || node.op == "not") {
-				if (operandType.kind != SemanticTypeKind::Bool && operandType.kind != SemanticTypeKind::Unknown) {
-					report(node.location, "logical negation requires bool, got " + semanticTypeName(operandType));
-				}
-				return operandType.kind == SemanticTypeKind::Bool || operandType.kind == SemanticTypeKind::Unknown ? makeBoolType() : makeUnknownType();
-			}
-			return makeUnknownType();
+		if (const auto* variable = std::get_if<VariableExpr>(&callee->node)) {
+			return variable->name + "()";
 		}
+		return "<expr>()";
+	}
 
-		SemanticType analyzeBinaryExpr(const BinaryExpr& node) {
-			auto leftType = analyzeExpr(node.left);
-			auto rightType = analyzeExpr(node.right);
-			if (node.op == "+" || node.op == "-" || node.op == "*" || node.op == "/" || node.op == "%" ||
-				node.op == "&" || node.op == "|" || node.op == "^" || node.op == "<<" || node.op == ">>") {
-				return analyzeArithmeticBinary(node, leftType, rightType);
+	SemanticType analyzeUnaryExpr(const UnaryExpr& node) {
+		auto operandType = analyzeExpr(node.operand);
+		if (node.op == "-" || node.op == "~") {
+			if (!isNumericType(operandType) && operandType.kind != SemanticTypeKind::Unknown) {
+				report(node.location, "unary '" + node.op + "' requires a numeric operand, got " + semanticTypeName(operandType));
 			}
-			if (node.op == "and" || node.op == "or" || node.op == "&&" || node.op == "||") {
-				return analyzeLogicalBinary(node, leftType, rightType);
-			}
-			if (node.op == "<" || node.op == "<=" || node.op == ">" || node.op == ">=") {
-				return analyzeComparisonBinary(node, leftType, rightType);
-			}
-			if (node.op == "==" || node.op == "!=") {
-				return analyzeEqualityBinary(node, leftType, rightType);
-			}
-			return makeUnknownType();
+			return isNumericType(operandType) ? operandType : (operandType.kind == SemanticTypeKind::Unknown ? makeNumberType() : makeUnknownType());
 		}
-
-		SemanticType analyzeCallExpr(const CallExpr& node) {
-			if (const auto* callee = std::get_if<VariableExpr>(&node.callee->node)) {
-				if (callee->name == "print") {
-					for (const auto& argument : node.arguments) {
-						analyzeExpr(argument);
-					}
-					return makeVoidType();
-				}
-				return resolveRoutineCall(callee->name, node.arguments, node.location);
+		if (node.op == "!" || node.op == "not") {
+			if (operandType.kind != SemanticTypeKind::Bool && operandType.kind != SemanticTypeKind::Unknown) {
+				report(node.location, "logical negation requires bool, got " + semanticTypeName(operandType));
 			}
-			analyzeExpr(node.callee);
-			for (const auto& argument : node.arguments) {
-				analyzeExpr(argument);
-			}
-			report(node.location, "call target must be a named routine");
-			return makeUnknownType();
+			return operandType.kind == SemanticTypeKind::Bool || operandType.kind == SemanticTypeKind::Unknown ? makeBoolType() : makeUnknownType();
 		}
+		return makeUnknownType();
+	}
 
-		SemanticType analyzeArithmeticBinary(const BinaryExpr& node, const SemanticType& leftType, const SemanticType& rightType) {
-			if ((!isNumericType(leftType) || !isNumericType(rightType)) && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
-				report(node.location, "arithmetic operator '" + node.op + "' requires numbers");
-			}
-			if (isNumericType(leftType) && leftType.name != "number") return leftType;
-			if (isNumericType(rightType) && rightType.name != "number") return rightType;
-			return (isNumericType(leftType) || isNumericType(rightType) || leftType.kind == SemanticTypeKind::Unknown || rightType.kind == SemanticTypeKind::Unknown)
-				? makeNumberType() : makeUnknownType();
+	SemanticType analyzeBinaryExpr(const BinaryExpr& node) {
+		auto leftType = analyzeExpr(node.left);
+		auto rightType = analyzeExpr(node.right);
+		if (node.op == "+" || node.op == "-" || node.op == "*" || node.op == "/" || node.op == "%" ||
+			node.op == "&" || node.op == "|" || node.op == "^" || node.op == "<<" || node.op == ">>") {
+			return analyzeArithmeticBinary(node, leftType, rightType);
 		}
-
-		SemanticType analyzeLogicalBinary(const BinaryExpr& node, const SemanticType& leftType, const SemanticType& rightType) {
-			if ((leftType.kind != SemanticTypeKind::Bool || rightType.kind != SemanticTypeKind::Bool) && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
-				report(node.location, "logical operator '" + node.op + "' requires bool operands");
-			}
-			return (leftType.kind == SemanticTypeKind::Bool || rightType.kind == SemanticTypeKind::Bool || leftType.kind == SemanticTypeKind::Unknown || rightType.kind == SemanticTypeKind::Unknown)
-				? makeBoolType()
-				: makeUnknownType();
+		if (node.op == "and" || node.op == "or" || node.op == "&&" || node.op == "||") {
+			return analyzeLogicalBinary(node, leftType, rightType);
 		}
-
-		SemanticType analyzeComparisonBinary(const BinaryExpr& node, const SemanticType& leftType, const SemanticType& rightType) {
-			if ((!isNumericType(leftType) || !isNumericType(rightType)) && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
-				report(node.location, "comparison operator '" + node.op + "' requires numbers");
-			}
-			return makeBoolType();
+		if (node.op == "<" || node.op == "<=" || node.op == ">" || node.op == ">=") {
+			return analyzeComparisonBinary(node, leftType, rightType);
 		}
-
-		SemanticType analyzeChooseExpr(const ChooseExpr& node) {
-			analyzeExpr(node.subject);
-			SemanticType resultType = makeUnknownType();
-			for (const auto& choice : node.cases) {
-				analyzeExpr(choice.condition);
-				auto branchType = analyzeExpr(choice.value);
-				if (resultType.kind == SemanticTypeKind::Unknown) {
-					resultType = branchType;
-				}
-				else if (!isAssignableTo(resultType, branchType) && !isAssignableTo(branchType, resultType)) {
-					report(choice.location, "choose branches must produce compatible types");
-				}
-			}
-			if (node.hasOtherwise) {
-				auto otherwiseType = analyzeExpr(node.otherwiseValue);
-				if (resultType.kind == SemanticTypeKind::Unknown) {
-					resultType = otherwiseType;
-				}
-				else if (!isAssignableTo(resultType, otherwiseType) && !isAssignableTo(otherwiseType, resultType)) {
-					report(node.location, "otherwise branch must match choose branch types");
-				}
-			}
-			return resultType;
+		if (node.op == "==" || node.op == "!=") {
+			return analyzeEqualityBinary(node, leftType, rightType);
 		}
+		return makeUnknownType();
+	}
 
-		SemanticType analyzeEqualityBinary(const BinaryExpr& node, const SemanticType& leftType, const SemanticType& rightType) {
-			if (!isAssignableTo(leftType, rightType) && !isAssignableTo(rightType, leftType) && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
-				report(node.location, "equality comparison requires compatible types");
+	SemanticType analyzeCallExpr(const CallExpr& node) {
+		if (const auto* callee = std::get_if<VariableExpr>(&node.callee->node)) {
+			if (callee->name == "ok" || callee->name == "err" || callee->name == "some") {
+				if (node.arguments.size()!=1) { report(node.location, callee->name + " requires exactly one argument"); return makeUnknownType(); }
+				auto t=analyzeExpr(node.arguments.front());
+				return makeCustomType("__"+callee->name+"<"+semanticTypeName(t)+">");
 			}
-			return makeBoolType();
-		}
-
-		SemanticType analyzeExpr(const ExprPtr& expr) {
-			if (!expr) {
-				return makeUnknownType();
-			}
-
-			return std::visit([&](const auto& node) -> SemanticType {
-				using T = std::decay_t<decltype(node)>;
-				if constexpr (std::is_same_v<T, NumberExpr>) {
-					return makeNumberType();
-				}
-				else if constexpr (std::is_same_v<T, StringExpr>) {
-					return makeStringType();
-				}
-				else if constexpr (std::is_same_v<T, BoolExpr>) {
-					return makeBoolType();
-				}
-				else if constexpr (std::is_same_v<T, NullExpr>) {
-					return makeNullType();
-				}
-				else if constexpr (std::is_same_v<T, VariableExpr>) {
-					auto* symbol = lookupSymbol(node.name);
-					if (symbol) {
-						return symbol->type;
-					}
-					if (routines_.contains(node.name)) {
-						report(node.location, "routine name used without call: " + node.name);
-					}
-					else {
-						report(node.location, "unknown name: " + node.name);
-					}
-					return makeUnknownType();
-				}
-				else if constexpr (std::is_same_v<T, UnaryExpr>) {
-					return analyzeUnaryExpr(node);
-				}
-				else if constexpr (std::is_same_v<T, BinaryExpr>) {
-					return analyzeBinaryExpr(node);
-				}
-				else if constexpr (std::is_same_v<T, PipelineExpr>) {
-					analyzeExpr(node.input);
-					for (const auto& stage : node.stages) analyzeExpr(stage);
-					return makeUnknownType();
-				}
-				else if constexpr (std::is_same_v<T, RangeExpr>) {
-					if (node.start) analyzeExpr(node.start);
-					if (node.end) analyzeExpr(node.end);
-					if (node.step) analyzeExpr(node.step);
-					return makeCustomType("range");
-				}
-				else if constexpr (std::is_same_v<T, ChooseExpr>) {
-					return analyzeChooseExpr(node);
-				}
-				else if constexpr (std::is_same_v<T, CallExpr>) {
-					return analyzeCallExpr(node);
-				}
-				else if constexpr (std::is_same_v<T, GroupExpr>) {
-					return analyzeExpr(node.expression);
-				}
-				else if constexpr (std::is_same_v<T, MemberExpr>) {
-					return analyzeMemberExpr(node);
-				}
-				else if constexpr (std::is_same_v<T, ConstructExpr>) {
-					return analyzeConstructExpr(node);
-				}
-				else {
-					return makeUnknownType();
-				}
-				}, expr->node);
-		}
-
-		const NominalTypeInfo* findNominalType(const std::string& name) const {
-			auto it = result_.nominalTypes.find(name);
-			return it != result_.nominalTypes.end() ? &it->second : nullptr;
-		}
-
-		SemanticType nominalSemanticType(const std::string& name) const {
-			if (const auto* nominal = findNominalType(name)) {
-				return makeCustomType(nominal->name);
-			}
-			return semanticTypeFromName(name);
-		}
-
-		SemanticType analyzeMemberExpr(const MemberExpr& node) {
-			auto objectType = analyzeExpr(node.object);
-			if (objectType.kind == SemanticTypeKind::Custom) {
-				if (const auto* nominal = findNominalType(objectType.name)) {
-					for (const auto& field : nominal->fields) {
-						if (field.first == node.member) {
-							return semanticTypeFromName(field.second);
-						}
-					}
-				}
-			}
-			report(node.location, "unknown member access: " + semanticTypeName(objectType) + "." + node.member);
-			return makeUnknownType();
-		}
-
-		SemanticType analyzeConstructExpr(const ConstructExpr& node) {
-			const auto* nominal = findNominalType(node.typeName);
-			for (const auto& field : node.fields) {
-				if (field.value) {
-					analyzeExpr(field.value);
-				}
-			}
-			if (!nominal) {
-				report(node.location, "unknown nominal type: " + node.typeName);
-				return makeUnknownType();
-			}
-			if (nominal->kind == "record" || nominal->kind == "union") {
-				for (const auto& field : node.fields) {
-					auto it = std::find_if(nominal->fields.begin(), nominal->fields.end(), [&](const auto& candidate) { return candidate.first == field.name; });
-					if (it == nominal->fields.end()) {
-						report(field.location, "unknown field '" + field.name + "' for type " + node.typeName);
-						continue;
-					}
-					if (field.value) {
-						auto valueType = analyzeExpr(field.value);
-						if (!isAssignableTo(semanticTypeFromName(it->second), valueType)) {
-							report(field.location, "field '" + field.name + "' type mismatch");
-						}
-					}
-				}
-			}
-			else if (nominal->kind == "enum") {
-				if (node.fields.size() > 1) {
-					report(node.location, "enum construction accepts at most one value");
-				}
-			}
-			else if (nominal->kind == "variant") {
-				if (node.fields.size() > 1) {
-					report(node.location, "variant construction accepts at most one payload field");
-				}
-			}
-			return makeCustomType(node.typeName);
-		}
-
-		void pushScope() {
-			scopes_.push_back(SemanticScope{});
-		}
-
-		void popScope() {
-			if (!scopes_.empty()) {
-				scopes_.pop_back();
-			}
-		}
-
-		SymbolInfo* lookupSymbol(const std::string& name) {
-			for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
-				auto symbolIt = it->symbols.find(name);
-				if (symbolIt != it->symbols.end()) {
-					return &symbolIt->second;
-				}
-			}
-			return nullptr;
-		}
-
-		void declareSymbol(SourceLocation location, const std::string& name, SymbolInfo symbol) {
-			if (scopes_.empty()) {
-				pushScope();
-			}
-			auto& scope = scopes_.back();
-			if (scope.symbols.contains(name)) {
-				report(location, "duplicate local name: " + name);
-				return;
-			}
-			scope.symbols.emplace(name, std::move(symbol));
-		}
-
-		SemanticType resolveRoutineCall(const std::string& name, const std::vector<ExprPtr>& arguments, SourceLocation location) {
-			auto it = routines_.find(name);
-			if (it == routines_.end()) {
-				report(location, "unknown routine: " + name);
-				for (const auto& argument : arguments) {
+			if (callee->name == "none") { if(!node.arguments.empty())report(node.location,"none requires no arguments"); return makeCustomType("__none"); }
+			if (callee->name == "print") {
+				for (const auto& argument : node.arguments) {
 					analyzeExpr(argument);
 				}
-				return makeUnknownType();
+				return makeVoidType();
 			}
-
-			std::vector<SemanticType> argumentTypes = collectArgumentTypes(arguments);
-
-			std::vector<SemanticAnalyzer::Candidate> candidates = buildCandidates(it->second, argumentTypes);
-
-			if (candidates.empty()) {
-				report(location, formatOverloadMismatch(name, it->second, argumentTypes));
-				return makeUnknownType();
-			}
-
-			std::sort(candidates.begin(), candidates.end(), [](const SemanticAnalyzer::Candidate& a, const SemanticAnalyzer::Candidate& b) { return a.score > b.score; });
-			if (candidates.size() > 1 && candidates[0].score == candidates[1].score) {
-				std::vector<RoutineSignature> candidateSignatures;
-				std::vector<std::size_t> candidateScores;
-				std::size_t limit = std::min<std::size_t>(candidates.size(), 3);
-				for (std::size_t i = 0; i < limit; ++i) {
-					candidateSignatures.push_back(*candidates[i].signature);
-					candidateScores.push_back(candidates[i].score);
+			if (auto* symbol = lookupSymbol(callee->name); symbol && symbol->type.kind == SemanticTypeKind::Custom) {
+				auto cs = closureSignatures_.find(symbol->type.name);
+				if (cs != closureSignatures_.end()) {
+					auto argumentTypes = collectArgumentTypes(node.arguments);
+					if (argumentTypes.size() != cs->second.parameterTypes.size()) report(node.location, "closure call arity mismatch");
+					else for(std::size_t i=0;i<argumentTypes.size();++i) if(!isAssignableTo(cs->second.parameterTypes[i],argumentTypes[i])) report(node.location,"closure argument type mismatch");
+					return cs->second.returnType;
 				}
-				report(location, formatAmbiguousOverload(name, candidateSignatures, candidateScores));
-				return candidates[0].signature->returnType;
-			}
-
-			return candidates.front().signature->returnType;
-		}
-
-		struct Candidate {
-			const RoutineSignature* signature = nullptr;
-			std::size_t score = 0;
-		};
-
-		bool sameSignature(const RoutineSignature& left, const RoutineSignature& right) const {
-			if (left.parameterTypes.size() != right.parameterTypes.size()) {
-				return false;
-			}
-			for (std::size_t i = 0; i < left.parameterTypes.size(); ++i) {
-				if (left.parameterTypes[i] != right.parameterTypes[i]) {
-					return false;
-				}
-			}
-			return true;
-		}
-
-		const RoutineSignature* findSignatureByArity(const std::vector<RoutineSignature>& overloads, std::size_t parameterCount) const {
-			for (const auto& signature : overloads) {
-				if (signature.parameterTypes.size() == parameterCount) {
-					return &signature;
-				}
-			}
-			return nullptr;
-		}
-
-		std::vector<SemanticType> collectArgumentTypes(const std::vector<ExprPtr>& arguments) {
-			std::vector<SemanticType> argumentTypes;
-			argumentTypes.reserve(arguments.size());
-			for (const auto& argument : arguments) {
-				argumentTypes.push_back(analyzeExpr(argument));
-			}
-			return argumentTypes;
-		}
-
-		std::vector<SemanticAnalyzer::Candidate> buildCandidates(const std::vector<RoutineSignature>& overloads, const std::vector<SemanticType>& argumentTypes) {
-			std::vector<SemanticAnalyzer::Candidate> candidates;
-			for (const auto& signature : overloads) {
-				if (signature.parameterTypes.size() != argumentTypes.size()) {
-					continue;
-				}
-				bool compatible = true;
-				std::size_t score = 0;
-				for (std::size_t i = 0; i < argumentTypes.size(); ++i) {
-					const auto& argType = argumentTypes[i];
-					if (!isAssignableTo(signature.parameterTypes[i], argType)) {
-						compatible = false;
-						break;
-					}
-					if (argType == signature.parameterTypes[i]) {
-						++score;
+				if (currentRoutine_) {
+					for (const auto& constraint : currentRoutine_->constraints) {
+						if (constraint.subject == symbol->type.name && constraint.capability == "callable" && constraint.arguments.size() >= 2) {
+							for (const auto& argument : node.arguments) analyzeExpr(argument);
+							return semanticTypeFromName(constraint.arguments.back());
+						}
 					}
 				}
-				if (compatible) {
-					candidates.push_back(SemanticAnalyzer::Candidate{ &signature, score });
-				}
 			}
-			return candidates;
+			return resolveRoutineCall(callee->name, node.arguments, node.genericArguments, node.location);
 		}
-
-		std::string formatSignature(const RoutineSignature& signature) const {
-			std::ostringstream oss;
-			oss << signature.name << '(';
-			for (std::size_t i = 0; i < signature.parameterTypes.size(); ++i) {
-				if (i != 0) oss << ", ";
-				oss << semanticTypeName(signature.parameterTypes[i]);
-			}
-			oss << ") -> " << semanticTypeName(signature.returnType);
-			return oss.str();
+		analyzeExpr(node.callee);
+		for (const auto& argument : node.arguments) {
+			analyzeExpr(argument);
 		}
-
-		std::string formatAmbiguousOverload(const std::string& name, const std::vector<RoutineSignature>& candidates, const std::vector<std::size_t>& scores) const {
-			std::ostringstream oss;
-			oss << "ambiguous overload resolution for routine '" << name << "': ";
-			const std::size_t limit = std::min<std::size_t>(candidates.size(), 3);
-			for (std::size_t i = 0; i < limit; ++i) {
-				if (i != 0) oss << "; ";
-				oss << formatSignature(candidates[i]);
-				if (i < scores.size()) {
-					oss << " [score " << scores[i] << "]";
-				}
-			}
-			if (candidates.size() > limit) {
-				oss << "; ...";
-			}
-			return oss.str();
-		}
-
-		std::string formatOverloadMismatch(const std::string& name, const std::vector<RoutineSignature>& candidates, const std::vector<SemanticType>& argumentTypes) const {
-			std::ostringstream oss;
-			oss << "no matching overload for routine '" << name << "' with arguments (";
-			for (std::size_t i = 0; i < argumentTypes.size(); ++i) {
-				if (i != 0) oss << ", ";
-				oss << semanticTypeName(argumentTypes[i]);
-			}
-			oss << "). Candidates: ";
-			const std::size_t limit = std::min<std::size_t>(candidates.size(), 3);
-			for (std::size_t i = 0; i < limit; ++i) {
-				if (i != 0) oss << "; ";
-				oss << formatSignature(candidates[i]);
-			}
-			if (candidates.size() > limit) {
-				oss << "; ...";
-			}
-			return oss.str();
-		}
-
-		void report(SourceLocation location, std::string message) {
-			result_.diagnostics.push_back({ location, std::move(message) });
-		}
-
-		void report(std::string message) {
-			report({}, std::move(message));
-		}
-
-		SemanticAnalysisResult result_;
-		std::unordered_map<std::string, std::vector<RoutineSignature>> routines_;
-		std::unordered_map<std::string, NominalRecord> nominalTypes_;
-		std::vector<SemanticScope> scopes_;
-		std::vector<std::unordered_set<std::string>> declarationScopes_;
-		const Routine* currentRoutine_ = nullptr;
-		SemanticType currentReturnType_ = makeVoidType();
-		std::size_t currentLoopDepth_ = 0;
-	};
-
-	// --- Frontend helpers: pretty-printing --------------------------------------
-	std::string indentText(std::size_t depth) {
-		return std::string(depth * 4, ' ');
+		report(node.location, "call target must be a named routine");
+		return makeUnknownType();
 	}
 
-	std::string exprToString(const ExprPtr& expr);
-	std::string stmtToString(const StmtPtr& stmt, std::size_t depth);
-
-	std::string exprToString(const ExprPtr& expr) {
-		if (!expr) {
-			return "<null>";
+	SemanticType analyzeArithmeticBinary(const BinaryExpr& node, const SemanticType& leftType, const SemanticType& rightType) {
+		if ((!isNumericType(leftType) || !isNumericType(rightType)) && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
+			report(node.location, "arithmetic operator '" + node.op + "' requires numbers");
 		}
-		return std::visit([](const auto& node) -> std::string {
+		if (isNumericType(leftType) && leftType.name != "number") return leftType;
+		if (isNumericType(rightType) && rightType.name != "number") return rightType;
+		return (isNumericType(leftType) || isNumericType(rightType) || leftType.kind == SemanticTypeKind::Unknown || rightType.kind == SemanticTypeKind::Unknown)
+			? makeNumberType() : makeUnknownType();
+	}
+
+	SemanticType analyzeLogicalBinary(const BinaryExpr& node, const SemanticType& leftType, const SemanticType& rightType) {
+		if ((leftType.kind != SemanticTypeKind::Bool || rightType.kind != SemanticTypeKind::Bool) && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
+			report(node.location, "logical operator '" + node.op + "' requires bool operands");
+		}
+		return (leftType.kind == SemanticTypeKind::Bool || rightType.kind == SemanticTypeKind::Bool || leftType.kind == SemanticTypeKind::Unknown || rightType.kind == SemanticTypeKind::Unknown)
+			? makeBoolType()
+			: makeUnknownType();
+	}
+
+	SemanticType analyzeComparisonBinary(const BinaryExpr& node, const SemanticType& leftType, const SemanticType& rightType) {
+		if ((!isNumericType(leftType) || !isNumericType(rightType)) && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
+			report(node.location, "comparison operator '" + node.op + "' requires numbers");
+		}
+		return makeBoolType();
+	}
+
+	SemanticType analyzeChooseExpr(const ChooseExpr& node) {
+		analyzeExpr(node.subject);
+		SemanticType resultType = makeUnknownType();
+		for (const auto& choice : node.cases) {
+			analyzeExpr(choice.condition);
+			auto branchType = analyzeExpr(choice.value);
+			if (resultType.kind == SemanticTypeKind::Unknown) {
+				resultType = branchType;
+			} else if (!isAssignableTo(resultType, branchType) && !isAssignableTo(branchType, resultType)) {
+				report(choice.location, "choose branches must produce compatible types");
+			}
+		}
+		if (node.hasOtherwise) {
+			auto otherwiseType = analyzeExpr(node.otherwiseValue);
+			if (resultType.kind == SemanticTypeKind::Unknown) {
+				resultType = otherwiseType;
+			} else if (!isAssignableTo(resultType, otherwiseType) && !isAssignableTo(otherwiseType, resultType)) {
+				report(node.location, "otherwise branch must match choose branch types");
+			}
+		}
+		return resultType;
+	}
+
+	SemanticType analyzeEqualityBinary(const BinaryExpr& node, const SemanticType& leftType, const SemanticType& rightType) {
+		if (!isAssignableTo(leftType, rightType) && !isAssignableTo(rightType, leftType) && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
+			report(node.location, "equality comparison requires compatible types");
+		}
+		return makeBoolType();
+	}
+
+	SemanticType analyzeExpr(const ExprPtr& expr) {
+		if (!expr) {
+			return makeUnknownType();
+		}
+
+		return std::visit([&](const auto& node) -> SemanticType {
 			using T = std::decay_t<decltype(node)>;
 			if constexpr (std::is_same_v<T, NumberExpr>) {
-				return node.value;
-			}
-			else if constexpr (std::is_same_v<T, StringExpr>) {
-				return '"' + node.value + '"';
-			}
-			else if constexpr (std::is_same_v<T, BoolExpr>) {
-				return node.value ? "true" : "false";
-			}
-			else if constexpr (std::is_same_v<T, NullExpr>) {
-				return "null";
-			}
-			else if constexpr (std::is_same_v<T, VariableExpr>) {
-				return node.name;
-			}
-			else if constexpr (std::is_same_v<T, UnaryExpr>) {
-				return "(" + node.op + " " + exprToString(node.operand) + ")";
-			}
-			else if constexpr (std::is_same_v<T, BinaryExpr>) {
-				return "(" + exprToString(node.left) + " " + node.op + " " + exprToString(node.right) + ")";
-			}
-			else if constexpr (std::is_same_v<T, PipelineExpr>) {
-				std::ostringstream oss;
-				oss << exprToString(node.input);
-				for (const auto& stage : node.stages) {
-					oss << " -> " << exprToString(stage);
+				return makeNumberType();
+			} else if constexpr (std::is_same_v<T, StringExpr>) {
+				return makeStringType();
+			} else if constexpr (std::is_same_v<T, BoolExpr>) {
+				return makeBoolType();
+			} else if constexpr (std::is_same_v<T, NullExpr>) {
+				return makeNullType();
+			} else if constexpr (std::is_same_v<T, VariableExpr>) {
+				auto* symbol = lookupSymbol(node.name);
+				if (symbol) {
+					return symbol->type;
 				}
-				return oss.str();
-			}
-			else if constexpr (std::is_same_v<T, RangeExpr>) {
-				return exprToString(node.start) + (node.inclusive ? "..=" : "..") + exprToString(node.end);
-			}
-			else if constexpr (std::is_same_v<T, ChooseExpr>) {
-				std::ostringstream oss;
-				oss << "choose";
-				if (node.subject) oss << " " << exprToString(node.subject);
-				for (const auto& choice : node.cases) {
-					oss << "\n" << indentText(1) << "when " << exprToString(choice.condition) << "\n" << indentText(2) << exprToString(choice.value);
+				if (routines_.contains(node.name)) {
+					report(node.location, "routine name used without call: " + node.name);
+				} else {
+					report(node.location, "unknown name: " + node.name);
 				}
-				if (node.hasOtherwise) {
-					oss << "\n" << indentText(1) << "otherwise\n" << indentText(2) << exprToString(node.otherwiseValue);
+				return makeUnknownType();
+			} else if constexpr (std::is_same_v<T, UnaryExpr>) {
+				return analyzeUnaryExpr(node);
+			} else if constexpr (std::is_same_v<T, BinaryExpr>) {
+				return analyzeBinaryExpr(node);
+			} else if constexpr (std::is_same_v<T, PipelineExpr>) {
+				analyzeExpr(node.input);
+				for (const auto& stage : node.stages) analyzeExpr(stage);
+				return makeUnknownType();
+			} else if constexpr (std::is_same_v<T, RangeExpr>) {
+				if (node.start) analyzeExpr(node.start);
+				if (node.end) analyzeExpr(node.end);
+				if (node.step) analyzeExpr(node.step);
+				return makeCustomType("range");
+			} else if constexpr (std::is_same_v<T, ChooseExpr>) {
+				return analyzeChooseExpr(node);
+			} else if constexpr (std::is_same_v<T, CallExpr>) {
+				return analyzeCallExpr(node);
+			} else if constexpr (std::is_same_v<T, TryExpr>) {
+				auto operandType = analyzeExpr(node.operand);
+				std::string okType, errType;
+				if (!typeIsResult(semanticTypeName(operandType), &okType, &errType)) { report(node.location, "E0500 try requires result<T,E>"); return makeUnknownType(); }
+				if (!currentRoutine_) return semanticTypeFromName(okType);
+				std::string currentOk, currentErr;
+				if (!typeIsResult(currentRoutine_->returnType, &currentOk, &currentErr) || currentErr != errType)
+					report(node.location, "E0501 try cannot propagate error '" + errType + "' from routine returning " + currentRoutine_->returnType);
+				return semanticTypeFromName(okType);
+			} else if constexpr (std::is_same_v<T, ClosureExpr>) {
+				std::string closureType = "closure$" + std::to_string(node.closureId);
+				RoutineSignature sig; sig.name = closureType;
+				pushScope();
+				for (const auto& p : node.parameters) {
+					if (p.typeName.empty()) report(p.location, "closure parameter '" + p.name + "' requires a type without an expected callable context");
+					auto pt = semanticTypeFromName(p.typeName); sig.parameterNames.push_back(p.name); sig.parameterTypes.push_back(pt); sig.parameterModes.push_back(p.mode); declareSymbol(p.location,p.name,{pt,p.mode=="var",true});
 				}
-				return oss.str();
+				SemanticType rt = node.returnType.empty()?makeUnknownType():semanticTypeFromName(node.returnType);
+				if (node.hasExpressionBody) { auto bodyType=analyzeExpr(node.expressionBody); if(rt.kind==SemanticTypeKind::Unknown)rt=bodyType; else if(!isAssignableTo(rt,bodyType))report(node.location,"closure return type mismatch"); }
+				else { auto saved=currentReturnType_; auto savedRoutine=currentRoutine_; currentReturnType_=rt.kind==SemanticTypeKind::Unknown?makeVoidType():rt; analyzeStatementList(node.blockBody); currentReturnType_=saved; currentRoutine_=savedRoutine; if(rt.kind==SemanticTypeKind::Unknown)rt=makeVoidType(); }
+				popScope(); sig.returnType=rt; closureSignatures_[closureType]=sig; return makeCustomType(closureType);
+			} else if constexpr (std::is_same_v<T, GroupExpr>) {
+				return analyzeExpr(node.expression);
+			} else if constexpr (std::is_same_v<T, MemberExpr>) {
+				return analyzeMemberExpr(node);
+			} else if constexpr (std::is_same_v<T, ConstructExpr>) {
+				return analyzeConstructExpr(node);
+			} else {
+				return makeUnknownType();
 			}
-			else if constexpr (std::is_same_v<T, CallExpr>) {
-				std::ostringstream oss;
-				oss << exprToString(node.callee) << '(';
-				for (std::size_t i = 0; i < node.arguments.size(); ++i) {
-					if (i != 0) oss << ", ";
-					oss << exprToString(node.arguments[i]);
-				}
-				oss << ')';
-				return oss.str();
-			}
-			else if constexpr (std::is_same_v<T, GroupExpr>) {
-				return "(" + exprToString(node.expression) + ")";
-			}
-			else if constexpr (std::is_same_v<T, PipelineExpr>) {
-				return exprToString(node.input) + " -> <pipeline>";
-			}
-			else if constexpr (std::is_same_v<T, RangeExpr>) {
-				return exprToString(node.start) + (node.inclusive ? "..=" : "..") + exprToString(node.end);
-			}
-			else if constexpr (std::is_same_v<T, ChooseExpr>) {
-				return "choose <expr>";
-			}
-			else {
-				return "<expr>";
-			}
-			}, expr->node);
+		}, expr->node);
 	}
 
-	std::string stmtToString(const StmtPtr& stmt, std::size_t depth) {
-		if (!stmt) {
-			return indentText(depth) + "<null>";
+	const NominalTypeInfo* findNominalType(const std::string& name) const {
+		auto it = result_.nominalTypes.find(name);
+		return it != result_.nominalTypes.end() ? &it->second : nullptr;
+	}
+
+	SemanticType nominalSemanticType(const std::string& name) const {
+		if (const auto* nominal = findNominalType(name)) {
+			return makeCustomType(nominal->name);
 		}
-		return std::visit([&](const auto& node) -> std::string {
-			using T = std::decay_t<decltype(node)>;
-			std::ostringstream oss;
-			if constexpr (std::is_same_v<T, LetStmt>) {
-				oss << indentText(depth) << "let " << node.name;
-				if (!node.typeName.empty()) oss << ": " << node.typeName;
-				oss << " = " << exprToString(node.initializer);
-				return oss.str();
-			}
-			else if constexpr (std::is_same_v<T, VarStmt>) {
-				oss << indentText(depth) << "var " << node.name;
-				if (!node.typeName.empty()) oss << ": " << node.typeName;
-				if (node.initializer) oss << " = " << exprToString(node.initializer);
-				return oss.str();
-			}
-			else if constexpr (std::is_same_v<T, AssignStmt>) {
-				oss << indentText(depth) << node.name << " = " << exprToString(node.value);
-				return oss.str();
-			}
-			else if constexpr (std::is_same_v<T, ExprStmt>) {
-				oss << indentText(depth) << exprToString(node.expression);
-				return oss.str();
-			}
-			else if constexpr (std::is_same_v<T, ReturnStmt>) {
-				oss << indentText(depth) << "return";
-				if (node.hasValue) oss << " " << exprToString(node.value);
-				return oss.str();
-			}
-			else if constexpr (std::is_same_v<T, GiveStmt>) {
-				oss << indentText(depth) << "give " << exprToString(node.value);
-				return oss.str();
-			}
-			else if constexpr (std::is_same_v<T, IfStmt>) {
-				oss << indentText(depth) << "if " << exprToString(node.condition) << "\n";
-				for (const auto& child : node.thenBranch) {
-					oss << stmtToString(child, depth + 1) << "\n";
-				}
-				if (node.hasElse) {
-					oss << indentText(depth) << "else\n";
-					for (const auto& child : node.elseBranch) {
-						oss << stmtToString(child, depth + 1) << "\n";
+		return semanticTypeFromName(name);
+	}
+
+	SemanticType analyzeMemberExpr(const MemberExpr& node) {
+		auto objectType = analyzeExpr(node.object);
+		if (objectType.kind == SemanticTypeKind::Custom) {
+			if (const auto* nominal = findNominalType(objectType.name)) {
+				for (const auto& field : nominal->fields) {
+					if (field.first == node.member) {
+						return semanticTypeFromName(field.second);
 					}
 				}
-				std::string result = oss.str();
-				if (!result.empty() && result.back() == '\n') result.pop_back();
-				return result;
 			}
-			else if constexpr (std::is_same_v<T, WhileStmt>) {
-				oss << indentText(depth) << "while " << exprToString(node.condition) << "\n";
-				for (const auto& child : node.body) {
-					oss << stmtToString(child, depth + 1) << "\n";
-				}
-				std::string result = oss.str();
-				if (!result.empty() && result.back() == '\n') result.pop_back();
-				return result;
-			}
-			else if constexpr (std::is_same_v<T, BreakStmt>) {
-				return indentText(depth) + "break" + (node.label.empty() ? "" : " @" + node.label);
-			}
-			else if constexpr (std::is_same_v<T, ContinueStmt>) {
-				return indentText(depth) + "continue" + (node.label.empty() ? "" : " @" + node.label);
-			}
-			else if constexpr (std::is_same_v<T, EachStmt>) {
-				oss << indentText(depth) << "for ";
-				if (node.bindingsMutable) oss << "var ";
-				for (std::size_t i = 0; i < node.bindings.size(); ++i) {
-					if (i != 0) oss << ", ";
-					oss << node.bindings[i];
-				}
-				oss << " in " << exprToString(node.range) << "\n";
-				for (const auto& child : node.body) {
-					oss << stmtToString(child, depth + 1) << "\n";
-				}
-				std::string result = oss.str();
-				if (!result.empty() && result.back() == '\n') result.pop_back();
-				return result;
-			}
-			else if constexpr (std::is_same_v<T, UnsafeStmt>) {
-				oss << indentText(depth) << "unsafe\n";
-				for (const auto& child : node.body) {
-					oss << stmtToString(child, depth + 1) << "\n";
-				}
-				std::string result = oss.str();
-				if (!result.empty() && result.back() == '\n') result.pop_back();
-				return result;
-			}
-			else if constexpr (std::is_same_v<T, DeferStmt>) {
-				oss << indentText(depth) << "defer " << exprToString(node.expression);
-				return oss.str();
-			}
-			else if constexpr (std::is_same_v<T, FailStmt>) {
-				oss << indentText(depth) << "fail " << exprToString(node.expression);
-				return oss.str();
-			}
-			else if constexpr (std::is_same_v<T, BlockStmt>) {
-				for (const auto& child : node.statements) {
-					oss << stmtToString(child, depth) << "\n";
-				}
-				std::string result = oss.str();
-				if (!result.empty() && result.back() == '\n') result.pop_back();
-				return result;
-			}
-			else {
-				return indentText(depth) + "<stmt>";
-			}
-			}, stmt->node);
+		}
+		report(node.location, "unknown member access: " + semanticTypeName(objectType) + "." + node.member);
+		return makeUnknownType();
 	}
 
-	std::string routineToString(const Routine& routine) {
+	SemanticType analyzeConstructExpr(const ConstructExpr& node) {
+		const auto* nominal = findNominalType(node.typeName);
+		for (const auto& field : node.fields) {
+			if (field.value) {
+				analyzeExpr(field.value);
+			}
+		}
+		if (!nominal) {
+			report(node.location, "unknown nominal type: " + node.typeName);
+			return makeUnknownType();
+		}
+		if (nominal->kind == "record" || nominal->kind == "union") {
+            std::unordered_set<std::string> supplied;
+			for (const auto& field : node.fields) {
+                if (!supplied.insert(field.name).second) report(field.location, "duplicate field '" + field.name + "' in construction of " + node.typeName);
+				auto it = std::find_if(nominal->fields.begin(), nominal->fields.end(), [&](const auto& candidate) { return candidate.first == field.name; });
+				if (it == nominal->fields.end()) {
+					report(field.location, "unknown field '" + field.name + "' for type " + node.typeName);
+					continue;
+				}
+				if (field.value) {
+					auto valueType = analyzeExpr(field.value);
+					if (!isAssignableTo(semanticTypeFromName(it->second), valueType)) {
+						report(field.location, "field '" + field.name + "' type mismatch");
+					}
+				}
+			}
+            if(nominal->kind=="record") for(const auto& required:nominal->fields) if(!supplied.contains(required.first)) report(node.location,"missing field '"+required.first+"' in construction of "+node.typeName);
+		} else if (nominal->kind == "enum") {
+			if (node.fields.size() > 1) {
+				report(node.location, "enum construction accepts at most one value");
+			}
+		} else if (nominal->kind == "variant") {
+			if (node.fields.size() > 1) {
+				report(node.location, "variant construction accepts at most one payload field");
+			}
+		}
+		return makeCustomType(node.typeName);
+	}
+
+	void pushScope() {
+		scopes_.push_back(SemanticScope{});
+	}
+
+	void popScope() {
+		if (!scopes_.empty()) {
+			scopes_.pop_back();
+		}
+	}
+
+	SymbolInfo* lookupSymbol(const std::string& name) {
+		for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
+			auto symbolIt = it->symbols.find(name);
+			if (symbolIt != it->symbols.end()) {
+				return &symbolIt->second;
+			}
+		}
+		return nullptr;
+	}
+
+	void declareSymbol(SourceLocation location, const std::string& name, SymbolInfo symbol) {
+		if (scopes_.empty()) {
+			pushScope();
+		}
+		auto& scope = scopes_.back();
+		if (scope.symbols.contains(name)) {
+			report(location, "duplicate local name: " + name);
+			return;
+		}
+		scope.symbols.emplace(name, std::move(symbol));
+	}
+
+	SemanticType resolveRoutineCall(const std::string& name, const std::vector<ExprPtr>& arguments, const std::vector<std::string>& explicitGenericArguments, SourceLocation location) {
+		auto it = routines_.find(name);
+		if (it == routines_.end()) {
+			report(location, "unknown routine: " + name);
+			for (const auto& argument : arguments) {
+				analyzeExpr(argument);
+			}
+			return makeUnknownType();
+		}
+
+		std::vector<SemanticType> argumentTypes = collectArgumentTypes(arguments);
+
+		std::vector<SemanticAnalyzer::Candidate> candidates = buildCandidates(it->second, argumentTypes, explicitGenericArguments);
+
+		if (candidates.empty()) {
+			report(location, formatOverloadMismatch(name, it->second, argumentTypes));
+			return makeUnknownType();
+		}
+
+		std::sort(candidates.begin(), candidates.end(), [](const SemanticAnalyzer::Candidate& a, const SemanticAnalyzer::Candidate& b) { return a.score > b.score; });
+		if (candidates.size() > 1 && candidates[0].score == candidates[1].score) {
+			std::vector<RoutineSignature> candidateSignatures;
+			std::vector<std::size_t> candidateScores;
+			std::size_t limit = std::min<std::size_t>(candidates.size(), 3);
+			for (std::size_t i = 0; i < limit; ++i) {
+				candidateSignatures.push_back(*candidates[i].signature);
+				candidateScores.push_back(candidates[i].score);
+			}
+			report(location, formatAmbiguousOverload(name, candidateSignatures, candidateScores));
+			return candidates[0].signature->returnType;
+		}
+
+		const auto& best = candidates.front();
+		return semanticTypeFromName(substituteGenericType(semanticTypeName(best.signature->returnType), best.substitutions));
+	}
+
+	struct Candidate {
+		const RoutineSignature* signature = nullptr;
+		std::size_t score = 0;
+		std::map<std::string,std::string> substitutions;
+	};
+
+	bool sameSignature(const RoutineSignature& left, const RoutineSignature& right) const {
+		if (left.parameterTypes.size() != right.parameterTypes.size()) {
+			return false;
+		}
+		for (std::size_t i = 0; i < left.parameterTypes.size(); ++i) {
+			if (left.parameterTypes[i] != right.parameterTypes[i]) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	const RoutineSignature* findSignatureByArity(const std::vector<RoutineSignature>& overloads, std::size_t parameterCount) const {
+		for (const auto& signature : overloads) {
+			if (signature.parameterTypes.size() == parameterCount) {
+				return &signature;
+			}
+		}
+		return nullptr;
+	}
+
+	std::vector<SemanticType> collectArgumentTypes(const std::vector<ExprPtr>& arguments) {
+		std::vector<SemanticType> argumentTypes;
+		argumentTypes.reserve(arguments.size());
+		for (const auto& argument : arguments) {
+			argumentTypes.push_back(analyzeExpr(argument));
+		}
+		return argumentTypes;
+	}
+
+	std::vector<SemanticAnalyzer::Candidate> buildCandidates(const std::vector<RoutineSignature>& overloads, const std::vector<SemanticType>& argumentTypes, const std::vector<std::string>& explicitGenericArguments) {
+		std::vector<SemanticAnalyzer::Candidate> candidates;
+		for (const auto& signature : overloads) {
+			if (signature.parameterTypes.size() != argumentTypes.size()) continue;
+            if (!explicitGenericArguments.empty() && explicitGenericArguments.size() != signature.genericParameters.size()) continue;
+            std::unordered_set<std::string> genericNames(signature.genericParameters.begin(), signature.genericParameters.end());
+            std::map<std::string,std::string> substitutions;
+            for(std::size_t i=0;i<explicitGenericArguments.size();++i) substitutions[signature.genericParameters[i]]=explicitGenericArguments[i];
+			bool compatible = true; std::size_t score = 0;
+			for (std::size_t i = 0; i < argumentTypes.size(); ++i) {
+                std::string patternText = semanticTypeName(signature.parameterTypes[i]);
+                std::string actualText = semanticTypeName(argumentTypes[i]);
+                if (!genericNames.empty() && actualText == "number") actualText = "int";
+                if (!genericNames.empty()) {
+                    try {
+                        auto p=CanonicalTypeParser(patternText).parse();
+                        if (!p.tuple && p.args.empty() && genericNames.contains(p.head)) {
+                            auto existing = substitutions.find(p.head);
+                            if (existing == substitutions.end()) { substitutions[p.head] = actualText; ++score; continue; }
+                            if (existing->second == actualText || (isNumericTypeName(existing->second) && isNumericTypeName(actualText))) { ++score; continue; }
+                            compatible=false; break;
+                        }
+                        auto a=CanonicalTypeParser(actualText).parse();
+                        if(!matchGenericTypePattern(p,a,genericNames,substitutions)){compatible=false;break;}
+                        ++score; continue;
+                    } catch(...) {}
+                }
+				if (!isAssignableTo(signature.parameterTypes[i], argumentTypes[i])) { compatible = false; break; }
+				if (argumentTypes[i] == signature.parameterTypes[i]) ++score;
+			}
+			if (compatible) candidates.push_back(SemanticAnalyzer::Candidate{&signature, score, std::move(substitutions)});
+		}
+		return candidates;
+	}
+
+	std::string formatSignature(const RoutineSignature& signature) const {
 		std::ostringstream oss;
-		oss << "routine " << routine.name << '(';
+		oss << signature.name << '(';
+		for (std::size_t i = 0; i < signature.parameterTypes.size(); ++i) {
+			if (i != 0) oss << ", ";
+			oss << semanticTypeName(signature.parameterTypes[i]);
+		}
+		oss << ") -> " << semanticTypeName(signature.returnType);
+		return oss.str();
+	}
+
+	std::string formatAmbiguousOverload(const std::string& name, const std::vector<RoutineSignature>& candidates, const std::vector<std::size_t>& scores) const {
+		std::ostringstream oss;
+		oss << "ambiguous overload resolution for routine '" << name << "': ";
+		const std::size_t limit = std::min<std::size_t>(candidates.size(), 3);
+		for (std::size_t i = 0; i < limit; ++i) {
+			if (i != 0) oss << "; ";
+			oss << formatSignature(candidates[i]);
+			if (i < scores.size()) {
+				oss << " [score " << scores[i] << "]";
+			}
+		}
+		if (candidates.size() > limit) {
+			oss << "; ...";
+		}
+		return oss.str();
+	}
+
+	std::string formatOverloadMismatch(const std::string& name, const std::vector<RoutineSignature>& candidates, const std::vector<SemanticType>& argumentTypes) const {
+		std::ostringstream oss;
+		oss << "no matching overload for routine '" << name << "' with arguments (";
+		for (std::size_t i = 0; i < argumentTypes.size(); ++i) {
+			if (i != 0) oss << ", ";
+			oss << semanticTypeName(argumentTypes[i]);
+		}
+		oss << "). Candidates: ";
+		const std::size_t limit = std::min<std::size_t>(candidates.size(), 3);
+		for (std::size_t i = 0; i < limit; ++i) {
+			if (i != 0) oss << "; ";
+			oss << formatSignature(candidates[i]);
+		}
+		if (candidates.size() > limit) {
+			oss << "; ...";
+		}
+		return oss.str();
+	}
+
+	void report(SourceLocation location, std::string message) {
+		result_.diagnostics.push_back({location, std::move(message)});
+	}
+
+	void report(std::string message) {
+		report({}, std::move(message));
+	}
+
+	SemanticAnalysisResult result_;
+	std::unordered_map<std::string, std::vector<RoutineSignature>> routines_;
+	std::unordered_map<std::string, NominalRecord> nominalTypes_;
+	std::unordered_map<std::string, RoutineSignature> closureSignatures_;
+	std::vector<SemanticScope> scopes_;
+	std::vector<std::unordered_set<std::string>> declarationScopes_;
+	const Routine* currentRoutine_ = nullptr;
+	SemanticType currentReturnType_ = makeVoidType();
+	std::size_t currentLoopDepth_ = 0;
+};
+
+
+// --- Semantic Knowledge Model materialization -------------------------------
+class SemanticKnowledgeBuilder {
+public:
+    void build(const Program& program, SemanticAnalysisResult& result) {
+        program_ = &program; result_ = &result; nextSymbolId_ = 1; nextBorrowId_ = 1;
+        routines_.clear(); capabilities_.clear(); specializationKeys_.clear(); closureSignatures_.clear();
+        for (const auto& r : program.routines) routines_[r.name].push_back(&r);
+        indexDeclarations(program.declarations);
+        buildLayouts();
+        for (const auto& r : program.routines) buildRoutine(r);
+        validateBorrowGraph();
+        result.skm.structuralFacts.push_back("semantic knowledge model materialized deterministically");
+        program_ = nullptr; result_ = nullptr;
+    }
+
+private:
+    struct LiveSymbol { std::size_t factIndex=0; std::string typeName; bool mutableBinding=false; std::string mode="shared"; };
+    using Scope = std::unordered_map<std::string, LiveSymbol>;
+    struct CaptureUse { BorrowKind kind=BorrowKind::Shared; std::uint64_t symbolId=0; std::string typeName; SourceLocation location; };
+    struct ClosureSignatureFact { std::vector<std::string> parameters; std::string returnType; };
+
+    static std::string keyFor(const Routine& r) { return r.name + "#" + std::to_string(r.parameters.size()); }
+    static BorrowKind stronger(BorrowKind a, BorrowKind b) {
+        auto rank=[](BorrowKind k){return k==BorrowKind::Owned?2:k==BorrowKind::Exclusive?1:0;}; return rank(a)>=rank(b)?a:b;
+    }
+
+    void indexDeclarations(const std::vector<Declaration>& declarations) {
+        for (const auto& d : declarations) std::visit([&](const auto& node){ using T=std::decay_t<decltype(node)>;
+            if constexpr(std::is_same_v<T,CapabilityDecl>) capabilities_[node.name]=&node;
+            else if constexpr(std::is_same_v<T,ForeignDecl>) routines_[node.routine.name].push_back(&node.routine);
+            else if constexpr(std::is_same_v<T,Routine>) routines_[node.name].push_back(&node);
+            else if constexpr(std::is_same_v<T,ModuleDecl>) indexDeclarations(node.declarations);
+        },d.node);
+    }
+
+    std::pair<std::size_t,std::size_t> layoutOf(const std::string& type, std::unordered_set<std::string>* stack=nullptr) const {
+        static const std::unordered_map<std::string,std::pair<std::size_t,std::size_t>> primitive={
+            {"byte",{1,1}},{"ubyte",{1,1}},{"bool",{1,1}},{"short",{2,2}},{"ushort",{2,2}},
+            {"int",{4,4}},{"uint",{4,4}},{"float",{4,4}},{"char",{4,4}},{"long",{8,8}},{"ulong",{8,8}},
+            {"size",{8,8}},{"ssize",{8,8}},{"double",{8,8}},{"raw",{8,8}},{"text",{16,8}},{"string",{24,8}}
+        };
+        if(auto it=primitive.find(type);it!=primitive.end())return it->second;
+        try {
+            auto t=CanonicalTypeParser(type).parse();
+            if(t.head=="raw")return {8,8};
+            if(t.head=="view"||t.head=="span"||t.head=="ref"||t.head=="mut")return {16,8};
+            if(t.head=="buffer")return {24,8};
+            if(t.head=="array"&&t.args.size()==2) { auto e=layoutOf(canonicalTypeText(t.args[0]),stack); return {e.first,e.second}; }
+            if(t.head=="option"&&t.args.size()==1){auto v=canonicalTypeText(t.args[0]);auto l=layoutOf(v,stack);bool niche=v=="bool"||v=="char"||v=="text"||v.rfind("view<",0)==0||v.rfind("span<",0)==0||v.rfind("buffer<",0)==0;return niche?l:std::pair<std::size_t,std::size_t>{alignUpSize(l.first,l.second)+l.second,l.second};}
+            if(t.head=="result"&&t.args.size()==2){auto a=layoutOf(canonicalTypeText(t.args[0]),stack),b=layoutOf(canonicalTypeText(t.args[1]),stack);auto al=std::max<std::size_t>({a.second,b.second,1});auto payload=std::max(a.first,b.first);return {alignUpSize(1,al)+alignUpSize(payload,al),al};}
+            if(t.tuple){std::size_t off=0,al=1;for(const auto&x:t.args){auto l=layoutOf(canonicalTypeText(x),stack);al=std::max(al,l.second);off=alignUpSize(off,l.second)+l.first;}return {alignUpSize(off,al),al};}
+        } catch(...) {}
+        auto it=result_->nominalTypes.find(type); if(it==result_->nominalTypes.end())return {8,8};
+        std::unordered_set<std::string> localStack; if(!stack)stack=&localStack; if(stack->contains(type))return {0,1}; stack->insert(type);
+        const auto& n=it->second; std::size_t off=0,al=1;
+        if(n.kind=="record"||n.kind=="union"){
+            if(n.kind=="union"){std::size_t mx=0;for(const auto&f:n.fields){auto l=layoutOf(f.second,stack);mx=std::max(mx,l.first);al=std::max(al,l.second);}off=alignUpSize(mx,al);} else {
+                for(const auto&f:n.fields){auto l=layoutOf(f.second,stack);al=std::max(al,l.second);off=alignUpSize(off,l.second)+l.first;}off=alignUpSize(off,al);
+            }
+        } else if(n.kind=="enum") { off=4; al=4; } else if(n.kind=="variant") { off=16; al=8; }
+        stack->erase(type); return {off,al};
+    }
+    static std::size_t alignUpSize(std::size_t v,std::size_t a){return a?((v+a-1)/a)*a:v;}
+
+    void buildLayouts() {
+        for (const auto& [name,n] : result_->nominalTypes) {
+            auto [size,align]=layoutOf(name); SKMLayoutFact f; f.typeName=name;f.size=size;f.alignment=align;
+            if(n.kind=="record"){std::size_t off=0;for(const auto&field:n.fields){auto l=layoutOf(field.second);off=alignUpSize(off,l.second);f.fieldOffsets.push_back({field.first,off});off+=l.first;}}
+            result_->skm.layouts.push_back(std::move(f));
+        }
+        std::unordered_set<std::string> seen; for(const auto&f:result_->skm.layouts)seen.insert(f.typeName);
+        auto add=[&](const std::string&t){if(t.empty()||t=="void"||t=="unknown"||seen.contains(t))return; if(t.size()==1&&std::isupper(static_cast<unsigned char>(t[0])))return; auto [sz,al]=layoutOf(t); result_->skm.layouts.push_back(SKMLayoutFact{t,sz,al,t.rfind("option<",0)==0,{}});seen.insert(t);};
+        for(const std::string t:{"text","string","option<bool>","option<char>"})add(t);
+        for(const auto&[_,rs]:routines_)for(const auto*r:rs){add(r->returnType);for(const auto&p:r->parameters)add(p.typeName);}
+    }
+
+    LiveSymbol* lookup(const std::string& name) {
+        for(auto it=scopes_.rbegin();it!=scopes_.rend();++it){auto f=it->find(name);if(f!=it->end())return &f->second;}return nullptr;
+    }
+    const LiveSymbol* lookup(const std::string& name) const {
+        for(auto it=scopes_.rbegin();it!=scopes_.rend();++it){auto f=it->find(name);if(f!=it->end())return &f->second;}return nullptr;
+    }
+    void touch(const std::string& name,std::size_t point){if(auto*s=lookup(name)){auto&f=result_->skm.symbols[s->factIndex];if(!f.firstPoint)f.firstPoint=point;f.lastPoint=std::max(f.lastPoint,point);}}
+    LiveSymbol declare(const std::string& name,const std::string& type,bool mut,bool param,const std::string& mode,SourceLocation loc,std::size_t point){
+        SKMSymbolFact f;f.id=nextSymbolId_++;f.routine=currentRoutine_;f.name=name;f.typeName=type;f.isMutable=mut;f.isParameter=param;f.parameterMode=mode;f.initialized=param;f.declaration=loc;f.firstPoint=point;f.lastPoint=point;
+        result_->skm.symbols.push_back(f); LiveSymbol l{result_->skm.symbols.size()-1,type,mut,mode}; scopes_.back()[name]=l; return l;
+    }
+
+    std::string inferExprType(const ExprPtr& e) {
+        if(!e)return "unknown";
+        return std::visit([&](const auto& n)->std::string{using T=std::decay_t<decltype(n)>;
+            if constexpr(std::is_same_v<T,NumberExpr>)return "int";
+            else if constexpr(std::is_same_v<T,StringExpr>)return "text";
+            else if constexpr(std::is_same_v<T,BoolExpr>)return "bool";
+            else if constexpr(std::is_same_v<T,NullExpr>)return "null";
+            else if constexpr(std::is_same_v<T,VariableExpr>){if(auto*s=lookup(n.name))return s->typeName;return "unknown";}
+            else if constexpr(std::is_same_v<T,UnaryExpr>)return inferExprType(n.operand);
+            else if constexpr(std::is_same_v<T,BinaryExpr>){if(n.op=="=="||n.op=="!="||n.op=="<"||n.op=="<="||n.op==">"||n.op==">="||n.op=="and"||n.op=="or"||n.op=="&&"||n.op=="||")return "bool";return inferExprType(n.left);}
+            else if constexpr(std::is_same_v<T,GroupExpr>)return inferExprType(n.expression);
+            else if constexpr(std::is_same_v<T,ConstructExpr>)return n.typeName;
+            else if constexpr(std::is_same_v<T,ClosureExpr>)return "closure$"+std::to_string(n.closureId);
+            else if constexpr(std::is_same_v<T,TryExpr>){std::string ok,err;auto x=inferExprType(n.operand);return typeIsResult(x,&ok,&err)?ok:"unknown";}
+            else if constexpr(std::is_same_v<T,MemberExpr>){auto o=inferExprType(n.object);auto ni=result_->nominalTypes.find(o);if(ni!=result_->nominalTypes.end())for(const auto&f:ni->second.fields)if(f.first==n.member)return f.second;return "unknown";}
+            else if constexpr(std::is_same_v<T,CallExpr>)return inferCallType(n);
+            else if constexpr(std::is_same_v<T,ChooseExpr>){if(!n.cases.empty())return inferExprType(n.cases.front().value);if(n.hasOtherwise)return inferExprType(n.otherwiseValue);return "unknown";}
+            else return "unknown";
+        },e->node);
+    }
+
+    const Routine* resolveCall(const CallExpr& call,std::map<std::string,std::string>* substitutions=nullptr) {
+        auto*v=call.callee?std::get_if<VariableExpr>(&call.callee->node):nullptr;if(!v)return nullptr;
+        auto it=routines_.find(v->name);if(it==routines_.end())return nullptr;
+        for(const auto*r:it->second){if(r->parameters.size()!=call.arguments.size())continue;std::unordered_set<std::string> gens;for(const auto&g:r->genericParameters)gens.insert(g.name);std::map<std::string,std::string> sub;
+            if(!call.genericArguments.empty()){if(call.genericArguments.size()!=r->genericParameters.size())continue;for(std::size_t i=0;i<call.genericArguments.size();++i)sub[r->genericParameters[i].name]=call.genericArguments[i];}
+            bool ok=true;for(std::size_t i=0;i<call.arguments.size();++i){auto actual=inferExprType(call.arguments[i]); if(actual=="number") actual="int"; auto pattern=r->parameters[i].typeName;if(gens.empty()){if(pattern!=actual&&actual!="unknown"&&!(actual=="int"&&isNumericTypeName(pattern)))ok=false;}else try{auto pt=CanonicalTypeParser(pattern).parse(); if(!pt.tuple&&pt.args.empty()&&gens.contains(pt.head)){auto ex=sub.find(pt.head);if(ex==sub.end()){sub[pt.head]=actual;continue;}if(ex->second==actual||(isNumericTypeName(ex->second)&&isNumericTypeName(actual)))continue;ok=false;}else if(!matchGenericTypePattern(pt,CanonicalTypeParser(actual).parse(),gens,sub))ok=false;}catch(...){if(pattern!=actual)ok=false;}if(!ok)break;}
+            if(ok){if(substitutions)*substitutions=std::move(sub);return r;}
+        }return nullptr;
+    }
+    std::string inferCallType(const CallExpr& c){auto*v=c.callee?std::get_if<VariableExpr>(&c.callee->node):nullptr;if(v&&(v->name=="ok"||v->name=="err"||v->name=="some")&&c.arguments.size()==1)return "__"+v->name+"<"+inferExprType(c.arguments[0])+">";if(v&&v->name=="none")return "__none";std::map<std::string,std::string>s;if(auto*r=resolveCall(c,&s))return substituteGenericType(r->returnType,s);return "unknown";}
+
+    void buildRoutine(const Routine& routine) {
+        currentRoutine_=keyFor(routine); point_=0; scopes_.clear(); scopes_.push_back({}); closureBindings_.clear(); closureLastUse_.clear(); closureBorrowIndexes_.clear();
+        for(const auto&p:routine.parameters)declare(p.name,p.typeName,p.mode=="var",true,p.mode,p.location,++point_);
+        walkStatements(routine.body,false);
+        const std::size_t endPoint=++point_;
+        for(auto&[cid,indexes]:closureBorrowIndexes_){std::size_t end=closureLastUse_.contains(cid)?closureLastUse_[cid]:endPoint;for(auto idx:indexes)result_->skm.borrowRegions[idx].endPoint=end;}
+        currentRoutine_.clear(); scopes_.clear();
+    }
+
+    void walkStatements(const std::vector<StmtPtr>& stmts,bool inClosure) {
+        for(const auto&s:stmts){if(!s)continue;++point_;std::visit([&](const auto&n){using T=std::decay_t<decltype(n)>;
+            if constexpr(std::is_same_v<T,LetStmt>||std::is_same_v<T,VarStmt>){walkExpr(n.initializer,inClosure);auto type=n.typeName.empty()?inferExprType(n.initializer):n.typeName;declare(n.name,type,std::is_same_v<T,VarStmt>,false,"shared",n.location,point_);if(n.initializer)if(auto*c=std::get_if<ClosureExpr>(&n.initializer->node))closureBindings_[n.name]=c->closureId;}
+            else if constexpr(std::is_same_v<T,AssignStmt>){touch(n.name,point_);walkExpr(n.value,inClosure);}
+            else if constexpr(std::is_same_v<T,ExprStmt>)walkExpr(n.expression,inClosure);
+            else if constexpr(std::is_same_v<T,ReturnStmt>){if(n.hasValue){markEscapingClosure(n.value);walkExpr(n.value,inClosure);}}
+            else if constexpr(std::is_same_v<T,GiveStmt>){markEscapingClosure(n.value);walkExpr(n.value,inClosure);}
+            else if constexpr(std::is_same_v<T,FailStmt>)walkExpr(n.expression,inClosure);
+            else if constexpr(std::is_same_v<T,DeferStmt>)walkExpr(n.expression,inClosure);
+            else if constexpr(std::is_same_v<T,IfStmt>){walkExpr(n.condition,inClosure);scopes_.push_back({});walkStatements(n.thenBranch,inClosure);scopes_.pop_back();scopes_.push_back({});walkStatements(n.elseBranch,inClosure);scopes_.pop_back();}
+            else if constexpr(std::is_same_v<T,WhileStmt>){result_->skm.structuralFacts.push_back(currentRoutine_+": loop");walkExpr(n.condition,inClosure);scopes_.push_back({});walkStatements(n.body,inClosure);scopes_.pop_back();}
+            else if constexpr(std::is_same_v<T,EachStmt>){result_->skm.structuralFacts.push_back(currentRoutine_+": iterator/range loop");walkExpr(n.range,inClosure);scopes_.push_back({});for(const auto&b:n.bindings)declare(b,"int",n.bindingsMutable,false,"shared",n.location,point_);walkStatements(n.body,inClosure);scopes_.pop_back();}
+            else if constexpr(std::is_same_v<T,UnsafeStmt>){result_->skm.structuralFacts.push_back(currentRoutine_+": unsafe boundary");scopes_.push_back({});walkStatements(n.body,inClosure);scopes_.pop_back();}
+            else if constexpr(std::is_same_v<T,BlockStmt>){scopes_.push_back({});walkStatements(n.statements,inClosure);scopes_.pop_back();}
+        },s->node);}
+    }
+
+    void walkExpr(const ExprPtr&e,bool inClosure){if(!e)return;++point_;std::visit([&](const auto&n){using T=std::decay_t<decltype(n)>;
+        if constexpr(std::is_same_v<T,VariableExpr>){touch(n.name,point_);auto cb=closureBindings_.find(n.name);if(cb!=closureBindings_.end())closureLastUse_[cb->second]=point_;}
+        else if constexpr(std::is_same_v<T,UnaryExpr>)walkExpr(n.operand,inClosure);
+        else if constexpr(std::is_same_v<T,BinaryExpr>){walkExpr(n.left,inClosure);walkExpr(n.right,inClosure);}
+        else if constexpr(std::is_same_v<T,PipelineExpr>){walkExpr(n.input,inClosure);for(auto&x:n.stages)walkExpr(x,inClosure);}
+        else if constexpr(std::is_same_v<T,RangeExpr>){walkExpr(n.start,inClosure);walkExpr(n.end,inClosure);walkExpr(n.step,inClosure);}
+        else if constexpr(std::is_same_v<T,ChooseExpr>){walkExpr(n.subject,inClosure);for(auto&c:n.cases){walkExpr(c.condition,inClosure);walkExpr(c.value,inClosure);}if(n.hasOtherwise)walkExpr(n.otherwiseValue,inClosure);}
+        else if constexpr(std::is_same_v<T,GroupExpr>)walkExpr(n.expression,inClosure);
+        else if constexpr(std::is_same_v<T,TryExpr>)walkExpr(n.operand,inClosure);
+        else if constexpr(std::is_same_v<T,MemberExpr>)walkExpr(n.object,inClosure);
+        else if constexpr(std::is_same_v<T,ConstructExpr>)for(auto&f:n.fields)walkExpr(f.value,inClosure);
+        else if constexpr(std::is_same_v<T,CallExpr>)walkCall(n,inClosure);
+        else if constexpr(std::is_same_v<T,ClosureExpr>)analyzeClosure(n);
+    },e->node);}
+
+    void walkCall(const CallExpr&call,bool inClosure){
+        auto*v=call.callee?std::get_if<VariableExpr>(&call.callee->node):nullptr;std::map<std::string,std::string>sub;const Routine*r=resolveCall(call,&sub);
+        if(v){touch(v->name,point_);auto cb=closureBindings_.find(v->name);if(cb!=closureBindings_.end())closureLastUse_[cb->second]=point_;result_->skm.calls.push_back({currentRoutine_,v->name,call.location});if(r){SKMEffectEdgeFact edge;edge.caller=currentRoutine_;edge.callee=keyFor(*r);auto it=result_->resolvedEffects.find(edge.callee);if(it!=result_->resolvedEffects.end())edge.effects=it->second;result_->skm.effectEdges.push_back(std::move(edge));}}
+        if(r&&!r->genericParameters.empty()){std::ostringstream spec;spec<<r->name<<'$';for(const auto&g:r->genericParameters){if(g.isConst)continue;spec<<g.name<<'_'<<sub[g.name]<<'$';}auto key=spec.str();if(specializationKeys_.insert(key).second){result_->skm.specializations.push_back({r->name,key,sub,call.location});resolveConstraints(*r,sub,call.location);}}
+        std::unordered_map<std::string,std::vector<std::pair<std::size_t,std::string>>> same;
+        for(std::size_t i=0;i<call.arguments.size();++i){std::string mode=(r&&i<r->parameters.size())?r->parameters[i].mode:"shared";if(auto*arg=std::get_if<VariableExpr>(&call.arguments[i]->node)){touch(arg->name,point_);if(auto*ls=lookup(arg->name)){BorrowKind kind=mode=="own"?BorrowKind::Owned:mode=="var"?BorrowKind::Exclusive:BorrowKind::Shared;addBorrow(*ls,arg->name,kind,point_,point_,0,false,call.location);same[arg->name].push_back({i,mode});}}walkExpr(call.arguments[i],inClosure);}
+        for(const auto&[name,uses]:same){bool ex=false;for(auto&u:uses)if(u.second=="var")ex=true;if(ex&&uses.size()>1){result_->diagnostics.push_back({call.location,"E0415 exclusive borrow of '"+name+"' aliases another argument in the same call"});result_->skm.aliases.push_back({currentRoutine_,name,name,true,call.location});}}
+    }
+
+    void validateBorrowGraph(){
+        auto overlaps=[](const SKMBorrowRegionFact&a,const SKMBorrowRegionFact&b){return a.beginPoint<=b.endPoint&&b.beginPoint<=a.endPoint;};
+        for(std::size_t i=0;i<result_->skm.borrowRegions.size();++i)for(std::size_t j=i+1;j<result_->skm.borrowRegions.size();++j){
+            const auto&a=result_->skm.borrowRegions[i];const auto&b=result_->skm.borrowRegions[j];
+            if(a.sourceSymbol!=b.sourceSymbol||!overlaps(a,b))continue;
+            if(a.kind==BorrowKind::Owned||b.kind==BorrowKind::Owned)continue;
+            if(a.kind==BorrowKind::Exclusive||b.kind==BorrowKind::Exclusive){
+                result_->diagnostics.push_back({b.location,"E0416 overlapping nonlexical borrows of '"+b.sourceName+"': an exclusive region intersects another live borrow"});
+                result_->skm.aliases.push_back({"borrow-graph",a.sourceName,b.sourceName,true,b.location});
+            }
+        }
+    }
+
+    void addBorrow(const LiveSymbol&ls,const std::string&name,BorrowKind kind,std::size_t begin,std::size_t end,std::size_t cid,bool escaping,SourceLocation loc){auto&sf=result_->skm.symbols[ls.factIndex];SKMBorrowRegionFact b; b.id=nextBorrowId_++;b.sourceSymbol=sf.id;b.sourceName=name;b.kind=kind;b.beginPoint=begin;b.endPoint=end;b.closureId=cid;b.escaping=escaping;b.location=loc;result_->skm.borrowRegions.push_back(b);if(cid&&kind!=BorrowKind::Owned)closureBorrowIndexes_[cid].push_back(result_->skm.borrowRegions.size()-1);}
+
+    void inferClosureExprEffects(const ExprPtr&e,std::set<std::string>&out){if(!e)return;std::visit([&](const auto&n){using T=std::decay_t<decltype(n)>;
+        if constexpr(std::is_same_v<T,UnaryExpr>)inferClosureExprEffects(n.operand,out);
+        else if constexpr(std::is_same_v<T,BinaryExpr>){inferClosureExprEffects(n.left,out);inferClosureExprEffects(n.right,out);if(n.op=="/"||n.op=="%")out.insert("trap");}
+        else if constexpr(std::is_same_v<T,CallExpr>){for(auto&a:n.arguments)inferClosureExprEffects(a,out);if(auto*v=n.callee?std::get_if<VariableExpr>(&n.callee->node):nullptr){if(v->name=="print"||v->name=="println")out.insert("io");auto ri=routines_.find(v->name);if(ri!=routines_.end())for(auto*r:ri->second)if(r->parameters.size()==n.arguments.size()){auto ef=result_->resolvedEffects.find(keyFor(*r));if(ef!=result_->resolvedEffects.end())out.insert(ef->second.begin(),ef->second.end());break;}}}
+        else if constexpr(std::is_same_v<T,PipelineExpr>){inferClosureExprEffects(n.input,out);for(auto&x:n.stages)inferClosureExprEffects(x,out);}
+        else if constexpr(std::is_same_v<T,RangeExpr>){inferClosureExprEffects(n.start,out);inferClosureExprEffects(n.end,out);inferClosureExprEffects(n.step,out);}
+        else if constexpr(std::is_same_v<T,ChooseExpr>){inferClosureExprEffects(n.subject,out);for(auto&x:n.cases){inferClosureExprEffects(x.condition,out);inferClosureExprEffects(x.value,out);}inferClosureExprEffects(n.otherwiseValue,out);}
+        else if constexpr(std::is_same_v<T,TryExpr>)inferClosureExprEffects(n.operand,out);
+        else if constexpr(std::is_same_v<T,GroupExpr>)inferClosureExprEffects(n.expression,out);
+        else if constexpr(std::is_same_v<T,MemberExpr>)inferClosureExprEffects(n.object,out);
+        else if constexpr(std::is_same_v<T,ConstructExpr>)for(auto&f:n.fields)inferClosureExprEffects(f.value,out);
+    },e->node);}
+    void inferClosureStmtEffects(const std::vector<StmtPtr>&ss,std::set<std::string>&out){for(auto&s:ss)if(s)std::visit([&](const auto&n){using T=std::decay_t<decltype(n)>;
+        if constexpr(std::is_same_v<T,LetStmt>||std::is_same_v<T,VarStmt>)inferClosureExprEffects(n.initializer,out);else if constexpr(std::is_same_v<T,AssignStmt>)inferClosureExprEffects(n.value,out);else if constexpr(std::is_same_v<T,ExprStmt>)inferClosureExprEffects(n.expression,out);else if constexpr(std::is_same_v<T,ReturnStmt>){if(n.hasValue)inferClosureExprEffects(n.value,out);}else if constexpr(std::is_same_v<T,GiveStmt>)inferClosureExprEffects(n.value,out);else if constexpr(std::is_same_v<T,FailStmt>)inferClosureExprEffects(n.expression,out);else if constexpr(std::is_same_v<T,IfStmt>){inferClosureExprEffects(n.condition,out);inferClosureStmtEffects(n.thenBranch,out);inferClosureStmtEffects(n.elseBranch,out);}else if constexpr(std::is_same_v<T,WhileStmt>){inferClosureExprEffects(n.condition,out);inferClosureStmtEffects(n.body,out);}else if constexpr(std::is_same_v<T,EachStmt>){inferClosureExprEffects(n.range,out);inferClosureStmtEffects(n.body,out);}else if constexpr(std::is_same_v<T,UnsafeStmt>){out.insert("unsafe");inferClosureStmtEffects(n.body,out);}else if constexpr(std::is_same_v<T,DeferStmt>)inferClosureExprEffects(n.expression,out);else if constexpr(std::is_same_v<T,BlockStmt>)inferClosureStmtEffects(n.statements,out);
+    },s->node);}
+
+    void analyzeClosure(const ClosureExpr&c){
+        ClosureSignatureFact sig; for (const auto& p : c.parameters) sig.parameters.push_back(p.typeName); sig.returnType = c.returnType.empty()?"void":c.returnType; closureSignatures_[c.closureId]=sig;
+        std::set<std::string> inferredEffects; if(c.hasExpressionBody)inferClosureExprEffects(c.expressionBody,inferredEffects);else inferClosureStmtEffects(c.blockBody,inferredEffects);
+        std::set<std::string> declared(c.effects.begin(),c.effects.end()); if(!declared.empty())for(const auto&e:inferredEffects)if(!declared.contains(e))result_->diagnostics.push_back({c.location,"E0360 closure effect '"+e+"' exceeds declared effect set"});
+        result_->skm.closures.push_back({c.closureId,sig.parameters,sig.returnType,inferredEffects,c.moveCapture,c.location});
+        std::unordered_set<std::string>locals;for(const auto&p:c.parameters)locals.insert(p.name);std::unordered_map<std::string,CaptureUse>captures;
+        auto note=[&](const std::string&name,BorrowKind kind,SourceLocation loc){if(locals.contains(name))return;if(auto*ls=lookup(name)){auto&sf=result_->skm.symbols[ls->factIndex];auto&cu=captures[name];cu.kind=cu.symbolId?stronger(cu.kind,kind):kind;cu.symbolId=sf.id;cu.typeName=ls->typeName;cu.location=loc;touch(name,point_);}};
+        std::function<void(const ExprPtr&)> scanExpr; std::function<void(const std::vector<StmtPtr>&)> scanStmts;
+        scanExpr=[&](const ExprPtr&e){if(!e)return;std::visit([&](const auto&n){using T=std::decay_t<decltype(n)>;if constexpr(std::is_same_v<T,VariableExpr>)note(n.name,c.moveCapture?BorrowKind::Owned:BorrowKind::Shared,n.location);else if constexpr(std::is_same_v<T,UnaryExpr>)scanExpr(n.operand);else if constexpr(std::is_same_v<T,BinaryExpr>){scanExpr(n.left);scanExpr(n.right);}else if constexpr(std::is_same_v<T,CallExpr>){auto*r=resolveCall(n);for(std::size_t i=0;i<n.arguments.size();++i){if(auto*v=std::get_if<VariableExpr>(&n.arguments[i]->node)){BorrowKind k=BorrowKind::Shared;if(c.moveCapture)k=BorrowKind::Owned;else if(r&&i<r->parameters.size()){auto m=r->parameters[i].mode;k=m=="own"?BorrowKind::Owned:m=="var"?BorrowKind::Exclusive:BorrowKind::Shared;}note(v->name,k,v->location);}scanExpr(n.arguments[i]);}}else if constexpr(std::is_same_v<T,GroupExpr>)scanExpr(n.expression);else if constexpr(std::is_same_v<T,TryExpr>)scanExpr(n.operand);else if constexpr(std::is_same_v<T,MemberExpr>)scanExpr(n.object);else if constexpr(std::is_same_v<T,ConstructExpr>)for(auto&f:n.fields)scanExpr(f.value);else if constexpr(std::is_same_v<T,PipelineExpr>){scanExpr(n.input);for(auto&s:n.stages)scanExpr(s);}else if constexpr(std::is_same_v<T,RangeExpr>){scanExpr(n.start);scanExpr(n.end);scanExpr(n.step);}else if constexpr(std::is_same_v<T,ChooseExpr>){scanExpr(n.subject);for(auto&x:n.cases){scanExpr(x.condition);scanExpr(x.value);}if(n.hasOtherwise)scanExpr(n.otherwiseValue);}},e->node);};
+        scanStmts=[&](const std::vector<StmtPtr>&ss){for(auto&s:ss)std::visit([&](const auto&n){using T=std::decay_t<decltype(n)>;if constexpr(std::is_same_v<T,LetStmt>||std::is_same_v<T,VarStmt>){scanExpr(n.initializer);locals.insert(n.name);}else if constexpr(std::is_same_v<T,AssignStmt>){if(!locals.contains(n.name))note(n.name,c.moveCapture?BorrowKind::Owned:BorrowKind::Exclusive,n.location);scanExpr(n.value);}else if constexpr(std::is_same_v<T,ExprStmt>)scanExpr(n.expression);else if constexpr(std::is_same_v<T,ReturnStmt>){if(n.hasValue)scanExpr(n.value);}else if constexpr(std::is_same_v<T,GiveStmt>)scanExpr(n.value);else if constexpr(std::is_same_v<T,FailStmt>)scanExpr(n.expression);else if constexpr(std::is_same_v<T,IfStmt>){scanExpr(n.condition);scanStmts(n.thenBranch);scanStmts(n.elseBranch);}else if constexpr(std::is_same_v<T,WhileStmt>){scanExpr(n.condition);scanStmts(n.body);}else if constexpr(std::is_same_v<T,EachStmt>){scanExpr(n.range);for(auto&x:n.bindings)locals.insert(x);scanStmts(n.body);}else if constexpr(std::is_same_v<T,UnsafeStmt>)scanStmts(n.body);else if constexpr(std::is_same_v<T,DeferStmt>)scanExpr(n.expression);else if constexpr(std::is_same_v<T,BlockStmt>)scanStmts(n.statements);},s->node);};
+        if(c.hasExpressionBody)scanExpr(c.expressionBody);else scanStmts(c.blockBody);
+        for(const auto&[name,cu]:captures){result_->skm.closureCaptures.push_back({c.closureId,cu.symbolId,name,cu.typeName,cu.kind,false,cu.location});if(auto*ls=lookup(name))addBorrow(*ls,name,cu.kind,point_,point_,c.closureId,false,cu.location);}
+        result_->skm.structuralFacts.push_back(currentRoutine_+": closure$"+std::to_string(c.closureId)+" captures="+std::to_string(captures.size()));
+    }
+
+    void markEscapingClosure(const ExprPtr&e){if(!e)return;std::size_t cid=0;if(auto*c=std::get_if<ClosureExpr>(&e->node))cid=c->closureId;else if(auto*v=std::get_if<VariableExpr>(&e->node)){auto it=closureBindings_.find(v->name);if(it!=closureBindings_.end())cid=it->second;}if(!cid)return;for(auto&c:result_->skm.closureCaptures)if(c.closureId==cid){c.escaping=true;if(c.kind!=BorrowKind::Owned)result_->diagnostics.push_back({c.location,"E0432 closure$"+std::to_string(cid)+" escapes while borrowing '"+c.name+"'; use move capture or keep the closure within the borrow region"});}for(auto idx:closureBorrowIndexes_[cid])result_->skm.borrowRegions[idx].escaping=true;}
+
+    bool primitiveCapability(const std::string&subject,const std::string&cap)const{bool scalar=isNumericTypeName(subject)||subject=="bool"||subject=="char"||subject=="text"||subject=="string";if(cap=="printable"||cap=="equatable")return scalar;if(cap=="ordered"||cap=="hashable")return scalar;if(cap=="defaultable")return scalar||result_->nominalTypes.contains(subject);return false;}
+    bool satisfyCapability(const std::string&subject,const std::string&cap,const std::vector<std::string>&args,std::vector<std::string>&evidence){
+        if(cap=="callable"){
+            if(subject.rfind("closure$",0)==0){
+                std::size_t id=0; try{id=static_cast<std::size_t>(std::stoull(subject.substr(8)));}catch(...){}
+                auto it=closureSignatures_.find(id); if(it==closureSignatures_.end()) return false;
+                if(args.size()>=2){
+                    std::vector<std::string> expected; try{auto tuple=CanonicalTypeParser(args.front()).parse(); if(tuple.tuple)for(auto&a:tuple.args)expected.push_back(canonicalTypeText(a)); else expected.push_back(args.front());}catch(...){expected.push_back(args.front());}
+                    if(expected!=it->second.parameters || args.back()!=it->second.returnType) return false;
+                }
+                evidence.push_back("closure signature satisfies intrinsic callable relationship"); return true;
+            }
+            if(subject.rfind("routine",0)==0){evidence.push_back("routine satisfies intrinsic callable relationship");return true;}return false;
+        }
+        if(primitiveCapability(subject,cap)){evidence.push_back("predeclared structural capability");return true;}
+        auto ci=capabilities_.find(cap);if(ci==capabilities_.end())return false;const auto*c=ci->second;for(const auto&m:c->members){auto ri=routines_.find(m.name);bool found=false;if(ri!=routines_.end())for(const auto*r:ri->second){if(r->parameters.size()!=m.parameters.size())continue;if(!r->parameters.empty()&&r->parameters.front().typeName!=subject)continue;found=true;evidence.push_back(r->name+"("+subject+")");break;}if(!found)return false;}return true;
+    }
+    void resolveConstraints(const Routine&r,const std::map<std::string,std::string>&sub,SourceLocation loc){for(const auto&c:r.constraints){auto it=sub.find(c.subject);std::string subject=it==sub.end()?c.subject:it->second;std::vector<std::string>args;for(const auto&a:c.arguments)args.push_back(substituteGenericType(a,sub));std::vector<std::string>evidence;bool ok=satisfyCapability(subject,c.capability,args,evidence);result_->skm.capabilityResolutions.push_back({subject,c.capability,args,ok,evidence,loc});if(!ok)result_->diagnostics.push_back({loc,"E0342 type '"+subject+"' does not satisfy capability '"+c.capability+"'"});}}
+
+    const Program* program_=nullptr; SemanticAnalysisResult* result_=nullptr;
+    std::unordered_map<std::string,std::vector<const Routine*>> routines_; std::unordered_map<std::string,const CapabilityDecl*> capabilities_;
+    std::vector<Scope> scopes_; std::string currentRoutine_; std::size_t point_=0; std::uint64_t nextSymbolId_=1,nextBorrowId_=1;
+    std::unordered_map<std::string,std::size_t> closureBindings_; std::unordered_map<std::size_t,std::size_t> closureLastUse_; std::unordered_map<std::size_t,std::vector<std::size_t>> closureBorrowIndexes_;
+    std::unordered_set<std::string> specializationKeys_;
+    std::unordered_map<std::size_t,ClosureSignatureFact> closureSignatures_;
+};
+
+// --- SAGE semantic core: effects + ownership/borrow discipline --------------
+class SAGEEngine {
+public:
+    void analyze(const Program& program, SemanticAnalysisResult& result) {
+        result_ = &result;
+        buildRoutineIndex(program);
+        analyzeEffects(program);
+        analyzeOwnership(program);
+        SemanticKnowledgeBuilder skmBuilder;
+        skmBuilder.build(program, result);
+        result_ = nullptr;
+    }
+
+private:
+    struct BorrowSymbol {
+        std::string typeName;
+        bool isMutable = false;
+        bool isParameter = false;
+        std::string mode = "shared";
+        OwnershipState ownership = OwnershipState::Available;
+    };
+
+    struct BorrowState {
+        std::vector<std::unordered_map<std::string, BorrowSymbol>> scopes;
+    };
+
+    struct EffectFacts {
+        std::set<std::string> direct;
+        std::set<std::string> calls;
+    };
+
+    static std::string routineKey(const std::string& name, std::size_t arity) {
+        return name + "#" + std::to_string(arity);
+    }
+
+    void buildRoutineIndex(const Program& program) {
+        routines_.clear();
+        for (const auto& routine : program.routines) {
+            routines_[routineKey(routine.name, routine.parameters.size())] = &routine;
+        }
+        collectForeign(program.declarations);
+    }
+
+    void collectForeign(const std::vector<Declaration>& declarations) {
+        for (const auto& declaration : declarations) {
+            std::visit([&](const auto& node) {
+                using T = std::decay_t<decltype(node)>;
+                if constexpr (std::is_same_v<T, ForeignDecl>) {
+                    routines_[routineKey(node.routine.name, node.routine.parameters.size())] = &node.routine;
+                    foreign_.insert(routineKey(node.routine.name, node.routine.parameters.size()));
+                } else if constexpr (std::is_same_v<T, Routine>) {
+                    routines_[routineKey(node.name, node.parameters.size())] = &node;
+                } else if constexpr (std::is_same_v<T, ModuleDecl>) {
+                    collectForeign(node.declarations);
+                }
+            }, declaration.node);
+        }
+    }
+
+    void analyzeEffects(const Program& program) {
+        effectFacts_.clear();
+        for (const auto& routine : program.routines) {
+            auto key = routineKey(routine.name, routine.parameters.size());
+            auto& facts = effectFacts_[key];
+            collectStatementEffects(routine.body, facts);
+        }
+        for (const auto& [key, routine] : routines_) {
+            if (foreign_.contains(key)) {
+                auto& facts = effectFacts_[key];
+                if (routine->effects.empty() || (routine->effects.size() == 1 && routine->effects.front() == "pure")) {
+                    facts.direct.insert("io");
+                    facts.direct.insert("trap");
+                } else {
+                    for (const auto& effect : routine->effects) if (effect != "pure") facts.direct.insert(effect);
+                }
+            }
+        }
+
+        std::unordered_map<std::string, std::set<std::string>> resolved;
+        for (const auto& [key, facts] : effectFacts_) resolved[key] = facts.direct;
+        bool changed = true;
+        for (std::size_t iteration = 0; changed && iteration < routines_.size() + 8; ++iteration) {
+            changed = false;
+            for (const auto& [key, facts] : effectFacts_) {
+                auto next = resolved[key];
+                for (const auto& callee : facts.calls) {
+                    auto it = resolved.find(callee);
+                    if (it == resolved.end()) continue;
+                    next.insert(it->second.begin(), it->second.end());
+                }
+                if (next != resolved[key]) { resolved[key] = std::move(next); changed = true; }
+            }
+        }
+
+        for (const auto& routine : program.routines) {
+            auto key = routineKey(routine.name, routine.parameters.size());
+            const auto& inferred = resolved[key];
+            result_->resolvedEffects[key] = inferred;
+            if (!routine.effects.empty()) {
+                std::set<std::string> allowed;
+                if (!(routine.effects.size() == 1 && routine.effects.front() == "pure")) {
+                    for (const auto& e : routine.effects) allowed.insert(e);
+                }
+                for (const auto& e : inferred) {
+                    if (!allowed.contains(e)) {
+                        report(routine.location, "E0360 undeclared effect '" + e + "' in routine '" + routine.name + "'");
+                    }
+                }
+            }
+        }
+    }
+
+    void collectStatementEffects(const std::vector<StmtPtr>& statements, EffectFacts& facts) {
+        for (const auto& stmt : statements) {
+            if (!stmt) continue;
+            std::visit([&](const auto& node) {
+                using T = std::decay_t<decltype(node)>;
+                if constexpr (std::is_same_v<T, LetStmt> || std::is_same_v<T, VarStmt>) {
+                    if (node.initializer) collectExprEffects(node.initializer, facts);
+                } else if constexpr (std::is_same_v<T, AssignStmt>) {
+                    collectExprEffects(node.value, facts);
+                } else if constexpr (std::is_same_v<T, ExprStmt>) {
+                    collectExprEffects(node.expression, facts);
+                } else if constexpr (std::is_same_v<T, ReturnStmt>) {
+                    if (node.hasValue) collectExprEffects(node.value, facts);
+                } else if constexpr (std::is_same_v<T, GiveStmt>) {
+                    collectExprEffects(node.value, facts);
+                } else if constexpr (std::is_same_v<T, FailStmt>) {
+                    collectExprEffects(node.expression, facts);
+                } else if constexpr (std::is_same_v<T, IfStmt>) {
+                    collectExprEffects(node.condition, facts);
+                    collectStatementEffects(node.thenBranch, facts);
+                    collectStatementEffects(node.elseBranch, facts);
+                } else if constexpr (std::is_same_v<T, WhileStmt>) {
+                    collectExprEffects(node.condition, facts);
+                    collectStatementEffects(node.body, facts);
+                } else if constexpr (std::is_same_v<T, EachStmt>) {
+                    collectExprEffects(node.range, facts);
+                    collectStatementEffects(node.body, facts);
+                } else if constexpr (std::is_same_v<T, UnsafeStmt>) {
+                    // A locally encapsulated unsafe block is not automatically part of the caller contract.
+                    collectStatementEffects(node.body, facts);
+                } else if constexpr (std::is_same_v<T, DeferStmt>) {
+                    collectExprEffects(node.expression, facts);
+                } else if constexpr (std::is_same_v<T, BlockStmt>) {
+                    collectStatementEffects(node.statements, facts);
+                }
+            }, stmt->node);
+        }
+    }
+
+    void collectExprEffects(const ExprPtr& expr, EffectFacts& facts) {
+        if (!expr) return;
+        std::visit([&](const auto& node) {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, UnaryExpr>) {
+                collectExprEffects(node.operand, facts);
+            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+                collectExprEffects(node.left, facts); collectExprEffects(node.right, facts);
+                if (node.op == "/" || node.op == "%") facts.direct.insert("trap");
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
+                for (const auto& a : node.arguments) collectExprEffects(a, facts);
+                if (const auto* variable = node.callee ? std::get_if<VariableExpr>(&node.callee->node) : nullptr) {
+                    if (variable->name == "print" || variable->name == "println") facts.direct.insert("io");
+                    auto key = routineKey(variable->name, node.arguments.size());
+                    if (routines_.contains(key)) facts.calls.insert(key);
+                }
+            } else if constexpr (std::is_same_v<T, PipelineExpr>) {
+                collectExprEffects(node.input, facts); for (const auto& s : node.stages) collectExprEffects(s, facts);
+            } else if constexpr (std::is_same_v<T, RangeExpr>) {
+                collectExprEffects(node.start, facts); collectExprEffects(node.end, facts); collectExprEffects(node.step, facts);
+            } else if constexpr (std::is_same_v<T, ChooseExpr>) {
+                collectExprEffects(node.subject, facts);
+                for (const auto& c : node.cases) { collectExprEffects(c.condition, facts); collectExprEffects(c.value, facts); }
+                if (node.hasOtherwise) collectExprEffects(node.otherwiseValue, facts);
+            } else if constexpr (std::is_same_v<T, GroupExpr>) {
+                collectExprEffects(node.expression, facts);
+            } else if constexpr (std::is_same_v<T, MemberExpr>) {
+                collectExprEffects(node.object, facts);
+            } else if constexpr (std::is_same_v<T, ConstructExpr>) {
+                for (const auto& f : node.fields) collectExprEffects(f.value, facts);
+            }
+        }, expr->node);
+    }
+
+    void analyzeOwnership(const Program& program) {
+        for (const auto& routine : program.routines) {
+            BorrowState state;
+            state.scopes.emplace_back();
+            for (const auto& p : routine.parameters) {
+                state.scopes.back()[p.name] = BorrowSymbol{p.typeName, p.mode == "var", true, p.mode, OwnershipState::Available};
+            }
+            analyzeBorrowStatements(routine.body, state, false);
+        }
+    }
+
+    BorrowSymbol* lookup(BorrowState& state, const std::string& name) {
+        for (auto it = state.scopes.rbegin(); it != state.scopes.rend(); ++it) {
+            auto found = it->find(name); if (found != it->end()) return &found->second;
+        }
+        return nullptr;
+    }
+
+    static bool isCopyType(const std::string& t) {
+        static const std::unordered_set<std::string> copy = {
+            "byte","ubyte","short","ushort","int","uint","long","ulong","size","ssize",
+            "float","double","bool","char","raw","text","view","span","ref","mut"
+        };
+        return copy.contains(t);
+    }
+
+    std::string inferBorrowType(const ExprPtr& e, BorrowState& state) {
+        if (!e) return {};
+        if (const auto* v = std::get_if<VariableExpr>(&e->node)) {
+            if (auto* s = lookup(state, v->name)) return s->typeName;
+        }
+        if (std::holds_alternative<NumberExpr>(e->node)) return "int";
+        if (std::holds_alternative<BoolExpr>(e->node)) return "bool";
+        if (std::holds_alternative<StringExpr>(e->node)) return "text";
+        return {};
+    }
+
+    void readVariable(const VariableExpr& v, BorrowState& state) {
+        if (auto* s = lookup(state, v.name)) {
+            if (s->ownership == OwnershipState::Moved) report(v.location, "E0412 use after move: '" + v.name + "'");
+        }
+    }
+
+    const Routine* resolveRoutine(const std::string& name, std::size_t arity) const {
+        auto it = routines_.find(routineKey(name, arity));
+        return it == routines_.end() ? nullptr : it->second;
+    }
+
+    void analyzeBorrowExpr(const ExprPtr& expr, BorrowState& state) {
+        if (!expr) return;
+        std::visit([&](const auto& node) {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, VariableExpr>) {
+                readVariable(node, state);
+            } else if constexpr (std::is_same_v<T, UnaryExpr>) {
+                analyzeBorrowExpr(node.operand, state);
+            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+                analyzeBorrowExpr(node.left, state); analyzeBorrowExpr(node.right, state);
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
+                const Routine* callee = nullptr;
+                if (const auto* v = node.callee ? std::get_if<VariableExpr>(&node.callee->node) : nullptr) callee = resolveRoutine(v->name, node.arguments.size());
+                for (std::size_t i = 0; i < node.arguments.size(); ++i) {
+                    const auto& arg = node.arguments[i];
+                    std::string mode = callee && i < callee->parameters.size() ? callee->parameters[i].mode : "shared";
+                    if (const auto* v = arg ? std::get_if<VariableExpr>(&arg->node) : nullptr) {
+                        auto* sym = lookup(state, v->name);
+                        if (sym && sym->ownership == OwnershipState::Moved) report(v->location, "E0412 use after move: '" + v->name + "'");
+                        if (sym && mode == "var" && !sym->isMutable) report(v->location, "E0415 exclusive borrow requires a mutable place: '" + v->name + "'");
+                        if (sym && mode == "own" && !isCopyType(sym->typeName)) sym->ownership = OwnershipState::Moved;
+                        if (sym && mode == "raw" && !isRawAuthorityTypeName(sym->typeName)) report(v->location, "E0408 raw parameter requires raw authority");
+                    } else {
+                        if (mode == "var") report(arg ? arg->location : SourceLocation{}, "E0416 exclusive borrow requires a place expression");
+                        analyzeBorrowExpr(arg, state);
+                    }
+                }
+            } else if constexpr (std::is_same_v<T, PipelineExpr>) {
+                analyzeBorrowExpr(node.input, state); for (const auto& x : node.stages) analyzeBorrowExpr(x, state);
+            } else if constexpr (std::is_same_v<T, RangeExpr>) {
+                analyzeBorrowExpr(node.start, state); analyzeBorrowExpr(node.end, state); analyzeBorrowExpr(node.step, state);
+            } else if constexpr (std::is_same_v<T, ChooseExpr>) {
+                analyzeBorrowExpr(node.subject, state);
+                for (const auto& c : node.cases) { analyzeBorrowExpr(c.condition, state); analyzeBorrowExpr(c.value, state); }
+                if (node.hasOtherwise) analyzeBorrowExpr(node.otherwiseValue, state);
+            } else if constexpr (std::is_same_v<T, GroupExpr>) {
+                analyzeBorrowExpr(node.expression, state);
+            } else if constexpr (std::is_same_v<T, MemberExpr>) {
+                analyzeBorrowExpr(node.object, state);
+            } else if constexpr (std::is_same_v<T, ConstructExpr>) {
+                for (const auto& f : node.fields) analyzeBorrowExpr(f.value, state);
+            }
+        }, expr->node);
+    }
+
+    static BorrowState mergeStates(const BorrowState& a, const BorrowState& b) {
+        BorrowState out = a;
+        const std::size_t n = std::min(out.scopes.size(), b.scopes.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            for (auto& [name, symbol] : out.scopes[i]) {
+                auto it = b.scopes[i].find(name);
+                if (it != b.scopes[i].end() && (symbol.ownership == OwnershipState::Moved || it->second.ownership == OwnershipState::Moved)) {
+                    symbol.ownership = OwnershipState::Moved;
+                }
+            }
+        }
+        return out;
+    }
+
+    void analyzeBorrowStatements(const std::vector<StmtPtr>& statements, BorrowState& state, bool repeating) {
+        for (const auto& stmt : statements) {
+            if (!stmt) continue;
+            std::visit([&](const auto& node) {
+                using T = std::decay_t<decltype(node)>;
+                if constexpr (std::is_same_v<T, LetStmt>) {
+                    analyzeBorrowExpr(node.initializer, state);
+                    state.scopes.back()[node.name] = BorrowSymbol{node.typeName.empty() ? inferBorrowType(node.initializer, state) : node.typeName, false, false, "shared", OwnershipState::Available};
+                } else if constexpr (std::is_same_v<T, VarStmt>) {
+                    analyzeBorrowExpr(node.initializer, state);
+                    state.scopes.back()[node.name] = BorrowSymbol{node.typeName.empty() ? inferBorrowType(node.initializer, state) : node.typeName, true, false, "shared", OwnershipState::Available};
+                } else if constexpr (std::is_same_v<T, AssignStmt>) {
+                    analyzeBorrowExpr(node.value, state);
+                    if (auto* s = lookup(state, node.name)) s->ownership = OwnershipState::Available;
+                } else if constexpr (std::is_same_v<T, ExprStmt>) analyzeBorrowExpr(node.expression, state);
+                else if constexpr (std::is_same_v<T, ReturnStmt>) { if (node.hasValue) analyzeBorrowExpr(node.value, state); }
+                else if constexpr (std::is_same_v<T, GiveStmt>) analyzeBorrowExpr(node.value, state);
+                else if constexpr (std::is_same_v<T, FailStmt>) analyzeBorrowExpr(node.expression, state);
+                else if constexpr (std::is_same_v<T, DeferStmt>) analyzeBorrowExpr(node.expression, state);
+                else if constexpr (std::is_same_v<T, IfStmt>) {
+                    analyzeBorrowExpr(node.condition, state);
+                    BorrowState thenState = state, elseState = state;
+                    thenState.scopes.emplace_back(); analyzeBorrowStatements(node.thenBranch, thenState, repeating); thenState.scopes.pop_back();
+                    if (node.hasElse) { elseState.scopes.emplace_back(); analyzeBorrowStatements(node.elseBranch, elseState, repeating); elseState.scopes.pop_back(); }
+                    state = mergeStates(thenState, elseState);
+                } else if constexpr (std::is_same_v<T, WhileStmt>) {
+                    analyzeBorrowExpr(node.condition, state);
+                    BorrowState body = state; body.scopes.emplace_back(); analyzeBorrowStatements(node.body, body, true); body.scopes.pop_back();
+                    for (std::size_t i = 0; i < std::min(state.scopes.size(), body.scopes.size()); ++i) {
+                        for (const auto& [name, after] : body.scopes[i]) {
+                            auto before = state.scopes[i].find(name);
+                            if (before != state.scopes[i].end() && before->second.ownership == OwnershipState::Available && after.ownership == OwnershipState::Moved) {
+                                report(node.location, "E0421 value '" + name + "' is moved inside a potentially repeating loop");
+                            }
+                        }
+                    }
+                    state = mergeStates(state, body);
+                } else if constexpr (std::is_same_v<T, EachStmt>) {
+                    analyzeBorrowExpr(node.range, state);
+                    BorrowState body = state; body.scopes.emplace_back();
+                    for (const auto& name : node.bindings) body.scopes.back()[name] = BorrowSymbol{"int", node.bindingsMutable, false, "shared", OwnershipState::Available};
+                    analyzeBorrowStatements(node.body, body, true); body.scopes.pop_back();
+                    state = mergeStates(state, body);
+                } else if constexpr (std::is_same_v<T, UnsafeStmt>) {
+                    state.scopes.emplace_back(); analyzeBorrowStatements(node.body, state, repeating); state.scopes.pop_back();
+                } else if constexpr (std::is_same_v<T, BlockStmt>) {
+                    state.scopes.emplace_back(); analyzeBorrowStatements(node.statements, state, repeating); state.scopes.pop_back();
+                }
+            }, stmt->node);
+        }
+    }
+
+    void report(SourceLocation loc, std::string message) {
+        result_->diagnostics.push_back({loc, std::move(message)});
+    }
+
+    SemanticAnalysisResult* result_ = nullptr;
+    std::unordered_map<std::string, const Routine*> routines_;
+    std::unordered_set<std::string> foreign_;
+    std::unordered_map<std::string, EffectFacts> effectFacts_;
+};
+
+// --- Frontend helpers: pretty-printing --------------------------------------
+std::string indentText(std::size_t depth) {
+	return std::string(depth * 4, ' ');
+}
+
+std::string exprToString(const ExprPtr& expr);
+std::string stmtToString(const StmtPtr& stmt, std::size_t depth);
+
+std::string exprToString(const ExprPtr& expr) {
+	if (!expr) {
+		return "<null>";
+	}
+	return std::visit([](const auto& node) -> std::string {
+		using T = std::decay_t<decltype(node)>;
+		if constexpr (std::is_same_v<T, NumberExpr>) {
+			return node.value;
+		} else if constexpr (std::is_same_v<T, StringExpr>) {
+			return '"' + node.value + '"';
+		} else if constexpr (std::is_same_v<T, BoolExpr>) {
+			return node.value ? "true" : "false";
+		} else if constexpr (std::is_same_v<T, NullExpr>) {
+			return "null";
+		} else if constexpr (std::is_same_v<T, VariableExpr>) {
+			return node.name;
+		} else if constexpr (std::is_same_v<T, UnaryExpr>) {
+			return "(" + node.op + " " + exprToString(node.operand) + ")";
+		} else if constexpr (std::is_same_v<T, BinaryExpr>) {
+			return "(" + exprToString(node.left) + " " + node.op + " " + exprToString(node.right) + ")";
+		} else if constexpr (std::is_same_v<T, PipelineExpr>) {
+			std::ostringstream oss;
+			oss << exprToString(node.input);
+			for (const auto& stage : node.stages) {
+				oss << " -> " << exprToString(stage);
+			}
+			return oss.str();
+		} else if constexpr (std::is_same_v<T, RangeExpr>) {
+			return exprToString(node.start) + (node.inclusive ? "..=" : "..") + exprToString(node.end);
+		} else if constexpr (std::is_same_v<T, ChooseExpr>) {
+			std::ostringstream oss;
+			oss << "choose";
+			if (node.subject) oss << " " << exprToString(node.subject);
+			for (const auto& choice : node.cases) {
+				oss << "\n" << indentText(1) << "when " << exprToString(choice.condition) << "\n" << indentText(2) << exprToString(choice.value);
+			}
+			if (node.hasOtherwise) {
+				oss << "\n" << indentText(1) << "otherwise\n" << indentText(2) << exprToString(node.otherwiseValue);
+			}
+			return oss.str();
+		} else if constexpr (std::is_same_v<T, CallExpr>) {
+			std::ostringstream oss;
+			oss << exprToString(node.callee);
+			if (!node.genericArguments.empty()) { oss << '<'; for (std::size_t i=0;i<node.genericArguments.size();++i){if(i)oss<<", ";oss<<node.genericArguments[i];} oss << '>'; }
+			oss << '(';
+			for (std::size_t i = 0; i < node.arguments.size(); ++i) {
+				if (i != 0) oss << ", ";
+				oss << exprToString(node.arguments[i]);
+			}
+			oss << ')';
+			return oss.str();
+		} else if constexpr (std::is_same_v<T, TryExpr>) {
+			return "try " + exprToString(node.operand);
+		} else if constexpr (std::is_same_v<T, ClosureExpr>) {
+			std::ostringstream oss; if(node.moveCapture)oss<<"move "; oss<<"routine(";
+			for(std::size_t i=0;i<node.parameters.size();++i){if(i)oss<<", ";if(node.parameters[i].mode!="shared")oss<<node.parameters[i].mode<<' ';oss<<node.parameters[i].name;if(!node.parameters[i].typeName.empty())oss<<": "<<node.parameters[i].typeName;}oss<<')';
+			if(!node.returnType.empty())oss<<" gives "<<node.returnType;
+			if(node.hasExpressionBody)oss<<" => "<<exprToString(node.expressionBody); else oss<<" <block closure>"; return oss.str();
+		} else if constexpr (std::is_same_v<T, GroupExpr>) {
+			return "(" + exprToString(node.expression) + ")";
+		} else if constexpr (std::is_same_v<T, PipelineExpr>) {
+			return exprToString(node.input) + " -> <pipeline>";
+		} else if constexpr (std::is_same_v<T, RangeExpr>) {
+			return exprToString(node.start) + (node.inclusive ? "..=" : "..") + exprToString(node.end);
+		} else if constexpr (std::is_same_v<T, ChooseExpr>) {
+			return "choose <expr>";
+		} else {
+			return "<expr>";
+		}
+	}, expr->node);
+}
+
+std::string stmtToString(const StmtPtr& stmt, std::size_t depth) {
+	if (!stmt) {
+		return indentText(depth) + "<null>";
+	}
+	return std::visit([&](const auto& node) -> std::string {
+		using T = std::decay_t<decltype(node)>;
+		std::ostringstream oss;
+		if constexpr (std::is_same_v<T, LetStmt>) {
+			oss << indentText(depth) << "let " << node.name;
+			if (!node.typeName.empty()) oss << ": " << node.typeName;
+			oss << " = " << exprToString(node.initializer);
+			return oss.str();
+		} else if constexpr (std::is_same_v<T, VarStmt>) {
+			oss << indentText(depth) << "var " << node.name;
+			if (!node.typeName.empty()) oss << ": " << node.typeName;
+			if (node.initializer) oss << " = " << exprToString(node.initializer);
+			return oss.str();
+		} else if constexpr (std::is_same_v<T, AssignStmt>) {
+			oss << indentText(depth) << node.name << " = " << exprToString(node.value);
+			return oss.str();
+		} else if constexpr (std::is_same_v<T, ExprStmt>) {
+			oss << indentText(depth) << exprToString(node.expression);
+			return oss.str();
+		} else if constexpr (std::is_same_v<T, ReturnStmt>) {
+			oss << indentText(depth) << "return";
+			if (node.hasValue) oss << " " << exprToString(node.value);
+			return oss.str();
+		} else if constexpr (std::is_same_v<T, GiveStmt>) {
+			oss << indentText(depth) << "give " << exprToString(node.value);
+			return oss.str();
+		} else if constexpr (std::is_same_v<T, IfStmt>) {
+			oss << indentText(depth) << "if " << exprToString(node.condition) << "\n";
+			for (const auto& child : node.thenBranch) {
+				oss << stmtToString(child, depth + 1) << "\n";
+			}
+			if (node.hasElse) {
+				oss << indentText(depth) << "else\n";
+				for (const auto& child : node.elseBranch) {
+					oss << stmtToString(child, depth + 1) << "\n";
+				}
+			}
+			std::string result = oss.str();
+			if (!result.empty() && result.back() == '\n') result.pop_back();
+			return result;
+		} else if constexpr (std::is_same_v<T, WhileStmt>) {
+			oss << indentText(depth) << "while " << exprToString(node.condition) << "\n";
+			for (const auto& child : node.body) {
+				oss << stmtToString(child, depth + 1) << "\n";
+			}
+			std::string result = oss.str();
+			if (!result.empty() && result.back() == '\n') result.pop_back();
+			return result;
+		} else if constexpr (std::is_same_v<T, BreakStmt>) {
+			return indentText(depth) + "break" + (node.label.empty() ? "" : " @" + node.label);
+		} else if constexpr (std::is_same_v<T, ContinueStmt>) {
+			return indentText(depth) + "continue" + (node.label.empty() ? "" : " @" + node.label);
+		} else if constexpr (std::is_same_v<T, EachStmt>) {
+			oss << indentText(depth) << "for ";
+			if (node.bindingsMutable) oss << "var ";
+			for (std::size_t i = 0; i < node.bindings.size(); ++i) {
+				if (i != 0) oss << ", ";
+				oss << node.bindings[i];
+			}
+			oss << " in " << exprToString(node.range) << "\n";
+			for (const auto& child : node.body) {
+				oss << stmtToString(child, depth + 1) << "\n";
+			}
+			std::string result = oss.str();
+			if (!result.empty() && result.back() == '\n') result.pop_back();
+			return result;
+		} else if constexpr (std::is_same_v<T, UnsafeStmt>) {
+			oss << indentText(depth) << "unsafe\n";
+			for (const auto& child : node.body) {
+				oss << stmtToString(child, depth + 1) << "\n";
+			}
+			std::string result = oss.str();
+			if (!result.empty() && result.back() == '\n') result.pop_back();
+			return result;
+		} else if constexpr (std::is_same_v<T, DeferStmt>) {
+			oss << indentText(depth) << "defer " << exprToString(node.expression);
+			return oss.str();
+		} else if constexpr (std::is_same_v<T, FailStmt>) {
+			oss << indentText(depth) << "fail " << exprToString(node.expression);
+			return oss.str();
+		} else if constexpr (std::is_same_v<T, BlockStmt>) {
+			for (const auto& child : node.statements) {
+				oss << stmtToString(child, depth) << "\n";
+			}
+			std::string result = oss.str();
+			if (!result.empty() && result.back() == '\n') result.pop_back();
+			return result;
+		} else {
+			return indentText(depth) + "<stmt>";
+		}
+	}, stmt->node);
+}
+
+std::string routineToString(const Routine& routine) {
+	std::ostringstream oss;
+	oss << "routine " << routine.name << '(';
+	for (std::size_t i = 0; i < routine.parameters.size(); ++i) {
+		if (i != 0) oss << ", ";
+		if (routine.parameters[i].mode != "shared") oss << routine.parameters[i].mode << ' ';
+		oss << routine.parameters[i].name << ": " << routine.parameters[i].typeName;
+	}
+	oss << ")";
+	if (!routine.returnType.empty() && routine.returnType != "void") {
+		oss << " gives " << routine.returnType;
+	}
+	if (!routine.effects.empty()) {
+		oss << " with ";
+		for (std::size_t i = 0; i < routine.effects.size(); ++i) { if (i) oss << ", "; oss << routine.effects[i]; }
+	}
+	for (const auto& stmt : routine.body) {
+		oss << "\n" << stmtToString(stmt, 1);
+	}
+	return oss.str();
+}
+
+std::string programToString(const Program& program) {
+	std::ostringstream oss;
+	oss << "Parsed " << program.routines.size() << " routine(s).";
+	for (const auto& routine : program.routines) {
+		oss << "\n" << routineToString(routine);
+	}
+	return oss.str();
+}
+
+// --- SAGE specialization + closure conversion before PCIR -------------------
+class SemanticSpecializer {
+public:
+    Program specialize(const Program& source, const SemanticAnalysisResult& analysis) {
+        analysis_ = &analysis; callSpecializations_.clear();
+        for (const auto& f : analysis.skm.specializations) callSpecializations_[callKey(f.location,f.genericRoutine)] = f.specializationName;
+        std::vector<const Routine*> all; for(const auto&r:source.routines)all.push_back(&r); collectDeclaredRoutines(source.declarations,all);
+        std::unordered_map<std::string,const Routine*> genericByName; for(auto*r:all)if(!r->genericParameters.empty())genericByName[r->name]=r;
+        Program out; out.declarations=source.declarations;
+        for(auto*r:all) if(r->genericParameters.empty()&&!r->isForeign) out.routines.push_back(rewriteRoutine(*r,{},r->name));
+        for(const auto& f:analysis.skm.specializations){auto it=genericByName.find(f.genericRoutine);if(it==genericByName.end())continue;out.routines.push_back(rewriteRoutine(*it->second,f.substitutions,f.specializationName));}
+        synthesizeClosures(out,analysis);
+        analysis_=nullptr; return out;
+    }
+private:
+    static std::string callKey(SourceLocation l,const std::string& n){return std::to_string(l.line)+":"+std::to_string(l.column)+":"+n;}
+    void collectDeclaredRoutines(const std::vector<Declaration>& ds,std::vector<const Routine*>& out){for(const auto&d:ds)std::visit([&](const auto&n){using T=std::decay_t<decltype(n)>;if constexpr(std::is_same_v<T,Routine>)out.push_back(&n);else if constexpr(std::is_same_v<T,ModuleDecl>)collectDeclaredRoutines(n.declarations,out);},d.node);}
+    std::string subst(const std::string&t,const std::map<std::string,std::string>&m)const{return substituteGenericType(t,m);}
+    Parameter rewriteParameter(Parameter p,const std::map<std::string,std::string>&m){p.typeName=subst(p.typeName,m);return p;}
+    ExprPtr rewriteExpr(const ExprPtr&e,const std::map<std::string,std::string>&m){if(!e)return{};auto span = e->span;return std::visit([&](const auto&n)->ExprPtr{using T=std::decay_t<decltype(n)>;
+        if constexpr(std::is_same_v<T,NumberExpr>||std::is_same_v<T,StringExpr>||std::is_same_v<T,BoolExpr>||std::is_same_v<T,NullExpr>||std::is_same_v<T,VariableExpr>)return std::make_shared<const Expr>(*e);
+        else if constexpr(std::is_same_v<T,UnaryExpr>){auto x=n;x.operand=rewriteExpr(n.operand,m);return AstFactory::makeExpr(std::move(x),span);}
+        else if constexpr(std::is_same_v<T,BinaryExpr>){auto x=n;x.left=rewriteExpr(n.left,m);x.right=rewriteExpr(n.right,m);return AstFactory::makeExpr(std::move(x),span);}
+        else if constexpr(std::is_same_v<T,PipelineExpr>){auto x=n;x.input=rewriteExpr(n.input,m);for(auto&z:x.stages)z=rewriteExpr(z,m);return AstFactory::makeExpr(std::move(x),span);}
+        else if constexpr(std::is_same_v<T,RangeExpr>){auto x=n;x.start=rewriteExpr(n.start,m);x.end=rewriteExpr(n.end,m);x.step=rewriteExpr(n.step,m);return AstFactory::makeExpr(std::move(x),span);}
+        else if constexpr(std::is_same_v<T,ChooseExpr>){auto x=n;x.subject=rewriteExpr(n.subject,m);for(auto&c:x.cases){c.condition=rewriteExpr(c.condition,m);c.value=rewriteExpr(c.value,m);}x.otherwiseValue=rewriteExpr(n.otherwiseValue,m);return AstFactory::makeExpr(std::move(x),span);}
+        else if constexpr(std::is_same_v<T,CallExpr>){auto x=n;x.callee=rewriteExpr(n.callee,m);for(auto&a:x.arguments)a=rewriteExpr(a,m);for(auto&a:x.genericArguments)a=subst(a,m);if(auto*v=std::get_if<VariableExpr>(&x.callee->node)){auto it=callSpecializations_.find(callKey(n.location,v->name));if(it!=callSpecializations_.end()){auto nv=*v;nv.name=it->second;x.callee=AstFactory::makeExpr(std::move(nv),x.callee->span);x.genericArguments.clear();}}return AstFactory::makeExpr(std::move(x),span);}
+        else if constexpr(std::is_same_v<T,TryExpr>){auto x=n;x.operand=rewriteExpr(n.operand,m);return AstFactory::makeExpr(std::move(x),span);}
+        else if constexpr(std::is_same_v<T,ClosureExpr>){auto x=n;for(auto&p:x.parameters)p=rewriteParameter(p,m);x.returnType=subst(x.returnType,m);x.expressionBody=rewriteExpr(n.expressionBody,m);x.blockBody=rewriteStatements(n.blockBody,m);return AstFactory::makeExpr(std::move(x),span);}
+        else if constexpr(std::is_same_v<T,GroupExpr>){auto x=n;x.expression=rewriteExpr(n.expression,m);return AstFactory::makeExpr(std::move(x),span);}
+        else if constexpr(std::is_same_v<T,MemberExpr>){auto x=n;x.object=rewriteExpr(n.object,m);return AstFactory::makeExpr(std::move(x),span);}
+        else if constexpr(std::is_same_v<T,ConstructExpr>){auto x=n;x.typeName=subst(n.typeName,m);for(auto&f:x.fields)f.value=rewriteExpr(f.value,m);return AstFactory::makeExpr(std::move(x),span);}
+        else return std::make_shared<const Expr>(*e);
+    },e->node);}
+    StmtPtr rewriteStmt(const StmtPtr&s,const std::map<std::string,std::string>&m){if(!s)return{};auto span=s->span;return std::visit([&](const auto&n)->StmtPtr{using T=std::decay_t<decltype(n)>;auto x=n;
+        if constexpr(std::is_same_v<T,LetStmt>||std::is_same_v<T,VarStmt>){x.typeName=subst(x.typeName,m);x.initializer=rewriteExpr(x.initializer,m);}
+        else if constexpr(std::is_same_v<T,AssignStmt>)x.value=rewriteExpr(x.value,m);
+        else if constexpr(std::is_same_v<T,ExprStmt>)x.expression=rewriteExpr(x.expression,m);
+        else if constexpr(std::is_same_v<T,ReturnStmt>){if(x.hasValue)x.value=rewriteExpr(x.value,m);}
+        else if constexpr(std::is_same_v<T,GiveStmt>)x.value=rewriteExpr(x.value,m);
+        else if constexpr(std::is_same_v<T,IfStmt>){x.condition=rewriteExpr(x.condition,m);x.thenBranch=rewriteStatements(x.thenBranch,m);x.elseBranch=rewriteStatements(x.elseBranch,m);}
+        else if constexpr(std::is_same_v<T,EachStmt>){x.range=rewriteExpr(x.range,m);x.body=rewriteStatements(x.body,m);}
+        else if constexpr(std::is_same_v<T,UnsafeStmt>)x.body=rewriteStatements(x.body,m);
+        else if constexpr(std::is_same_v<T,DeferStmt>)x.expression=rewriteExpr(x.expression,m);
+        else if constexpr(std::is_same_v<T,FailStmt>)x.expression=rewriteExpr(x.expression,m);
+        else if constexpr(std::is_same_v<T,WhileStmt>){x.condition=rewriteExpr(x.condition,m);x.body=rewriteStatements(x.body,m);}
+        else if constexpr(std::is_same_v<T,BlockStmt>)x.statements=rewriteStatements(x.statements,m);
+        return AstFactory::makeStmt(std::move(x),span);
+    },s->node);}
+    std::vector<StmtPtr> rewriteStatements(const std::vector<StmtPtr>&ss,const std::map<std::string,std::string>&m){std::vector<StmtPtr>out;out.reserve(ss.size());for(auto&s:ss)out.push_back(rewriteStmt(s,m));return out;}
+    Routine rewriteRoutine(const Routine&r,const std::map<std::string,std::string>&m,const std::string&name){Routine x=r;x.name=name;x.genericParameters.clear();x.constraints.clear();for(auto&p:x.parameters)p=rewriteParameter(p,m);x.returnType=subst(x.returnType,m);x.body=rewriteStatements(x.body,m);return x;}
+    void collectClosuresExpr(const ExprPtr&e,std::vector<const ClosureExpr*>&out){if(!e)return;std::visit([&](const auto&n){using T=std::decay_t<decltype(n)>;if constexpr(std::is_same_v<T,ClosureExpr>){out.push_back(&n);collectClosuresExpr(n.expressionBody,out);collectClosuresStmt(n.blockBody,out);}else if constexpr(std::is_same_v<T,UnaryExpr>)collectClosuresExpr(n.operand,out);else if constexpr(std::is_same_v<T,BinaryExpr>){collectClosuresExpr(n.left,out);collectClosuresExpr(n.right,out);}else if constexpr(std::is_same_v<T,CallExpr>){collectClosuresExpr(n.callee,out);for(auto&a:n.arguments)collectClosuresExpr(a,out);}else if constexpr(std::is_same_v<T,PipelineExpr>){collectClosuresExpr(n.input,out);for(auto&a:n.stages)collectClosuresExpr(a,out);}else if constexpr(std::is_same_v<T,RangeExpr>){collectClosuresExpr(n.start,out);collectClosuresExpr(n.end,out);collectClosuresExpr(n.step,out);}else if constexpr(std::is_same_v<T,ChooseExpr>){collectClosuresExpr(n.subject,out);for(auto&c:n.cases){collectClosuresExpr(c.condition,out);collectClosuresExpr(c.value,out);}collectClosuresExpr(n.otherwiseValue,out);}else if constexpr(std::is_same_v<T,TryExpr>)collectClosuresExpr(n.operand,out);else if constexpr(std::is_same_v<T,GroupExpr>)collectClosuresExpr(n.expression,out);else if constexpr(std::is_same_v<T,MemberExpr>)collectClosuresExpr(n.object,out);else if constexpr(std::is_same_v<T,ConstructExpr>)for(auto&f:n.fields)collectClosuresExpr(f.value,out);},e->node);}
+    void collectClosuresStmt(const std::vector<StmtPtr>&ss,std::vector<const ClosureExpr*>&out){for(auto&s:ss)if(s)std::visit([&](const auto&n){using T=std::decay_t<decltype(n)>;if constexpr(std::is_same_v<T,LetStmt>||std::is_same_v<T,VarStmt>)collectClosuresExpr(n.initializer,out);else if constexpr(std::is_same_v<T,AssignStmt>)collectClosuresExpr(n.value,out);else if constexpr(std::is_same_v<T,ExprStmt>)collectClosuresExpr(n.expression,out);else if constexpr(std::is_same_v<T,ReturnStmt>){if(n.hasValue)collectClosuresExpr(n.value,out);}else if constexpr(std::is_same_v<T,GiveStmt>)collectClosuresExpr(n.value,out);else if constexpr(std::is_same_v<T,IfStmt>){collectClosuresExpr(n.condition,out);collectClosuresStmt(n.thenBranch,out);collectClosuresStmt(n.elseBranch,out);}else if constexpr(std::is_same_v<T,EachStmt>){collectClosuresExpr(n.range,out);collectClosuresStmt(n.body,out);}else if constexpr(std::is_same_v<T,UnsafeStmt>)collectClosuresStmt(n.body,out);else if constexpr(std::is_same_v<T,DeferStmt>)collectClosuresExpr(n.expression,out);else if constexpr(std::is_same_v<T,FailStmt>)collectClosuresExpr(n.expression,out);else if constexpr(std::is_same_v<T,WhileStmt>){collectClosuresExpr(n.condition,out);collectClosuresStmt(n.body,out);}else if constexpr(std::is_same_v<T,BlockStmt>)collectClosuresStmt(n.statements,out);},s->node);}
+    void synthesizeClosures(Program&out,const SemanticAnalysisResult&analysis){std::vector<const ClosureExpr*> closures;for(const auto&r:out.routines)collectClosuresStmt(r.body,closures);std::unordered_set<std::size_t>seen;for(auto*c:closures){if(!seen.insert(c->closureId).second)continue;Routine fn;fn.name="closure$"+std::to_string(c->closureId)+"$call";fn.returnType=c->returnType.empty()?"void":c->returnType;fn.location=c->location;fn.span=c->span;for(const auto&cap:analysis.skm.closureCaptures)if(cap.closureId==c->closureId){Parameter p;p.name=cap.name;p.typeName=cap.typeName;p.location=cap.location;p.mode=cap.kind==BorrowKind::Owned?"own":cap.kind==BorrowKind::Exclusive?"var":"shared";fn.parameters.push_back(p);}for(auto p:c->parameters)fn.parameters.push_back(p);if(c->hasExpressionBody){auto st=GiveStmt{c->expressionBody,c->span,c->location};fn.body.push_back(AstFactory::makeStmt(std::move(st),c->span));}else fn.body=c->blockBody;out.routines.push_back(std::move(fn));}}
+    const SemanticAnalysisResult*analysis_=nullptr;std::unordered_map<std::string,std::string>callSpecializations_;
+};
+
+// --- IR lowerer -------------------------------------------------------------
+class IRLowerer {
+public:
+	IRProgram lower(const Program& program) {
+		IRProgram lowered;
+		routineReturnTypes_.clear();
+		routineParameters_.clear();
+		nominalTypeNames_.clear();
+		collectNominalNames(program.declarations);
+		for (const auto& routine : program.routines) {
+			routineReturnTypes_[routine.name] = routine.returnType.empty() ? "void" : routine.returnType;
+			routineParameters_[routine.name] = routine.parameters;
+		}
+		for (const auto& routine : program.routines) {
+			lowered.functions.push_back(lowerRoutine(routine));
+		}
+		lowerDeclarationList(program.declarations, lowered.declarationSummaries);
+		return lowered;
+	}
+
+private:
+	void collectNominalNames(const std::vector<Declaration>& declarations) {
+		for (const auto& d : declarations) std::visit([&](const auto& n) {
+			using T = std::decay_t<decltype(n)>;
+			if constexpr (std::is_same_v<T, RecordDecl> || std::is_same_v<T, UnionDecl> || std::is_same_v<T, VariantDecl> || std::is_same_v<T, EnumDecl>) nominalTypeNames_.insert(n.name);
+			else if constexpr (std::is_same_v<T, ModuleDecl>) collectNominalNames(n.declarations);
+		}, d.node);
+	}
+
+	static std::string joinPath(const std::vector<std::string>& path) {
+		std::string text;
+		for (std::size_t i = 0; i < path.size(); ++i) {
+			if (i != 0) {
+				text += "::";
+			}
+			text += path[i];
+		}
+		return text;
+	}
+
+	void lowerDeclarationList(const std::vector<Declaration>& declarations, std::vector<DeclarationInfo>& output, const std::string& scopePrefix = {}) {
+		for (const auto& declaration : declarations) {
+			lowerDeclaration(declaration, output, scopePrefix);
+		}
+	}
+
+	void lowerDeclaration(const Declaration& declaration, std::vector<DeclarationInfo>& output, const std::string& scopePrefix) {
+		std::visit([&](const auto& node) {
+			using T = std::decay_t<decltype(node)>;
+			auto qualify = [&](const std::string& name) {
+				if (scopePrefix.empty()) {
+					return name;
+				}
+				return scopePrefix + "::" + name;
+			};
+			if constexpr (std::is_same_v<T, RecordDecl>) {
+				output.push_back({qualify(node.name), "record", node.isPublic, node.isCompileTime, node.layout});
+			} else if constexpr (std::is_same_v<T, EnumDecl>) {
+				output.push_back({qualify(node.name), "enum", node.isPublic, false, node.underlyingType.empty() ? "unknown" : node.underlyingType});
+			} else if constexpr (std::is_same_v<T, UnionDecl>) {
+				output.push_back({qualify(node.name), "union", node.isPublic, false, node.layout});
+			} else if constexpr (std::is_same_v<T, VariantDecl>) {
+				output.push_back({qualify(node.name), "variant", node.isPublic, false, "cases=" + std::to_string(node.cases.size())});
+			} else if constexpr (std::is_same_v<T, ModuleDecl>) {
+				output.push_back({qualify(node.name), "module", node.isPublic, false, node.name});
+				lowerDeclarationList(node.declarations, output, qualify(node.name));
+			} else if constexpr (std::is_same_v<T, UseDecl>) {
+				std::string alias = node.alias.empty() ? (node.path.empty() ? std::string{} : node.path.back()) : node.alias;
+				output.push_back({qualify(alias), "use", false, false, joinPath(node.path)});
+			} else if constexpr (std::is_same_v<T, ConstDecl>) {
+				output.push_back({qualify(node.name), "const", node.isPublic, node.isCompileTime, node.typeName});
+			} else if constexpr (std::is_same_v<T, ForeignDecl>) {
+				output.push_back({qualify(node.routine.name), "foreign", node.routine.isPublic, node.routine.isCompileTime, node.abi});
+			} else if constexpr (std::is_same_v<T, Routine>) {
+				output.push_back({qualify(node.name), "routine", node.isPublic, node.isCompileTime, node.returnType});
+			}
+		}, declaration.node);
+	}
+
+	IRFunction lowerRoutine(const Routine& routine) {
+		IRFunction function;
+		function.name = routine.name;
+		function.returnType = routine.returnType.empty() ? "void" : routine.returnType;
+		currentReturnType_ = function.returnType;
+		function.valueType = function.returnType == "void" ? makeIRVoidType() : makeIRIntType();
+		function.signature = buildSignature(routine);
+
+		blocks_.clear();
+		locals_.clear();
+		localValueTypes_.clear();
+		closureBindings_.clear();
+		lastValue_ = VReg::None;
+		lastValueType_ = makeIRUnknownType();
+		nextVreg_ = 1;
+		nextBlock_ = 1;
+
+		for (const auto& parameter : routine.parameters) {
+			function.parameterNames.push_back(parameter.name);
+			function.parameterTypes.push_back(parameter.typeName);
+			function.parameterValueTypes.push_back(irValueTypeFromName(parameter.typeName));
+			function.parameterSignature.push_back(parameter.name + ": " + parameter.typeName);
+			function.parameterVregs.push_back(allocateVReg());
+		}
+		currentBlock_ = createBlock("entry");
+		currentTerminated_ = false;
+		loopBreakTargets_.clear();
+		loopContinueTargets_.clear();
+
+		for (std::size_t i = 0; i < routine.parameters.size(); ++i) {
+			locals_[routine.parameters[i].name] = function.parameterVregs[i];
+			localValueTypes_[routine.parameters[i].name] = function.parameterValueTypes[i];
+		}
+
+		lowerStatementList(routine.body);
+
+		function.blocks = std::move(blocks_);
+		function.totalVregs = nextVreg_ ? nextVreg_ - 1 : 0;
+		return function;
+	}
+
+	std::string blockLabel(BlockID id) const {
+		return "bb_" + std::to_string(static_cast<std::uint32_t>(id));
+	}
+
+	std::string buildSignature(const Routine& routine) const {
+		std::ostringstream oss;
+		oss << routine.name << '(';
 		for (std::size_t i = 0; i < routine.parameters.size(); ++i) {
 			if (i != 0) oss << ", ";
 			if (routine.parameters[i].mode != "shared") oss << routine.parameters[i].mode << ' ';
 			oss << routine.parameters[i].name << ": " << routine.parameters[i].typeName;
 		}
-		oss << ")";
-		if (!routine.returnType.empty() && routine.returnType != "void") {
-			oss << " gives " << routine.returnType;
-		}
+		oss << ") -> " << (routine.returnType.empty() ? "void" : routine.returnType);
 		if (!routine.effects.empty()) {
 			oss << " with ";
-			for (std::size_t i = 0; i < routine.effects.size(); ++i) { if (i) oss << ", "; oss << routine.effects[i]; }
-		}
-		for (const auto& stmt : routine.body) {
-			oss << "\n" << stmtToString(stmt, 1);
+			for (std::size_t i = 0; i < routine.effects.size(); ++i) { if (i) oss << ','; oss << routine.effects[i]; }
 		}
 		return oss.str();
 	}
 
-	std::string programToString(const Program& program) {
-		std::ostringstream oss;
-		oss << "Parsed " << program.routines.size() << " routine(s).";
-		for (const auto& routine : program.routines) {
-			oss << "\n" << routineToString(routine);
+	IRValueType binaryValueType(const std::string& op) const {
+		if (op == "and" || op == "or" || op == "&&" || op == "||" || op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") {
+			return makeIRBoolType();
 		}
-		return oss.str();
+		if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%" ||
+			op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
+			return makeIRIntType();
+		}
+		return makeIRUnknownType();
 	}
 
-	// --- IR lowerer -------------------------------------------------------------
-	class IRLowerer {
-	public:
-		IRProgram lower(const Program& program) {
-			IRProgram lowered;
-			routineReturnTypes_.clear();
-			for (const auto& routine : program.routines) {
-				routineReturnTypes_[routine.name] = routine.returnType.empty() ? "void" : routine.returnType;
-			}
-			for (const auto& routine : program.routines) {
-				lowered.functions.push_back(lowerRoutine(routine));
-			}
-			lowerDeclarationList(program.declarations, lowered.declarationSummaries);
-			return lowered;
+	std::string calleeSignature(const ExprPtr& callee) const {
+		if (!callee) {
+			return "<unknown>()";
 		}
+		if (const auto* variable = std::get_if<VariableExpr>(&callee->node)) {
+			return variable->name + "()";
+		}
+		return "<expr>()";
+	}
 
-	private:
-		static std::string joinPath(const std::vector<std::string>& path) {
-			std::string text;
-			for (std::size_t i = 0; i < path.size(); ++i) {
-				if (i != 0) {
-					text += "::";
+	IRValueType irValueTypeFromName(const std::string& name) const {
+		if (name == "void") return makeIRVoidType();
+		if (name == "bool") return makeIRBoolType();
+		if (isNumericTypeName(name)) return makeIRIntType();
+		if (name == "string" || name == "text") return makeIRStringType();
+		if (name == "null") return makeIRNullType();
+		if (name.rfind("result<", 0) == 0) return {IRValueKind::Result, name};
+		if (name.rfind("option<", 0) == 0) return {IRValueKind::Option, name};
+		if (name.rfind("closure$", 0) == 0) return {IRValueKind::Closure, name};
+		if (!name.empty() && (name.front() == '(' || nominalTypeNames_.count(name))) return {IRValueKind::Aggregate, name};
+		if (name.empty()) return makeIRUnknownType();
+		return {IRValueKind::Function, name};
+	}
+
+	void lowerStatementList(const std::vector<StmtPtr>& statements) {
+		for (const auto& statement : statements) {
+			ensureActiveBlock();
+			lowerStatement(statement);
+		}
+	}
+
+	void lowerStatement(const StmtPtr& statement) {
+		if (!statement) {
+			return;
+		}
+		std::visit([&](const auto& node) {
+			using T = std::decay_t<decltype(node)>;
+			if constexpr (std::is_same_v<T, LetStmt>) {
+				lowerLet(node);
+			} else if constexpr (std::is_same_v<T, VarStmt>) {
+				lowerVar(node);
+			} else if constexpr (std::is_same_v<T, AssignStmt>) {
+				lowerAssign(node);
+			} else if constexpr (std::is_same_v<T, ExprStmt>) {
+				(void)lowerExpr(node.expression);
+			} else if constexpr (std::is_same_v<T, ReturnStmt>) {
+				lowerReturn(node);
+			} else if constexpr (std::is_same_v<T, GiveStmt>) {
+				lowerGive(node);
+			} else if constexpr (std::is_same_v<T, IfStmt>) {
+				lowerIf(node);
+			} else if constexpr (std::is_same_v<T, EachStmt>) {
+				lowerEach(node);
+			} else if constexpr (std::is_same_v<T, UnsafeStmt>) {
+				lowerUnsafe(node);
+			} else if constexpr (std::is_same_v<T, DeferStmt>) {
+				lowerDefer(node);
+			} else if constexpr (std::is_same_v<T, FailStmt>) {
+				lowerFail(node);
+			} else if constexpr (std::is_same_v<T, WhileStmt>) {
+				lowerWhile(node);
+			} else if constexpr (std::is_same_v<T, BreakStmt>) {
+				lowerBreak(node);
+			} else if constexpr (std::is_same_v<T, ContinueStmt>) {
+				lowerContinue(node);
+			} else if constexpr (std::is_same_v<T, BlockStmt>) {
+				lowerStatementList(node.statements);
+			}
+		}, statement->node);
+	}
+
+	void lowerLet(const LetStmt& node) {
+		if (node.initializer) {
+			if (const auto* closure = std::get_if<ClosureExpr>(&node.initializer->node)) {
+				ClosureBinding binding;
+				binding.functionName = "closure$" + std::to_string(closure->closureId) + "$call";
+				auto pit = routineParameters_.find(binding.functionName);
+				if (pit != routineParameters_.end() && pit->second.size() >= closure->parameters.size()) {
+					const auto captureCount = pit->second.size() - closure->parameters.size();
+					for (std::size_t i = 0; i < captureCount; ++i) binding.captures.push_back(pit->second[i].name);
 				}
-				text += path[i];
-			}
-			return text;
-		}
-
-		void lowerDeclarationList(const std::vector<Declaration>& declarations, std::vector<DeclarationInfo>& output, const std::string& scopePrefix = {}) {
-			for (const auto& declaration : declarations) {
-				lowerDeclaration(declaration, output, scopePrefix);
-			}
-		}
-
-		void lowerDeclaration(const Declaration& declaration, std::vector<DeclarationInfo>& output, const std::string& scopePrefix) {
-			std::visit([&](const auto& node) {
-				using T = std::decay_t<decltype(node)>;
-				auto qualify = [&](const std::string& name) {
-					if (scopePrefix.empty()) {
-						return name;
-					}
-					return scopePrefix + "::" + name;
-					};
-				if constexpr (std::is_same_v<T, RecordDecl>) {
-					output.push_back({ qualify(node.name), "record", node.isPublic, node.isCompileTime, node.layout });
-				}
-				else if constexpr (std::is_same_v<T, EnumDecl>) {
-					output.push_back({ qualify(node.name), "enum", node.isPublic, false, node.underlyingType.empty() ? "unknown" : node.underlyingType });
-				}
-				else if constexpr (std::is_same_v<T, UnionDecl>) {
-					output.push_back({ qualify(node.name), "union", node.isPublic, false, node.layout });
-				}
-				else if constexpr (std::is_same_v<T, VariantDecl>) {
-					output.push_back({ qualify(node.name), "variant", node.isPublic, false, "cases=" + std::to_string(node.cases.size()) });
-				}
-				else if constexpr (std::is_same_v<T, ModuleDecl>) {
-					output.push_back({ qualify(node.name), "module", node.isPublic, false, node.name });
-					lowerDeclarationList(node.declarations, output, qualify(node.name));
-				}
-				else if constexpr (std::is_same_v<T, UseDecl>) {
-					std::string alias = node.alias.empty() ? (node.path.empty() ? std::string{} : node.path.back()) : node.alias;
-					output.push_back({ qualify(alias), "use", false, false, joinPath(node.path) });
-				}
-				else if constexpr (std::is_same_v<T, ConstDecl>) {
-					output.push_back({ qualify(node.name), "const", node.isPublic, node.isCompileTime, node.typeName });
-				}
-				else if constexpr (std::is_same_v<T, ForeignDecl>) {
-					output.push_back({ qualify(node.routine.name), "foreign", node.routine.isPublic, node.routine.isCompileTime, node.abi });
-				}
-				else if constexpr (std::is_same_v<T, Routine>) {
-					output.push_back({ qualify(node.name), "routine", node.isPublic, node.isCompileTime, node.returnType });
-				}
-				}, declaration.node);
-		}
-
-		IRFunction lowerRoutine(const Routine& routine) {
-			IRFunction function;
-			function.name = routine.name;
-			function.returnType = routine.returnType.empty() ? "void" : routine.returnType;
-			function.valueType = function.returnType == "void" ? makeIRVoidType() : makeIRIntType();
-			function.signature = buildSignature(routine);
-
-			blocks_.clear();
-			locals_.clear();
-			localValueTypes_.clear();
-			lastValue_ = VReg::None;
-			lastValueType_ = makeIRUnknownType();
-			nextVreg_ = 1;
-			nextBlock_ = 1;
-
-			for (const auto& parameter : routine.parameters) {
-				function.parameterNames.push_back(parameter.name);
-				function.parameterTypes.push_back(parameter.typeName);
-				function.parameterValueTypes.push_back(irValueTypeFromName(parameter.typeName));
-				function.parameterSignature.push_back(parameter.name + ": " + parameter.typeName);
-				function.parameterVregs.push_back(allocateVReg());
-			}
-			currentBlock_ = createBlock("entry");
-			currentTerminated_ = false;
-			loopBreakTargets_.clear();
-			loopContinueTargets_.clear();
-
-			for (std::size_t i = 0; i < routine.parameters.size(); ++i) {
-				locals_[routine.parameters[i].name] = function.parameterVregs[i];
-				localValueTypes_[routine.parameters[i].name] = function.parameterValueTypes[i];
-			}
-
-			lowerStatementList(routine.body);
-
-			function.blocks = std::move(blocks_);
-			function.totalVregs = nextVreg_ ? nextVreg_ - 1 : 0;
-			return function;
-		}
-
-		std::string blockLabel(BlockID id) const {
-			return "bb_" + std::to_string(static_cast<std::uint32_t>(id));
-		}
-
-		std::string buildSignature(const Routine& routine) const {
-			std::ostringstream oss;
-			oss << routine.name << '(';
-			for (std::size_t i = 0; i < routine.parameters.size(); ++i) {
-				if (i != 0) oss << ", ";
-				if (routine.parameters[i].mode != "shared") oss << routine.parameters[i].mode << ' ';
-				oss << routine.parameters[i].name << ": " << routine.parameters[i].typeName;
-			}
-			oss << ") -> " << (routine.returnType.empty() ? "void" : routine.returnType);
-			if (!routine.effects.empty()) {
-				oss << " with ";
-				for (std::size_t i = 0; i < routine.effects.size(); ++i) { if (i) oss << ','; oss << routine.effects[i]; }
-			}
-			return oss.str();
-		}
-
-		IRValueType binaryValueType(const std::string& op) const {
-			if (op == "and" || op == "or" || op == "&&" || op == "||" || op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") {
-				return makeIRBoolType();
-			}
-			if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%" ||
-				op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
-				return makeIRIntType();
-			}
-			return makeIRUnknownType();
-		}
-
-		std::string calleeSignature(const ExprPtr& callee) const {
-			if (!callee) {
-				return "<unknown>()";
-			}
-			if (const auto* variable = std::get_if<VariableExpr>(&callee->node)) {
-				return variable->name + "()";
-			}
-			return "<expr>()";
-		}
-
-		IRValueType irValueTypeFromName(const std::string& name) const {
-			if (name == "void") return makeIRVoidType();
-			if (name == "bool") return makeIRBoolType();
-			if (isNumericTypeName(name)) return makeIRIntType();
-			if (name == "string" || name == "text") return makeIRStringType();
-			if (name == "null") return makeIRNullType();
-			if (name.empty()) return makeIRUnknownType();
-			return { IRValueKind::Function, name };
-		}
-
-		void lowerStatementList(const std::vector<StmtPtr>& statements) {
-			for (const auto& statement : statements) {
-				ensureActiveBlock();
-				lowerStatement(statement);
-			}
-		}
-
-		void lowerStatement(const StmtPtr& statement) {
-			if (!statement) {
+				closureBindings_[node.name] = binding;
+				IRInstruction make; make.op = IROpcode::MakeClosure; make.dest = allocateVReg(); make.callee = binding.functionName; make.valueType = {IRValueKind::Closure, "closure$" + std::to_string(closure->closureId)};
+				for (const auto& capture : binding.captures) { auto it=locals_.find(capture); if(it!=locals_.end() && it->second!=VReg::None) make.args.push_back(it->second); }
+				emit(make);
+				locals_[node.name] = make.dest;
+				localValueTypes_[node.name] = make.valueType;
+				lastValue_ = make.dest;
+				lastValueType_ = make.valueType;
 				return;
 			}
-			std::visit([&](const auto& node) {
-				using T = std::decay_t<decltype(node)>;
-				if constexpr (std::is_same_v<T, LetStmt>) {
-					lowerLet(node);
-				}
-				else if constexpr (std::is_same_v<T, VarStmt>) {
-					lowerVar(node);
-				}
-				else if constexpr (std::is_same_v<T, AssignStmt>) {
-					lowerAssign(node);
-				}
-				else if constexpr (std::is_same_v<T, ExprStmt>) {
-					(void)lowerExpr(node.expression);
-				}
-				else if constexpr (std::is_same_v<T, ReturnStmt>) {
-					lowerReturn(node);
-				}
-				else if constexpr (std::is_same_v<T, GiveStmt>) {
-					lowerGive(node);
-				}
-				else if constexpr (std::is_same_v<T, IfStmt>) {
-					lowerIf(node);
-				}
-				else if constexpr (std::is_same_v<T, EachStmt>) {
-					lowerEach(node);
-				}
-				else if constexpr (std::is_same_v<T, UnsafeStmt>) {
-					lowerUnsafe(node);
-				}
-				else if constexpr (std::is_same_v<T, DeferStmt>) {
-					lowerDefer(node);
-				}
-				else if constexpr (std::is_same_v<T, FailStmt>) {
-					lowerFail(node);
-				}
-				else if constexpr (std::is_same_v<T, WhileStmt>) {
-					lowerWhile(node);
-				}
-				else if constexpr (std::is_same_v<T, BreakStmt>) {
-					lowerBreak(node);
-				}
-				else if constexpr (std::is_same_v<T, ContinueStmt>) {
-					lowerContinue(node);
-				}
-				else if constexpr (std::is_same_v<T, BlockStmt>) {
-					lowerStatementList(node.statements);
-				}
-				}, statement->node);
 		}
+		auto value = node.initializer ? lowerExpr(node.initializer) : makeNullValue();
+		locals_[node.name] = value;
+		localValueTypes_[node.name] = lastValueType_;
+		lastValue_ = value;
+		lastValueType_ = localValueTypes_[node.name];
+	}
 
-		void lowerLet(const LetStmt& node) {
-			auto value = node.initializer ? lowerExpr(node.initializer) : makeNullValue();
+	void lowerVar(const VarStmt& node) {
+		auto value = node.initializer ? lowerExpr(node.initializer) : makeNullValue();
+		locals_[node.name] = value;
+		localValueTypes_[node.name] = lastValueType_;
+		lastValue_ = value;
+		lastValueType_ = localValueTypes_[node.name];
+	}
+
+	void lowerAssign(const AssignStmt& node) {
+		auto value = lowerExpr(node.value);
+		auto it = locals_.find(node.name);
+		if (it == locals_.end()) {
 			locals_[node.name] = value;
 			localValueTypes_[node.name] = lastValueType_;
 			lastValue_ = value;
-			lastValueType_ = localValueTypes_[node.name];
+			return;
 		}
+		IRInstruction copy;
+		copy.op = IROpcode::Copy;
+		copy.dest = it->second;
+		copy.args.push_back(value);
+		copy.valueType = lastValueType_;
+		emit(std::move(copy));
+		localValueTypes_[node.name] = lastValueType_;
+		lastValue_ = it->second;
+	}
 
-		void lowerVar(const VarStmt& node) {
-			auto value = node.initializer ? lowerExpr(node.initializer) : makeNullValue();
-			locals_[node.name] = value;
-			localValueTypes_[node.name] = lastValueType_;
-			lastValue_ = value;
-			lastValueType_ = localValueTypes_[node.name];
-		}
-
-		void lowerAssign(const AssignStmt& node) {
-			auto value = lowerExpr(node.value);
-			auto it = locals_.find(node.name);
-			if (it == locals_.end()) {
-				locals_[node.name] = value;
-				localValueTypes_[node.name] = lastValueType_;
-				lastValue_ = value;
-				return;
-			}
-			IRInstruction copy;
-			copy.op = IROpcode::Copy;
-			copy.dest = it->second;
-			copy.args.push_back(value);
-			copy.valueType = lastValueType_;
-			emit(std::move(copy));
-			localValueTypes_[node.name] = lastValueType_;
-			lastValue_ = it->second;
-		}
-
-		void lowerReturn(const ReturnStmt& node) {
-			IRInstruction inst;
-			inst.op = IROpcode::Return;
-			if (node.hasValue) {
-				inst.args.push_back(lowerExpr(node.value));
-				inst.valueType = lastValueType_;
-			}
-			else {
-				inst.valueType = makeIRVoidType();
-			}
-			emit(std::move(inst));
-			currentTerminated_ = true;
-		}
-
-		void lowerGive(const GiveStmt& node) {
-			IRInstruction inst;
-			inst.op = IROpcode::Return;
+	void lowerReturn(const ReturnStmt& node) {
+		IRInstruction inst;
+		inst.op = IROpcode::Return;
+		if (node.hasValue) {
 			inst.args.push_back(lowerExpr(node.value));
 			inst.valueType = lastValueType_;
-			emit(std::move(inst));
-			currentTerminated_ = true;
+		} else {
+			inst.valueType = makeIRVoidType();
 		}
+		emit(std::move(inst));
+		currentTerminated_ = true;
+	}
 
-		void lowerIf(const IfStmt& node) {
-			BlockID thenBlock = createBlock("if.then");
-			BlockID elseBlock = node.hasElse ? createBlock("if.else") : createBlock("if.merge");
-			BlockID mergeBlock = node.hasElse ? createBlock("if.merge") : elseBlock;
-			auto conditionValue = lowerExpr(node.condition);
+	void lowerGive(const GiveStmt& node) {
+		auto value = lowerExpr(node.value);
+		if (currentReturnType_.rfind("result<", 0) == 0 && lastValueType_.kind != IRValueKind::Result) value = emitTagged(IROpcode::ResultOk, value, {IRValueKind::Result, currentReturnType_});
+		else if (currentReturnType_.rfind("option<", 0) == 0 && lastValueType_.kind != IRValueKind::Option) value = emitTagged(IROpcode::OptionSome, value, {IRValueKind::Option, currentReturnType_});
+		IRInstruction inst; inst.op = IROpcode::Return; inst.args.push_back(value); inst.valueType = irValueTypeFromName(currentReturnType_);
+		emit(std::move(inst)); currentTerminated_ = true;
+	}
 
-			IRInstruction branch;
-			branch.op = IROpcode::BranchIf;
-			branch.args.push_back(conditionValue);
-			branch.targetBlocks.push_back(thenBlock);
-			branch.targetBlocks.push_back(elseBlock);
-			emit(std::move(branch));
-			currentTerminated_ = true;
+	void lowerIf(const IfStmt& node) {
+		BlockID thenBlock = createBlock("if.then");
+		BlockID elseBlock = node.hasElse ? createBlock("if.else") : createBlock("if.merge");
+		BlockID mergeBlock = node.hasElse ? createBlock("if.merge") : elseBlock;
+		auto conditionValue = lowerExpr(node.condition);
 
-			currentBlock_ = thenBlock;
+		IRInstruction branch;
+		branch.op = IROpcode::BranchIf;
+		branch.args.push_back(conditionValue);
+		branch.targetBlocks.push_back(thenBlock);
+		branch.targetBlocks.push_back(elseBlock);
+		emit(std::move(branch));
+		currentTerminated_ = true;
+
+		currentBlock_ = thenBlock;
+		currentTerminated_ = false;
+		lastValue_ = VReg::None;
+		lowerStatementList(node.thenBranch);
+		if (!currentTerminated_) {
+			emitBranch(mergeBlock);
+		}
+		appendPhiInput(mergeBlock, thenBlock, lastValue_);
+
+		if (node.hasElse) {
+			currentBlock_ = elseBlock;
 			currentTerminated_ = false;
 			lastValue_ = VReg::None;
-			lowerStatementList(node.thenBranch);
+			lowerStatementList(node.elseBranch);
 			if (!currentTerminated_) {
 				emitBranch(mergeBlock);
 			}
-			appendPhiInput(mergeBlock, thenBlock, lastValue_);
+			appendPhiInput(mergeBlock, elseBlock, lastValue_);
+		}
 
-			if (node.hasElse) {
-				currentBlock_ = elseBlock;
-				currentTerminated_ = false;
-				lastValue_ = VReg::None;
-				lowerStatementList(node.elseBranch);
-				if (!currentTerminated_) {
-					emitBranch(mergeBlock);
+		currentBlock_ = mergeBlock;
+		currentTerminated_ = false;
+	}
+
+	void lowerWhile(const WhileStmt& node) {
+        BlockID condBlock = createBlock("while.cond");
+        BlockID bodyBlock = createBlock("while.body");
+        BlockID exitBlock = createBlock("while.exit");
+        emitBranch(condBlock);
+
+        currentBlock_ = condBlock;
+        currentTerminated_ = false;
+        auto conditionValue = lowerExpr(node.condition);
+        IRInstruction branch;
+        branch.op = IROpcode::BranchIf;
+        branch.args.push_back(conditionValue);
+        branch.targetBlocks.push_back(bodyBlock);
+        branch.targetBlocks.push_back(exitBlock);
+        emit(std::move(branch));
+        currentTerminated_ = true;
+
+        loopContinueTargets_.push_back(condBlock);
+        loopBreakTargets_.push_back(exitBlock);
+        currentBlock_ = bodyBlock;
+        currentTerminated_ = false;
+        lastValue_ = VReg::None;
+        lowerStatementList(node.body);
+        if (!currentTerminated_) emitBranch(condBlock);
+        loopContinueTargets_.pop_back();
+        loopBreakTargets_.pop_back();
+
+        currentBlock_ = exitBlock;
+        currentTerminated_ = false;
+    }
+
+    void lowerEach(const EachStmt& node) {
+        if (node.bindings.size() != 1) {
+            throw std::runtime_error("bootstrap PCIR lowering currently requires one binding in for-range loops");
+        }
+        const auto* range = node.range ? std::get_if<RangeExpr>(&node.range->node) : nullptr;
+        if (!range || !range->start || !range->end) {
+            throw std::runtime_error("bootstrap PCIR lowering currently supports for over numeric ranges only");
+        }
+
+        const std::string& binding = node.bindings.front();
+        VReg startValue = lowerExpr(range->start);
+        VReg endValue = lowerExpr(range->end);
+        VReg induction = allocateVReg();
+        IRInstruction init;
+        init.op = IROpcode::Copy;
+        init.dest = induction;
+        init.args.push_back(startValue);
+        init.valueType = makeIRIntType();
+        emit(std::move(init));
+        locals_[binding] = induction;
+        localValueTypes_[binding] = makeIRIntType();
+
+        BlockID condBlock = createBlock("for.cond");
+        BlockID bodyBlock = createBlock("for.body");
+        BlockID stepBlock = createBlock("for.step");
+        BlockID exitBlock = createBlock("for.exit");
+        emitBranch(condBlock);
+
+        currentBlock_ = condBlock;
+        currentTerminated_ = false;
+        VReg condition = allocateVReg();
+        IRInstruction compare;
+        compare.op = range->inclusive ? IROpcode::Le : IROpcode::Lt;
+        compare.dest = condition;
+        compare.args = {induction, endValue};
+        compare.valueType = makeIRBoolType();
+        emit(std::move(compare));
+        IRInstruction branch;
+        branch.op = IROpcode::BranchIf;
+        branch.args.push_back(condition);
+        branch.targetBlocks = {bodyBlock, exitBlock};
+        branch.valueType = makeIRVoidType();
+        emit(std::move(branch));
+        currentTerminated_ = true;
+
+        loopContinueTargets_.push_back(stepBlock);
+        loopBreakTargets_.push_back(exitBlock);
+        currentBlock_ = bodyBlock;
+        currentTerminated_ = false;
+        lowerStatementList(node.body);
+        if (!currentTerminated_) emitBranch(stepBlock);
+
+        currentBlock_ = stepBlock;
+        currentTerminated_ = false;
+        VReg one = emitConst(IROpcode::ConstInt, "1");
+        VReg next = allocateVReg();
+        IRInstruction add;
+        add.op = IROpcode::Add;
+        add.dest = next;
+        add.args = {induction, one};
+        add.valueType = makeIRIntType();
+        emit(std::move(add));
+        IRInstruction update;
+        update.op = IROpcode::Copy;
+        update.dest = induction;
+        update.args.push_back(next);
+        update.valueType = makeIRIntType();
+        emit(std::move(update));
+        emitBranch(condBlock);
+
+        loopContinueTargets_.pop_back();
+        loopBreakTargets_.pop_back();
+        currentBlock_ = exitBlock;
+        currentTerminated_ = false;
+    }
+
+    void lowerBreak(const BreakStmt&) {
+        if (loopBreakTargets_.empty()) throw std::runtime_error("internal error: break without loop target");
+        emitBranch(loopBreakTargets_.back());
+    }
+
+    void lowerContinue(const ContinueStmt&) {
+        if (loopContinueTargets_.empty()) throw std::runtime_error("internal error: continue without loop target");
+        emitBranch(loopContinueTargets_.back());
+    }
+
+	void lowerUnsafe(const UnsafeStmt& node) {
+		lowerStatementList(node.body);
+	}
+
+	void lowerDefer(const DeferStmt& node) {
+		(void)lowerExpr(node.expression);
+	}
+
+	void lowerFail(const FailStmt& node) {
+		auto value = node.expression ? lowerExpr(node.expression) : makeNullValue();
+		value = emitTagged(IROpcode::ResultErr, value, {IRValueKind::Result, currentReturnType_});
+		IRInstruction inst; inst.op = IROpcode::Return; inst.args.push_back(value); inst.valueType = {IRValueKind::Result, currentReturnType_};
+		emit(std::move(inst)); currentTerminated_ = true;
+	}
+
+	VReg lowerChoose(const ChooseExpr& node) {
+		IRInstruction inst;
+		inst.dest = allocateVReg();
+		inst.op = IROpcode::Phi;
+		inst.valueType = makeIRUnknownType();
+		if (node.subject) {
+			(void)lowerExpr(node.subject);
+		}
+		for (const auto& choice : node.cases) {
+			(void)lowerExpr(choice.condition);
+			inst.phiInputs.emplace_back(BlockID::None, lowerExpr(choice.value));
+		}
+		if (node.hasOtherwise) {
+			inst.phiInputs.emplace_back(BlockID::None, lowerExpr(node.otherwiseValue));
+		}
+		emit(std::move(inst));
+		return inst.dest;
+	}
+
+	void appendPhiInput(BlockID target, BlockID source, VReg value) {
+		if (target == BlockID::None || source == BlockID::None || value == VReg::None) {
+			return;
+		}
+		auto& block = blocks_[static_cast<std::size_t>(static_cast<std::uint32_t>(target) - 1)];
+		block.predecessors.push_back(blockLabel(source));
+		IRInstruction phi;
+		phi.op = IROpcode::Phi;
+		phi.dest = allocateVReg();
+		phi.phiInputs.emplace_back(source, value);
+		block.phiNodes.push_back(std::move(phi));
+		lastValue_ = value;
+	}
+
+	VReg lowerExpr(const ExprPtr& expr) {
+		if (!expr) {
+			lastValueType_ = makeIRUnknownType();
+			return makeNullValue();
+		}
+		VReg value = std::visit([&](const auto& node) -> VReg {
+			using T = std::decay_t<decltype(node)>;
+			if constexpr (std::is_same_v<T, NumberExpr>) {
+				lastValueType_ = makeIRIntType();
+				return emitConst(IROpcode::ConstInt, node.value);
+			} else if constexpr (std::is_same_v<T, StringExpr>) {
+				lastValueType_ = makeIRStringType();
+				return emitConst(IROpcode::ConstString, node.value);
+			} else if constexpr (std::is_same_v<T, BoolExpr>) {
+				lastValueType_ = makeIRBoolType();
+				return emitBool(node.value);
+			} else if constexpr (std::is_same_v<T, NullExpr>) {
+				lastValueType_ = makeIRNullType();
+				return makeNullValue();
+			} else if constexpr (std::is_same_v<T, VariableExpr>) {
+				lastValueType_ = lowerExprType(expr);
+				return lowerVariable(node.name);
+			} else if constexpr (std::is_same_v<T, UnaryExpr>) {
+				lastValueType_ = lowerExprType(expr);
+				return lowerUnary(node);
+			} else if constexpr (std::is_same_v<T, BinaryExpr>) {
+				lastValueType_ = lowerExprType(expr);
+				return lowerBinary(node);
+			} else if constexpr (std::is_same_v<T, CallExpr>) {
+				lastValueType_ = lowerExprType(expr);
+				return lowerCall(node);
+			} else if constexpr (std::is_same_v<T, PipelineExpr>) {
+				lastValueType_ = lowerExprType(expr);
+				VReg current = lowerExpr(node.input);
+				for (const auto& stage : node.stages) {
+					if (stage) {
+						current = lowerExpr(stage);
+					}
 				}
-				appendPhiInput(mergeBlock, elseBlock, lastValue_);
-			}
-
-			currentBlock_ = mergeBlock;
-			currentTerminated_ = false;
-		}
-
-		void lowerWhile(const WhileStmt& node) {
-			BlockID condBlock = createBlock("while.cond");
-			BlockID bodyBlock = createBlock("while.body");
-			BlockID exitBlock = createBlock("while.exit");
-			emitBranch(condBlock);
-
-			currentBlock_ = condBlock;
-			currentTerminated_ = false;
-			auto conditionValue = lowerExpr(node.condition);
-			IRInstruction branch;
-			branch.op = IROpcode::BranchIf;
-			branch.args.push_back(conditionValue);
-			branch.targetBlocks.push_back(bodyBlock);
-			branch.targetBlocks.push_back(exitBlock);
-			emit(std::move(branch));
-			currentTerminated_ = true;
-
-			loopContinueTargets_.push_back(condBlock);
-			loopBreakTargets_.push_back(exitBlock);
-			currentBlock_ = bodyBlock;
-			currentTerminated_ = false;
-			lastValue_ = VReg::None;
-			lowerStatementList(node.body);
-			if (!currentTerminated_) emitBranch(condBlock);
-			loopContinueTargets_.pop_back();
-			loopBreakTargets_.pop_back();
-
-			currentBlock_ = exitBlock;
-			currentTerminated_ = false;
-		}
-
-		void lowerEach(const EachStmt& node) {
-			if (node.bindings.size() != 1) {
-				throw std::runtime_error("bootstrap PCIR lowering currently requires one binding in for-range loops");
-			}
-			const auto* range = node.range ? std::get_if<RangeExpr>(&node.range->node) : nullptr;
-			if (!range || !range->start || !range->end) {
-				throw std::runtime_error("bootstrap PCIR lowering currently supports for over numeric ranges only");
-			}
-
-			const std::string& binding = node.bindings.front();
-			VReg startValue = lowerExpr(range->start);
-			VReg endValue = lowerExpr(range->end);
-			VReg induction = allocateVReg();
-			IRInstruction init;
-			init.op = IROpcode::Copy;
-			init.dest = induction;
-			init.args.push_back(startValue);
-			init.valueType = makeIRIntType();
-			emit(std::move(init));
-			locals_[binding] = induction;
-			localValueTypes_[binding] = makeIRIntType();
-
-			BlockID condBlock = createBlock("for.cond");
-			BlockID bodyBlock = createBlock("for.body");
-			BlockID stepBlock = createBlock("for.step");
-			BlockID exitBlock = createBlock("for.exit");
-			emitBranch(condBlock);
-
-			currentBlock_ = condBlock;
-			currentTerminated_ = false;
-			VReg condition = allocateVReg();
-			IRInstruction compare;
-			compare.op = range->inclusive ? IROpcode::Le : IROpcode::Lt;
-			compare.dest = condition;
-			compare.args = { induction, endValue };
-			compare.valueType = makeIRBoolType();
-			emit(std::move(compare));
-			IRInstruction branch;
-			branch.op = IROpcode::BranchIf;
-			branch.args.push_back(condition);
-			branch.targetBlocks = { bodyBlock, exitBlock };
-			branch.valueType = makeIRVoidType();
-			emit(std::move(branch));
-			currentTerminated_ = true;
-
-			loopContinueTargets_.push_back(stepBlock);
-			loopBreakTargets_.push_back(exitBlock);
-			currentBlock_ = bodyBlock;
-			currentTerminated_ = false;
-			lowerStatementList(node.body);
-			if (!currentTerminated_) emitBranch(stepBlock);
-
-			currentBlock_ = stepBlock;
-			currentTerminated_ = false;
-			VReg one = emitConst(IROpcode::ConstInt, "1");
-			VReg next = allocateVReg();
-			IRInstruction add;
-			add.op = IROpcode::Add;
-			add.dest = next;
-			add.args = { induction, one };
-			add.valueType = makeIRIntType();
-			emit(std::move(add));
-			IRInstruction update;
-			update.op = IROpcode::Copy;
-			update.dest = induction;
-			update.args.push_back(next);
-			update.valueType = makeIRIntType();
-			emit(std::move(update));
-			emitBranch(condBlock);
-
-			loopContinueTargets_.pop_back();
-			loopBreakTargets_.pop_back();
-			currentBlock_ = exitBlock;
-			currentTerminated_ = false;
-		}
-
-		void lowerBreak(const BreakStmt&) {
-			if (loopBreakTargets_.empty()) throw std::runtime_error("internal error: break without loop target");
-			emitBranch(loopBreakTargets_.back());
-		}
-
-		void lowerContinue(const ContinueStmt&) {
-			if (loopContinueTargets_.empty()) throw std::runtime_error("internal error: continue without loop target");
-			emitBranch(loopContinueTargets_.back());
-		}
-
-		void lowerUnsafe(const UnsafeStmt& node) {
-			lowerStatementList(node.body);
-		}
-
-		void lowerDefer(const DeferStmt& node) {
-			(void)lowerExpr(node.expression);
-		}
-
-		void lowerFail(const FailStmt& node) {
-			IRInstruction inst;
-			inst.op = IROpcode::Return;
-			if (node.expression) {
-				inst.args.push_back(lowerExpr(node.expression));
-				inst.valueType = lastValueType_;
-			}
-			else {
-				inst.valueType = makeIRVoidType();
-			}
-			emit(std::move(inst));
-			currentTerminated_ = true;
-		}
-
-		VReg lowerChoose(const ChooseExpr& node) {
-			IRInstruction inst;
-			inst.dest = allocateVReg();
-			inst.op = IROpcode::Phi;
-			inst.valueType = makeIRUnknownType();
-			if (node.subject) {
-				(void)lowerExpr(node.subject);
-			}
-			for (const auto& choice : node.cases) {
-				(void)lowerExpr(choice.condition);
-				inst.phiInputs.emplace_back(BlockID::None, lowerExpr(choice.value));
-			}
-			if (node.hasOtherwise) {
-				inst.phiInputs.emplace_back(BlockID::None, lowerExpr(node.otherwiseValue));
-			}
-			emit(std::move(inst));
-			return inst.dest;
-		}
-
-		void appendPhiInput(BlockID target, BlockID source, VReg value) {
-			if (target == BlockID::None || source == BlockID::None || value == VReg::None) {
-				return;
-			}
-			auto& block = blocks_[static_cast<std::size_t>(static_cast<std::uint32_t>(target) - 1)];
-			block.predecessors.push_back(blockLabel(source));
-			IRInstruction phi;
-			phi.op = IROpcode::Phi;
-			phi.dest = allocateVReg();
-			phi.phiInputs.emplace_back(source, value);
-			block.phiNodes.push_back(std::move(phi));
-			lastValue_ = value;
-		}
-
-		VReg lowerExpr(const ExprPtr& expr) {
-			if (!expr) {
+				return current;
+			} else if constexpr (std::is_same_v<T, RangeExpr>) {
+				lastValueType_ = makeIRUnknownType();
+				return makeNullValue();
+			} else if constexpr (std::is_same_v<T, ChooseExpr>) {
+				lastValueType_ = lowerExprType(expr);
+				return lowerChoose(node);
+			} else if constexpr (std::is_same_v<T, TryExpr>) {
+				auto source = lowerExpr(node.operand);
+				IRInstruction inst; inst.op = IROpcode::ResultTry; inst.dest = allocateVReg(); inst.args.push_back(source); inst.valueType = makeIRUnknownType(); inst.returnType = currentReturnType_; emit(inst); lastValueType_ = inst.valueType; return inst.dest;
+			} else if constexpr (std::is_same_v<T, ConstructExpr>) {
+				IRInstruction inst; inst.op = IROpcode::MakeAggregate; inst.dest = allocateVReg(); inst.typeName = node.typeName; inst.valueType = {IRValueKind::Aggregate, node.typeName}; for (const auto& f : node.fields) { inst.args.push_back(lowerExpr(f.value)); inst.argumentTypes.push_back(f.name); } emit(inst); lastValueType_ = inst.valueType; return inst.dest;
+			} else if constexpr (std::is_same_v<T, MemberExpr>) {
+				IRInstruction inst; inst.op = IROpcode::ExtractField; inst.dest = allocateVReg(); inst.args.push_back(lowerExpr(node.object)); inst.literalText = node.member; inst.valueType = makeIRUnknownType(); emit(inst); lastValueType_ = inst.valueType; return inst.dest;
+			} else if constexpr (std::is_same_v<T, ClosureExpr>) {
+				IRInstruction inst; inst.op = IROpcode::MakeClosure; inst.dest = allocateVReg(); inst.callee = "closure$" + std::to_string(node.closureId) + "$call"; inst.valueType = {IRValueKind::Closure, "closure$" + std::to_string(node.closureId)}; emit(inst); lastValueType_ = inst.valueType; return inst.dest;
+			} else if constexpr (std::is_same_v<T, GroupExpr>) {
+				lastValueType_ = lowerExprType(expr);
+				return lowerExpr(node.expression);
+			} else {
 				lastValueType_ = makeIRUnknownType();
 				return makeNullValue();
 			}
-			VReg value = std::visit([&](const auto& node) -> VReg {
-				using T = std::decay_t<decltype(node)>;
-				if constexpr (std::is_same_v<T, NumberExpr>) {
-					lastValueType_ = makeIRIntType();
-					return emitConst(IROpcode::ConstInt, node.value);
-				}
-				else if constexpr (std::is_same_v<T, StringExpr>) {
-					lastValueType_ = makeIRStringType();
-					return emitConst(IROpcode::ConstString, node.value);
-				}
-				else if constexpr (std::is_same_v<T, BoolExpr>) {
-					lastValueType_ = makeIRBoolType();
-					return emitBool(node.value);
-				}
-				else if constexpr (std::is_same_v<T, NullExpr>) {
-					lastValueType_ = makeIRNullType();
-					return makeNullValue();
-				}
-				else if constexpr (std::is_same_v<T, VariableExpr>) {
-					lastValueType_ = lowerExprType(expr);
-					return lowerVariable(node.name);
-				}
-				else if constexpr (std::is_same_v<T, UnaryExpr>) {
-					lastValueType_ = lowerExprType(expr);
-					return lowerUnary(node);
-				}
-				else if constexpr (std::is_same_v<T, BinaryExpr>) {
-					lastValueType_ = lowerExprType(expr);
-					return lowerBinary(node);
-				}
-				else if constexpr (std::is_same_v<T, CallExpr>) {
-					lastValueType_ = lowerExprType(expr);
-					return lowerCall(node);
-				}
-				else if constexpr (std::is_same_v<T, PipelineExpr>) {
-					lastValueType_ = lowerExprType(expr);
-					VReg current = lowerExpr(node.input);
-					for (const auto& stage : node.stages) {
-						if (stage) {
-							current = lowerExpr(stage);
-						}
-					}
-					return current;
-				}
-				else if constexpr (std::is_same_v<T, RangeExpr>) {
-					lastValueType_ = makeIRUnknownType();
-					return makeNullValue();
-				}
-				else if constexpr (std::is_same_v<T, ChooseExpr>) {
-					lastValueType_ = lowerExprType(expr);
-					return lowerChoose(node);
-				}
-				else if constexpr (std::is_same_v<T, GroupExpr>) {
-					lastValueType_ = lowerExprType(expr);
-					return lowerExpr(node.expression);
-				}
-				else {
-					lastValueType_ = makeIRUnknownType();
-					return makeNullValue();
-				}
-				}, expr->node);
-			lastValue_ = value;
-			return value;
-		}
+		}, expr->node);
+		lastValue_ = value;
+		return value;
+	}
 
-		IRValueType lowerExprType(const ExprPtr& expr) const {
-			if (!expr) {
+	IRValueType lowerExprType(const ExprPtr& expr) const {
+		if (!expr) {
+			return makeIRUnknownType();
+		}
+		return std::visit([&](const auto& node) -> IRValueType {
+			using T = std::decay_t<decltype(node)>;
+			if constexpr (std::is_same_v<T, BoolExpr>) {
+				return makeIRBoolType();
+			} else if constexpr (std::is_same_v<T, NumberExpr>) {
+				return makeIRIntType();
+			} else if constexpr (std::is_same_v<T, StringExpr>) {
+				return makeIRStringType();
+			} else if constexpr (std::is_same_v<T, NullExpr>) {
+				return makeIRNullType();
+			} else if constexpr (std::is_same_v<T, VariableExpr>) {
+				auto it = localValueTypes_.find(node.name);
+				return it != localValueTypes_.end() ? it->second : makeIRUnknownType();
+			} else if constexpr (std::is_same_v<T, UnaryExpr>) {
+				return node.op == "!" || node.op == "not" ? makeIRBoolType() : makeIRIntType();
+			} else if constexpr (std::is_same_v<T, BinaryExpr>) {
+				return binaryValueType(node.op);
+			} else if constexpr (std::is_same_v<T, CallExpr>) {
+				return node.callee ? makeIRIntType() : makeIRUnknownType();
+			} else if constexpr (std::is_same_v<T, PipelineExpr>) {
+				return makeIRUnknownType();
+			} else if constexpr (std::is_same_v<T, RangeExpr>) {
+				return makeIRUnknownType();
+			} else if constexpr (std::is_same_v<T, ChooseExpr>) {
+				return makeIRUnknownType();
+			} else if constexpr (std::is_same_v<T, TryExpr>) {
+				return makeIRUnknownType();
+			} else if constexpr (std::is_same_v<T, ConstructExpr>) {
+				return {IRValueKind::Aggregate, node.typeName};
+			} else if constexpr (std::is_same_v<T, MemberExpr>) {
+				return makeIRUnknownType();
+			} else if constexpr (std::is_same_v<T, ClosureExpr>) {
+				return {IRValueKind::Closure, "closure$" + std::to_string(node.closureId)};
+			} else {
 				return makeIRUnknownType();
 			}
-			return std::visit([&](const auto& node) -> IRValueType {
-				using T = std::decay_t<decltype(node)>;
-				if constexpr (std::is_same_v<T, BoolExpr>) {
-					return makeIRBoolType();
-				}
-				else if constexpr (std::is_same_v<T, NumberExpr>) {
-					return makeIRIntType();
-				}
-				else if constexpr (std::is_same_v<T, StringExpr>) {
-					return makeIRStringType();
-				}
-				else if constexpr (std::is_same_v<T, NullExpr>) {
-					return makeIRNullType();
-				}
-				else if constexpr (std::is_same_v<T, VariableExpr>) {
-					auto it = localValueTypes_.find(node.name);
-					return it != localValueTypes_.end() ? it->second : makeIRUnknownType();
-				}
-				else if constexpr (std::is_same_v<T, UnaryExpr>) {
-					return node.op == "!" || node.op == "not" ? makeIRBoolType() : makeIRIntType();
-				}
-				else if constexpr (std::is_same_v<T, BinaryExpr>) {
-					return binaryValueType(node.op);
-				}
-				else if constexpr (std::is_same_v<T, CallExpr>) {
-					return node.callee ? makeIRIntType() : makeIRUnknownType();
-				}
-				else if constexpr (std::is_same_v<T, PipelineExpr>) {
-					return makeIRUnknownType();
-				}
-				else if constexpr (std::is_same_v<T, RangeExpr>) {
-					return makeIRUnknownType();
-				}
-				else if constexpr (std::is_same_v<T, ChooseExpr>) {
-					return makeIRUnknownType();
-				}
-				else {
-					return makeIRUnknownType();
-				}
-				}, expr->node);
-		}
+		}, expr->node);
+	}
 
-		VReg lowerVariable(const std::string& name) {
-			auto it = locals_.find(name);
+	VReg emitTagged(IROpcode op, VReg payload, IRValueType type) {
+		IRInstruction inst; inst.op = op; inst.dest = allocateVReg(); if (payload != VReg::None) inst.args.push_back(payload); inst.valueType = type; emit(inst); lastValueType_ = type; return inst.dest;
+	}
+
+	VReg lowerVariable(const std::string& name) {
+		auto it = locals_.find(name);
+		if (it != locals_.end()) {
+			return it->second;
+		}
+		VReg value = allocateVReg();
+		locals_[name] = value;
+		return value;
+	}
+
+	VReg lowerUnary(const UnaryExpr& node) {
+		IRInstruction inst;
+		auto dest = allocateVReg();
+		inst.dest = dest;
+		inst.valueType = node.op == "!" || node.op == "not" ? makeIRBoolType() : makeIRIntType();
+		inst.args.push_back(lowerExpr(node.operand));
+		if (node.op == "-") {
+			inst.op = IROpcode::Neg;
+		} else if (node.op == "~") {
+			inst.op = IROpcode::BitNot;
+		} else if (node.op == "!" || node.op == "not") {
+			inst.op = IROpcode::Not;
+		} else {
+			inst.op = IROpcode::Nop;
+		}
+		emit(std::move(inst));
+		lastValueType_ = inst.valueType;
+		return dest;
+	}
+
+	VReg lowerBinary(const BinaryExpr& node) {
+		IRInstruction inst;
+		auto dest = allocateVReg();
+		inst.dest = dest;
+		inst.valueType = binaryValueType(node.op);
+		inst.args.push_back(lowerExpr(node.left));
+		inst.args.push_back(lowerExpr(node.right));
+		if (node.op == "+") inst.op = IROpcode::Add;
+		else if (node.op == "-") inst.op = IROpcode::Sub;
+		else if (node.op == "*") inst.op = IROpcode::Mul;
+		else if (node.op == "/") inst.op = IROpcode::Div;
+		else if (node.op == "%") inst.op = IROpcode::Mod;
+		else if (node.op == "&") inst.op = IROpcode::BitAnd;
+		else if (node.op == "|") inst.op = IROpcode::BitOr;
+		else if (node.op == "^") inst.op = IROpcode::BitXor;
+		else if (node.op == "<<") inst.op = IROpcode::Shl;
+		else if (node.op == ">>") inst.op = IROpcode::Shr;
+		else if (node.op == "and" || node.op == "&&") inst.op = IROpcode::And;
+		else if (node.op == "or" || node.op == "||") inst.op = IROpcode::Or;
+		else if (node.op == "==") inst.op = IROpcode::Eq;
+		else if (node.op == "!=") inst.op = IROpcode::Ne;
+		else if (node.op == "<") inst.op = IROpcode::Lt;
+		else if (node.op == "<=") inst.op = IROpcode::Le;
+		else if (node.op == ">") inst.op = IROpcode::Gt;
+		else if (node.op == ">=") inst.op = IROpcode::Ge;
+		else inst.op = IROpcode::Nop;
+		emit(std::move(inst));
+		lastValueType_ = inst.valueType;
+		return dest;
+	}
+
+	VReg lowerCall(const CallExpr& node) {
+		IRInstruction inst;
+		if (const auto* intrinsic = node.callee ? std::get_if<VariableExpr>(&node.callee->node) : nullptr) {
+			if (intrinsic->name == "ok" || intrinsic->name == "err" || intrinsic->name == "some" || intrinsic->name == "none") {
+				VReg payload = VReg::None; if (!node.arguments.empty()) payload = lowerExpr(node.arguments.front());
+				if (intrinsic->name == "ok") return emitTagged(IROpcode::ResultOk, payload, {IRValueKind::Result, "result"});
+				if (intrinsic->name == "err") return emitTagged(IROpcode::ResultErr, payload, {IRValueKind::Result, "result"});
+				if (intrinsic->name == "some") return emitTagged(IROpcode::OptionSome, payload, {IRValueKind::Option, "option"});
+				return emitTagged(IROpcode::OptionNone, VReg::None, {IRValueKind::Option, "option"});
+			}
+		}
+		if (const auto* variable = node.callee ? std::get_if<VariableExpr>(&node.callee->node) : nullptr) {
+			auto cb = closureBindings_.find(variable->name);
+			if (cb != closureBindings_.end()) {
+				auto dest = allocateVReg();
+				inst.dest = dest; inst.op = IROpcode::Call; inst.callee = cb->second.functionName;
+				inst.returnType = routineReturnTypes_.count(inst.callee) ? routineReturnTypes_[inst.callee] : "value";
+				inst.typeName = inst.returnType; inst.valueType = irValueTypeFromName(inst.returnType);
+				for (const auto& capture : cb->second.captures) {
+					auto it = locals_.find(capture);
+					if (it == locals_.end() || it->second == VReg::None) throw std::runtime_error("PCIR closure conversion: missing capture '" + capture + "'");
+					inst.args.push_back(it->second); inst.argumentTypes.push_back(irValueTypeName(localValueTypes_[capture])); inst.argumentValueTypes.push_back(localValueTypes_[capture]);
+				}
+				for (const auto& argument : node.arguments) { auto v=lowerExpr(argument); inst.args.push_back(v); inst.argumentTypes.push_back(argumentTypeName(argument)); inst.argumentValueTypes.push_back(lastValueType_); }
+				inst.callSignature = inst.callee; emit(std::move(inst)); lastValueType_ = irValueTypeFromName(routineReturnTypes_[cb->second.functionName]); return dest;
+			}
+			auto lt = localValueTypes_.find(variable->name);
+			if (lt != localValueTypes_.end() && lt->second.kind == IRValueKind::Closure) {
+				auto dest=allocateVReg(); inst.dest=dest; inst.op=IROpcode::CallClosure; inst.args.push_back(lowerVariable(variable->name));
+				for(const auto& argument:node.arguments){auto v=lowerExpr(argument);inst.args.push_back(v);inst.argumentTypes.push_back(argumentTypeName(argument));inst.argumentValueTypes.push_back(lastValueType_);}
+				inst.valueType=makeIRIntType(); inst.returnType="value"; emit(inst); lastValueType_=inst.valueType; return dest;
+			}
+		}
+		auto dest = allocateVReg();
+		inst.dest = dest;
+		inst.op = IROpcode::Call;
+		inst.callee = calleeName(node.callee);
+		inst.returnType = callReturnType(node.callee);
+		inst.typeName = inst.returnType;
+		inst.callSignature = calleeSignature(node.callee);
+		inst.valueType = irValueTypeFromName(inst.returnType);
+		for (const auto& argument : node.arguments) {
+			auto argumentValue = lowerExpr(argument);
+			inst.args.push_back(argumentValue);
+			inst.argumentTypes.push_back(argumentTypeName(argument));
+			inst.argumentValueTypes.push_back(lastValueType_);
+		}
+		emit(std::move(inst));
+		lastValueType_ = inst.valueType;
+		return dest;
+	}
+
+	std::string callReturnType(const ExprPtr& callee) {
+		if (!callee) {
+			return "unknown";
+		}
+		if (const auto* variable = std::get_if<VariableExpr>(&callee->node)) {
+			auto it = locals_.find(variable->name);
 			if (it != locals_.end()) {
-				return it->second;
+				return "value";
 			}
-			VReg value = allocateVReg();
-			locals_[name] = value;
-			return value;
-		}
-
-		VReg lowerUnary(const UnaryExpr& node) {
-			IRInstruction inst;
-			auto dest = allocateVReg();
-			inst.dest = dest;
-			inst.valueType = node.op == "!" || node.op == "not" ? makeIRBoolType() : makeIRIntType();
-			inst.args.push_back(lowerExpr(node.operand));
-			if (node.op == "-") {
-				inst.op = IROpcode::Neg;
+			if (variable->name == "print") {
+				return "void";
 			}
-			else if (node.op == "~") {
-				inst.op = IROpcode::BitNot;
-			}
-			else if (node.op == "!" || node.op == "not") {
-				inst.op = IROpcode::Not;
-			}
-			else {
-				inst.op = IROpcode::Nop;
-			}
-			emit(std::move(inst));
-			lastValueType_ = inst.valueType;
-			return dest;
-		}
-
-		VReg lowerBinary(const BinaryExpr& node) {
-			IRInstruction inst;
-			auto dest = allocateVReg();
-			inst.dest = dest;
-			inst.valueType = binaryValueType(node.op);
-			inst.args.push_back(lowerExpr(node.left));
-			inst.args.push_back(lowerExpr(node.right));
-			if (node.op == "+") inst.op = IROpcode::Add;
-			else if (node.op == "-") inst.op = IROpcode::Sub;
-			else if (node.op == "*") inst.op = IROpcode::Mul;
-			else if (node.op == "/") inst.op = IROpcode::Div;
-			else if (node.op == "%") inst.op = IROpcode::Mod;
-			else if (node.op == "&") inst.op = IROpcode::BitAnd;
-			else if (node.op == "|") inst.op = IROpcode::BitOr;
-			else if (node.op == "^") inst.op = IROpcode::BitXor;
-			else if (node.op == "<<") inst.op = IROpcode::Shl;
-			else if (node.op == ">>") inst.op = IROpcode::Shr;
-			else if (node.op == "and" || node.op == "&&") inst.op = IROpcode::And;
-			else if (node.op == "or" || node.op == "||") inst.op = IROpcode::Or;
-			else if (node.op == "==") inst.op = IROpcode::Eq;
-			else if (node.op == "!=") inst.op = IROpcode::Ne;
-			else if (node.op == "<") inst.op = IROpcode::Lt;
-			else if (node.op == "<=") inst.op = IROpcode::Le;
-			else if (node.op == ">") inst.op = IROpcode::Gt;
-			else if (node.op == ">=") inst.op = IROpcode::Ge;
-			else inst.op = IROpcode::Nop;
-			emit(std::move(inst));
-			lastValueType_ = inst.valueType;
-			return dest;
-		}
-
-		VReg lowerCall(const CallExpr& node) {
-			IRInstruction inst;
-			auto dest = allocateVReg();
-			inst.dest = dest;
-			inst.op = IROpcode::Call;
-			inst.callee = calleeName(node.callee);
-			inst.returnType = callReturnType(node.callee);
-			inst.typeName = inst.returnType;
-			inst.callSignature = calleeSignature(node.callee);
-			inst.valueType = irValueTypeFromName(inst.returnType);
-			for (const auto& argument : node.arguments) {
-				auto argumentValue = lowerExpr(argument);
-				inst.args.push_back(argumentValue);
-				inst.argumentTypes.push_back(argumentTypeName(argument));
-				inst.argumentValueTypes.push_back(lastValueType_);
-			}
-			emit(std::move(inst));
-			lastValueType_ = inst.valueType;
-			return dest;
-		}
-
-		std::string callReturnType(const ExprPtr& callee) {
-			if (!callee) {
-				return "unknown";
-			}
-			if (const auto* variable = std::get_if<VariableExpr>(&callee->node)) {
-				auto it = locals_.find(variable->name);
-				if (it != locals_.end()) {
-					return "value";
-				}
-				if (variable->name == "print") {
-					return "void";
-				}
-				auto signature = routineReturnTypes_.find(variable->name);
-				if (signature != routineReturnTypes_.end()) {
-					return signature->second;
-				}
-			}
-			return "value";
-		}
-
-		std::string argumentTypeName(const ExprPtr& expr) const {
-			if (!expr) {
-				return "unknown";
-			}
-			return std::visit([&](const auto& node) -> std::string {
-				using T = std::decay_t<decltype(node)>;
-				if constexpr (std::is_same_v<T, BoolExpr>) {
-					return "bool";
-				}
-				else if constexpr (std::is_same_v<T, NumberExpr>) {
-					return "number";
-				}
-				else if constexpr (std::is_same_v<T, StringExpr>) {
-					return "string";
-				}
-				else if constexpr (std::is_same_v<T, NullExpr>) {
-					return "null";
-				}
-				else {
-					return "value";
-				}
-				}, expr->node);
-		}
-
-		std::string calleeName(const ExprPtr& callee) {
-			if (!callee) {
-				return "<unknown>";
-			}
-			if (const auto* variable = std::get_if<VariableExpr>(&callee->node)) {
-				return variable->name;
-			}
-			return "<expr>";
-		}
-
-		VReg emitConst(IROpcode op, const std::string& text) {
-			IRInstruction inst;
-			inst.op = op;
-			auto dest = allocateVReg();
-			inst.dest = dest;
-			inst.literalText = text;
-			inst.valueType = op == IROpcode::ConstString ? makeIRStringType() : makeIRIntType();
-			emit(std::move(inst));
-			return dest;
-		}
-
-		VReg emitBool(bool value) {
-			IRInstruction inst;
-			inst.op = IROpcode::ConstBool;
-			auto dest = allocateVReg();
-			inst.dest = dest;
-			inst.valueType = makeIRBoolType();
-			inst.hasImmediate = true;
-			inst.immediate = value ? 1 : 0;
-			emit(std::move(inst));
-			return dest;
-		}
-
-		VReg makeNullValue() {
-			IRInstruction inst;
-			inst.op = IROpcode::ConstNull;
-			auto dest = allocateVReg();
-			inst.dest = dest;
-			inst.valueType = makeIRNullType();
-			emit(std::move(inst));
-			return dest;
-		}
-
-		void emitBranch(BlockID target) {
-			IRInstruction inst;
-			inst.op = IROpcode::Branch;
-			inst.targetBlocks.push_back(target);
-			inst.valueType = makeIRVoidType();
-			emit(std::move(inst));
-			currentTerminated_ = true;
-		}
-
-		void emit(IRInstruction inst) {
-			ensureActiveBlock();
-			inst.blockLabel = currentBlock().labelName;
-			currentBlock().instructions.push_back(std::move(inst));
-		}
-
-		IRBasicBlock& currentBlock() {
-			return blocks_[static_cast<std::size_t>(static_cast<std::uint32_t>(currentBlock_) - 1)];
-		}
-
-		void ensureActiveBlock() {
-			if (currentBlock_ == BlockID::None) {
-				currentBlock_ = createBlock("block");
-				currentTerminated_ = false;
-			}
-			if (currentTerminated_) {
-				currentBlock_ = createBlock("dead");
-				currentTerminated_ = false;
+			auto signature = routineReturnTypes_.find(variable->name);
+			if (signature != routineReturnTypes_.end()) {
+				return signature->second;
 			}
 		}
-
-		BlockID createBlock(const std::string& label) {
-			BlockID id = static_cast<BlockID>(nextBlock_++);
-			blocks_.push_back({ id, blockLabel(id) + "_" + label, makeIRVoidType(), {}, {}, {} });
-			return id;
-		}
-
-		VReg allocateVReg() {
-			return static_cast<VReg>(nextVreg_++);
-		}
-
-		std::unordered_map<std::string, std::string> routineReturnTypes_;
-		std::vector<IRBasicBlock> blocks_;
-		std::unordered_map<std::string, VReg> locals_;
-		std::unordered_map<std::string, IRValueType> localValueTypes_;
-		VReg lastValue_ = VReg::None;
-		IRValueType lastValueType_ = makeIRUnknownType();
-		std::uint32_t nextVreg_ = 1;
-		std::uint32_t nextBlock_ = 1;
-		BlockID currentBlock_ = BlockID::None;
-		bool currentTerminated_ = false;
-		std::vector<BlockID> loopBreakTargets_;
-		std::vector<BlockID> loopContinueTargets_;
-	};
-
-	IRProgram lowerProgramToIR(const Program& program) {
-		IRLowerer lowerer;
-		return lowerer.lower(program);
+		return "value";
 	}
 
-	void printSemanticDiagnostics(const SemanticAnalysisResult& analysis) {
-		for (const auto& diagnostic : analysis.diagnostics) {
-			std::cerr << "semantic error";
-			if (diagnostic.location.line != 0 || diagnostic.location.column != 0) {
-				std::cerr << " at " << diagnostic.location.line << ":" << diagnostic.location.column;
+	std::string argumentTypeName(const ExprPtr& expr) const {
+		if (!expr) {
+			return "unknown";
+		}
+		return std::visit([&](const auto& node) -> std::string {
+			using T = std::decay_t<decltype(node)>;
+			if constexpr (std::is_same_v<T, BoolExpr>) {
+				return "bool";
+			} else if constexpr (std::is_same_v<T, NumberExpr>) {
+				return "number";
+			} else if constexpr (std::is_same_v<T, StringExpr>) {
+				return "string";
+			} else if constexpr (std::is_same_v<T, NullExpr>) {
+				return "null";
+			} else {
+				return "value";
 			}
-			std::cerr << ": " << diagnostic.message << "\n";
+		}, expr->node);
+	}
+
+	std::string calleeName(const ExprPtr& callee) {
+		if (!callee) {
+			return "<unknown>";
+		}
+		if (const auto* variable = std::get_if<VariableExpr>(&callee->node)) {
+			return variable->name;
+		}
+		return "<expr>";
+	}
+
+	VReg emitConst(IROpcode op, const std::string& text) {
+		IRInstruction inst;
+		inst.op = op;
+		auto dest = allocateVReg();
+		inst.dest = dest;
+		inst.literalText = text;
+		inst.valueType = op == IROpcode::ConstString ? makeIRStringType() : makeIRIntType();
+		emit(std::move(inst));
+		return dest;
+	}
+
+	VReg emitBool(bool value) {
+		IRInstruction inst;
+		inst.op = IROpcode::ConstBool;
+		auto dest = allocateVReg();
+		inst.dest = dest;
+		inst.valueType = makeIRBoolType();
+		inst.hasImmediate = true;
+		inst.immediate = value ? 1 : 0;
+		emit(std::move(inst));
+		return dest;
+	}
+
+	VReg makeNullValue() {
+		IRInstruction inst;
+		inst.op = IROpcode::ConstNull;
+		auto dest = allocateVReg();
+		inst.dest = dest;
+		inst.valueType = makeIRNullType();
+		emit(std::move(inst));
+		return dest;
+	}
+
+	void emitBranch(BlockID target) {
+		IRInstruction inst;
+		inst.op = IROpcode::Branch;
+		inst.targetBlocks.push_back(target);
+		inst.valueType = makeIRVoidType();
+		emit(std::move(inst));
+		currentTerminated_ = true;
+	}
+
+	void emit(IRInstruction inst) {
+		ensureActiveBlock();
+		inst.blockLabel = currentBlock().labelName;
+		currentBlock().instructions.push_back(std::move(inst));
+	}
+
+	IRBasicBlock& currentBlock() {
+		return blocks_[static_cast<std::size_t>(static_cast<std::uint32_t>(currentBlock_) - 1)];
+	}
+
+	void ensureActiveBlock() {
+		if (currentBlock_ == BlockID::None) {
+			currentBlock_ = createBlock("block");
+			currentTerminated_ = false;
+		}
+		if (currentTerminated_) {
+			currentBlock_ = createBlock("dead");
+			currentTerminated_ = false;
 		}
 	}
 
-	// --- IR emitter -------------------------------------------------------------
-	class CppIREmitter {
-	public:
-		std::string emit(const IRProgram& program) const {
-			std::ostringstream oss;
-			oss << "#include <cstdint>\n#include <cstdlib>\n#include <limits>\n\n";
-			oss << "static std::int64_t pcn_add(std::int64_t a, std::int64_t b) { return static_cast<std::int64_t>(static_cast<std::uint64_t>(a) + static_cast<std::uint64_t>(b)); }\n";
-			oss << "static std::int64_t pcn_sub(std::int64_t a, std::int64_t b) { return static_cast<std::int64_t>(static_cast<std::uint64_t>(a) - static_cast<std::uint64_t>(b)); }\n";
-			oss << "static std::int64_t pcn_mul(std::int64_t a, std::int64_t b) { return static_cast<std::int64_t>(static_cast<std::uint64_t>(a) * static_cast<std::uint64_t>(b)); }\n";
-			oss << "static std::int64_t pcn_neg(std::int64_t a) { return static_cast<std::int64_t>(0ull - static_cast<std::uint64_t>(a)); }\n";
-			oss << "static std::int64_t pcn_div(std::int64_t a, std::int64_t b) { if (b == 0) std::abort(); if (a == std::numeric_limits<std::int64_t>::min() && b == -1) return a; return a / b; }\n";
-			oss << "static std::int64_t pcn_mod(std::int64_t a, std::int64_t b) { if (b == 0) std::abort(); if (a == std::numeric_limits<std::int64_t>::min() && b == -1) return 0; return a % b; }\n";
-			oss << "static std::int64_t pcn_shl(std::int64_t a, std::int64_t b) { return static_cast<std::int64_t>(static_cast<std::uint64_t>(a) << (static_cast<std::uint64_t>(b) & 63u)); }\n";
-			oss << "static std::int64_t pcn_shr(std::int64_t a, std::int64_t b) { return a >> (static_cast<std::uint64_t>(b) & 63u); }\n\n";
+	BlockID createBlock(const std::string& label) {
+		BlockID id = static_cast<BlockID>(nextBlock_++);
+		blocks_.push_back({id, blockLabel(id) + "_" + label, makeIRVoidType(), {}, {}, {}});
+		return id;
+	}
 
-			for (const auto& decl : program.declarationSummaries) emitDeclarationSummary(oss, decl);
-			if (!program.declarationSummaries.empty()) oss << "\n";
-			for (const auto& function : program.functions) emitPrototype(oss, function);
-			if (!program.functions.empty()) oss << "\n";
-			for (const auto& function : program.functions) emitFunction(oss, function);
+	VReg allocateVReg() {
+		return static_cast<VReg>(nextVreg_++);
+	}
 
-			const IRFunction* entry = nullptr;
-			for (const auto& function : program.functions) if (function.name == "main" && function.parameterNames.empty()) { entry = &function; break; }
-			oss << "int main() {";
-			if (entry) {
-				if (entry->returnType == "void") oss << " " << cppFunctionName(entry->name) << "(); return 0; ";
-				else oss << " return static_cast<int>(" << cppFunctionName(entry->name) << "()); ";
+	struct ClosureBinding { std::string functionName; std::vector<std::string> captures; };
+	std::unordered_map<std::string, std::string> routineReturnTypes_;
+	std::unordered_map<std::string, std::vector<Parameter>> routineParameters_;
+	std::unordered_map<std::string, ClosureBinding> closureBindings_;
+	std::unordered_set<std::string> nominalTypeNames_;
+	std::string currentReturnType_;
+	std::vector<IRBasicBlock> blocks_;
+	std::unordered_map<std::string, VReg> locals_;
+	std::unordered_map<std::string, IRValueType> localValueTypes_;
+	VReg lastValue_ = VReg::None;
+	IRValueType lastValueType_ = makeIRUnknownType();
+	std::uint32_t nextVreg_ = 1;
+	std::uint32_t nextBlock_ = 1;
+	BlockID currentBlock_ = BlockID::None;
+	bool currentTerminated_ = false;
+	std::vector<BlockID> loopBreakTargets_;
+	std::vector<BlockID> loopContinueTargets_;
+};
+
+IRProgram lowerProgramToIR(const Program& program) {
+	IRLowerer lowerer;
+	return lowerer.lower(program);
+}
+
+void printSemanticDiagnostics(const SemanticAnalysisResult& analysis) {
+	for (const auto& diagnostic : analysis.diagnostics) {
+		std::cerr << "semantic error";
+		if (diagnostic.location.line != 0 || diagnostic.location.column != 0) {
+			std::cerr << " at " << diagnostic.location.line << ":" << diagnostic.location.column;
+		}
+		std::cerr << ": " << diagnostic.message << "\n";
+	}
+}
+
+// --- PCIR verification, optimization and semantic oracle --------------------
+class PCIRVerifier {
+public:
+    std::vector<std::string> verify(const IRProgram& program) const {
+        std::vector<std::string> errors;
+        std::unordered_set<std::string> functions;
+        for (const auto& fn : program.functions) {
+            if (!functions.insert(fn.name).second) errors.push_back("duplicate PCIR function: " + fn.name);
+            verifyFunction(fn, errors);
+        }
+        return errors;
+    }
+
+private:
+    static bool isTerminator(IROpcode op) {
+        return op == IROpcode::Branch || op == IROpcode::BranchIf || op == IROpcode::Return;
+    }
+
+    void verifyFunction(const IRFunction& fn, std::vector<std::string>& errors) const {
+        if (fn.blocks.empty()) { errors.push_back(fn.name + ": has no basic blocks"); return; }
+        std::unordered_set<std::uint32_t> blockIds;
+        for (const auto& b : fn.blocks) blockIds.insert(static_cast<std::uint32_t>(b.id));
+        auto validReg = [&](VReg r) {
+            auto v = static_cast<std::uint32_t>(r);
+            return r != VReg::None && v <= fn.totalVregs;
+        };
+        for (const auto& p : fn.parameterVregs) if (!validReg(p)) errors.push_back(fn.name + ": invalid parameter vreg");
+        for (const auto& block : fn.blocks) {
+            if (block.id == BlockID::None) errors.push_back(fn.name + ": block has invalid id 0");
+            bool terminated = false;
+            auto checkInst = [&](const IRInstruction& inst, bool phi) {
+                if (inst.dest != VReg::None && !validReg(inst.dest)) errors.push_back(fn.name + ": instruction destination outside vreg file");
+                for (auto arg : inst.args) if (!validReg(arg)) errors.push_back(fn.name + ": instruction uses invalid vreg");
+                for (auto [pred, value] : inst.phiInputs) {
+                    if (pred != BlockID::None && !blockIds.contains(static_cast<std::uint32_t>(pred))) errors.push_back(fn.name + ": phi references invalid predecessor");
+                    if (!validReg(value)) errors.push_back(fn.name + ": phi uses invalid vreg");
+                }
+                for (auto target : inst.targetBlocks) if (!blockIds.contains(static_cast<std::uint32_t>(target))) errors.push_back(fn.name + ": branch references invalid block");
+                if (phi && inst.op != IROpcode::Phi) errors.push_back(fn.name + ": non-phi instruction in phi list");
+            };
+            for (const auto& phi : block.phiNodes) checkInst(phi, true);
+            for (std::size_t i = 0; i < block.instructions.size(); ++i) {
+                const auto& inst = block.instructions[i];
+                checkInst(inst, false);
+                if (terminated) errors.push_back(fn.name + ": instruction appears after terminator in " + block.labelName);
+                if (isTerminator(inst.op)) terminated = true;
+                if (isTerminator(inst.op) && i + 1 != block.instructions.size()) errors.push_back(fn.name + ": terminator is not final instruction in " + block.labelName);
+                if (inst.op == IROpcode::Branch && inst.targetBlocks.size() != 1) errors.push_back(fn.name + ": branch requires one target");
+                if (inst.op == IROpcode::BranchIf && (inst.targetBlocks.size() != 2 || inst.args.size() != 1)) errors.push_back(fn.name + ": conditional branch shape invalid");
+            }
+        }
+    }
+};
+
+class PCIROptimizer {
+public:
+    explicit PCIROptimizer(int level = 2) : level_(std::clamp(level, 0, 3)) {}
+
+    void optimize(IRProgram& program) const {
+        if (level_ == 0) return;
+        for (auto& fn : program.functions) {
+            for (auto& block : fn.blocks) foldBlock(block);
+            if (level_ >= 2) removeDeadPureInstructions(fn);
+            if (level_ >= 3) removeUnreachableBlocks(fn);
+        }
+    }
+
+private:
+    struct Constant { bool known = false; std::int64_t value = 0; bool boolean = false; };
+
+    static bool pure(IROpcode op) {
+        switch (op) {
+        case IROpcode::ConstInt: case IROpcode::ConstBool: case IROpcode::ConstNull: case IROpcode::Copy:
+        case IROpcode::Add: case IROpcode::Sub: case IROpcode::Mul: case IROpcode::BitAnd: case IROpcode::BitOr:
+        case IROpcode::BitXor: case IROpcode::Shl: case IROpcode::Shr: case IROpcode::Neg: case IROpcode::BitNot:
+        case IROpcode::Not: case IROpcode::Eq: case IROpcode::Ne: case IROpcode::Lt: case IROpcode::Le:
+        case IROpcode::Gt: case IROpcode::Ge: case IROpcode::And: case IROpcode::Or:
+        case IROpcode::MakeAggregate: case IROpcode::ExtractField: case IROpcode::ResultOk: case IROpcode::ResultErr:
+        case IROpcode::OptionSome: case IROpcode::OptionNone: case IROpcode::MakeClosure: return true;
+        default: return false;
+        }
+    }
+
+    static std::optional<std::int64_t> eval(IROpcode op, std::int64_t a, std::int64_t b = 0) {
+        auto u = [](std::int64_t x) { return static_cast<std::uint64_t>(x); };
+        switch (op) {
+        case IROpcode::Add: return static_cast<std::int64_t>(u(a) + u(b));
+        case IROpcode::Sub: return static_cast<std::int64_t>(u(a) - u(b));
+        case IROpcode::Mul: return static_cast<std::int64_t>(u(a) * u(b));
+        case IROpcode::Div:
+            if (b == 0) return std::nullopt;
+            if (a == std::numeric_limits<std::int64_t>::min() && b == -1) return a;
+            return a / b;
+        case IROpcode::Mod:
+            if (b == 0) return std::nullopt;
+            if (a == std::numeric_limits<std::int64_t>::min() && b == -1) return 0;
+            return a % b;
+        case IROpcode::BitAnd: return a & b;
+        case IROpcode::BitOr: return a | b;
+        case IROpcode::BitXor: return a ^ b;
+        case IROpcode::Shl: return static_cast<std::int64_t>(u(a) << (u(b) & 63u));
+        case IROpcode::Shr: return a >> (u(b) & 63u);
+        case IROpcode::Neg: return static_cast<std::int64_t>(0u - u(a));
+        case IROpcode::BitNot: return ~a;
+        case IROpcode::Not: return a == 0 ? 1 : 0;
+        case IROpcode::Eq: return a == b; case IROpcode::Ne: return a != b;
+        case IROpcode::Lt: return a < b; case IROpcode::Le: return a <= b;
+        case IROpcode::Gt: return a > b; case IROpcode::Ge: return a >= b;
+        case IROpcode::And: return (a != 0) && (b != 0); case IROpcode::Or: return (a != 0) || (b != 0);
+        default: return std::nullopt;
+        }
+    }
+
+    void foldBlock(IRBasicBlock& block) const {
+        std::unordered_map<std::uint32_t, Constant> constants;
+        auto key = [](VReg v) { return static_cast<std::uint32_t>(v); };
+        for (auto& inst : block.instructions) {
+            if (inst.op == IROpcode::ConstInt) {
+                try { constants[key(inst.dest)] = {true, std::stoll(inst.literalText), false}; } catch (...) { constants.erase(key(inst.dest)); }
+                continue;
+            }
+            if (inst.op == IROpcode::ConstBool) { constants[key(inst.dest)] = {true, inst.immediate ? 1 : 0, true}; continue; }
+            if (inst.op == IROpcode::ConstNull) { constants[key(inst.dest)] = {true, 0, false}; continue; }
+            if (inst.op == IROpcode::Copy && inst.args.size() == 1) {
+                auto it = constants.find(key(inst.args[0]));
+                if (it != constants.end()) constants[key(inst.dest)] = it->second; else constants.erase(key(inst.dest));
+                continue;
+            }
+            if (inst.op == IROpcode::BranchIf && inst.args.size() == 1 && inst.targetBlocks.size() == 2) {
+                auto it = constants.find(key(inst.args[0]));
+                if (it != constants.end() && it->second.known) {
+                    BlockID target = it->second.value ? inst.targetBlocks[0] : inst.targetBlocks[1];
+                    inst.op = IROpcode::Branch; inst.args.clear(); inst.targetBlocks = {target};
+                }
+                continue;
+            }
+            if (pure(inst.op) && inst.dest != VReg::None && (inst.args.size() == 1 || inst.args.size() == 2)) {
+                auto a = constants.find(key(inst.args[0]));
+                auto b = inst.args.size() == 2 ? constants.find(key(inst.args[1])) : constants.end();
+                if (a != constants.end() && (inst.args.size() == 1 || b != constants.end())) {
+                    auto value = eval(inst.op, a->second.value, inst.args.size() == 2 ? b->second.value : 0);
+                    if (value) {
+                        bool isBool = inst.valueType.kind == IRValueKind::Bool;
+                        inst.op = isBool ? IROpcode::ConstBool : IROpcode::ConstInt;
+                        inst.args.clear(); inst.targetBlocks.clear(); inst.phiInputs.clear();
+                        inst.hasImmediate = isBool;
+                        inst.immediate = *value;
+                        inst.literalText = isBool ? std::string{} : std::to_string(*value);
+                        constants[key(inst.dest)] = {true, *value, isBool};
+                        continue;
+                    }
+                }
+                constants.erase(key(inst.dest));
+            } else if (inst.dest != VReg::None) constants.erase(key(inst.dest));
+        }
+    }
+
+    void removeDeadPureInstructions(IRFunction& fn) const {
+        std::unordered_map<std::uint32_t, std::size_t> uses;
+        for (const auto& b : fn.blocks) {
+            for (const auto& phi : b.phiNodes) for (auto [pred, v] : phi.phiInputs) { (void)pred; ++uses[static_cast<std::uint32_t>(v)]; }
+            for (const auto& i : b.instructions) for (auto v : i.args) ++uses[static_cast<std::uint32_t>(v)];
+        }
+        for (auto& b : fn.blocks) {
+            b.instructions.erase(std::remove_if(b.instructions.begin(), b.instructions.end(), [&](const IRInstruction& i) {
+                return i.dest != VReg::None && pure(i.op) && uses[static_cast<std::uint32_t>(i.dest)] == 0;
+            }), b.instructions.end());
+        }
+    }
+
+    void removeUnreachableBlocks(IRFunction& fn) const {
+        if (fn.blocks.empty()) return;
+        std::unordered_map<std::uint32_t, const IRBasicBlock*> byId;
+        for (const auto& b : fn.blocks) byId[static_cast<std::uint32_t>(b.id)] = &b;
+        std::unordered_set<std::uint32_t> live;
+        std::vector<std::uint32_t> work{static_cast<std::uint32_t>(fn.blocks.front().id)};
+        while (!work.empty()) {
+            auto id = work.back(); work.pop_back(); if (!live.insert(id).second) continue;
+            auto it = byId.find(id); if (it == byId.end()) continue;
+            for (const auto& inst : it->second->instructions) for (auto t : inst.targetBlocks) work.push_back(static_cast<std::uint32_t>(t));
+        }
+        fn.blocks.erase(std::remove_if(fn.blocks.begin(), fn.blocks.end(), [&](const IRBasicBlock& b) { return !live.contains(static_cast<std::uint32_t>(b.id)); }), fn.blocks.end());
+    }
+
+    int level_ = 2;
+};
+
+class PCIRInterpreter {
+public:
+    explicit PCIRInterpreter(const IRProgram& program) : program_(program) {
+        for (const auto& fn : program.functions) functions_[fn.name] = &fn;
+    }
+
+    std::int64_t run(const std::string& entry = {}) {
+        const IRFunction* fn = selectEntry(entry);
+        if (!fn) throw std::runtime_error("no zero-argument entry routine (expected main, answer, or first zero-argument routine)");
+        return execute(*fn, {});
+    }
+
+private:
+    const IRFunction* selectEntry(const std::string& requested) const {
+        if (!requested.empty()) { auto it = functions_.find(requested); return it == functions_.end() ? nullptr : it->second; }
+        for (const char* name : {"main", "answer", "start"}) {
+            auto it = functions_.find(name); if (it != functions_.end() && it->second->parameterVregs.empty()) return it->second;
+        }
+        for (const auto& fn : program_.functions) if (fn.parameterVregs.empty()) return &fn;
+        return nullptr;
+    }
+
+    static std::int64_t binary(IROpcode op, std::int64_t a, std::int64_t b) {
+        auto u = [](std::int64_t x) { return static_cast<std::uint64_t>(x); };
+        switch (op) {
+        case IROpcode::Add: return static_cast<std::int64_t>(u(a) + u(b));
+        case IROpcode::Sub: return static_cast<std::int64_t>(u(a) - u(b));
+        case IROpcode::Mul: return static_cast<std::int64_t>(u(a) * u(b));
+        case IROpcode::Div: if (!b) throw std::runtime_error("Paracine trap: division by zero"); if (a == std::numeric_limits<std::int64_t>::min() && b == -1) return a; return a / b;
+        case IROpcode::Mod: if (!b) throw std::runtime_error("Paracine trap: remainder by zero"); if (a == std::numeric_limits<std::int64_t>::min() && b == -1) return 0; return a % b;
+        case IROpcode::BitAnd: return a & b; case IROpcode::BitOr: return a | b; case IROpcode::BitXor: return a ^ b;
+        case IROpcode::Shl: return static_cast<std::int64_t>(u(a) << (u(b) & 63u)); case IROpcode::Shr: return a >> (u(b) & 63u);
+        case IROpcode::Eq: return a == b; case IROpcode::Ne: return a != b; case IROpcode::Lt: return a < b; case IROpcode::Le: return a <= b; case IROpcode::Gt: return a > b; case IROpcode::Ge: return a >= b;
+        case IROpcode::And: return (a != 0) && (b != 0); case IROpcode::Or: return (a != 0) || (b != 0);
+        default: throw std::runtime_error("PCIR interpreter: unsupported binary opcode");
+        }
+    }
+
+    std::int64_t execute(const IRFunction& fn, const std::vector<std::int64_t>& args) {
+        if (callDepth_++ > 1024) throw std::runtime_error("Paracine trap: recursion limit exceeded in PCIR oracle");
+        struct Guard { std::size_t& d; ~Guard(){--d;} } guard{callDepth_};
+        std::vector<std::int64_t> regs(fn.totalVregs + 1, 0);
+        for (std::size_t i = 0; i < std::min(args.size(), fn.parameterVregs.size()); ++i) regs[static_cast<std::uint32_t>(fn.parameterVregs[i])] = args[i];
+        std::unordered_map<std::uint32_t, std::size_t> blockIndex;
+        for (std::size_t i = 0; i < fn.blocks.size(); ++i) blockIndex[static_cast<std::uint32_t>(fn.blocks[i].id)] = i;
+        std::size_t current = 0; BlockID predecessor = BlockID::None; std::size_t steps = 0;
+        while (steps++ < 10000000) {
+            const auto& block = fn.blocks.at(current);
+            for (const auto& phi : block.phiNodes) {
+                if (phi.dest == VReg::None || phi.phiInputs.empty()) continue;
+                VReg selected = phi.phiInputs.front().second;
+                for (auto [pred, value] : phi.phiInputs) if (pred == predecessor) { selected = value; break; }
+                regs[static_cast<std::uint32_t>(phi.dest)] = regs[static_cast<std::uint32_t>(selected)];
+            }
+            bool jumped = false;
+            for (const auto& inst : block.instructions) {
+                auto get = [&](std::size_t n) { return regs.at(static_cast<std::uint32_t>(inst.args.at(n))); };
+                auto set = [&](std::int64_t v) { if (inst.dest != VReg::None) regs.at(static_cast<std::uint32_t>(inst.dest)) = v; };
+                switch (inst.op) {
+                case IROpcode::ConstInt: set(std::stoll(inst.literalText)); break;
+                case IROpcode::ConstBool: set(inst.immediate ? 1 : 0); break;
+                case IROpcode::ConstNull: set(0); break;
+                case IROpcode::Copy: set(get(0)); break;
+                case IROpcode::Neg: set(static_cast<std::int64_t>(0u - static_cast<std::uint64_t>(get(0)))); break;
+                case IROpcode::BitNot: set(~get(0)); break;
+                case IROpcode::Not: set(get(0) == 0); break;
+                case IROpcode::Add: case IROpcode::Sub: case IROpcode::Mul: case IROpcode::Div: case IROpcode::Mod:
+                case IROpcode::BitAnd: case IROpcode::BitOr: case IROpcode::BitXor: case IROpcode::Shl: case IROpcode::Shr:
+                case IROpcode::Eq: case IROpcode::Ne: case IROpcode::Lt: case IROpcode::Le: case IROpcode::Gt: case IROpcode::Ge:
+                case IROpcode::And: case IROpcode::Or: set(binary(inst.op, get(0), get(1))); break;
+                case IROpcode::Branch: predecessor = block.id; current = blockIndex.at(static_cast<std::uint32_t>(inst.targetBlocks.at(0))); jumped = true; break;
+                case IROpcode::BranchIf: predecessor = block.id; current = blockIndex.at(static_cast<std::uint32_t>(get(0) ? inst.targetBlocks.at(0) : inst.targetBlocks.at(1))); jumped = true; break;
+                case IROpcode::Call: {
+                    std::vector<std::int64_t> callArgs; for (auto v : inst.args) callArgs.push_back(regs.at(static_cast<std::uint32_t>(v)));
+                    if (inst.callee == "print" || inst.callee == "println") {
+                        if (!callArgs.empty()) std::cout << callArgs.front();
+                        if (inst.callee == "println") std::cout << '\n';
+                        set(0);
+                    } else {
+                        auto it = functions_.find(inst.callee); if (it == functions_.end()) throw std::runtime_error("PCIR oracle unresolved call: " + inst.callee);
+                        set(execute(*it->second, callArgs));
+                    }
+                    break;
+                }
+                case IROpcode::CallClosure: throw std::runtime_error("PCIR oracle indirect closure invocation requires closure runtime legalization");
+                case IROpcode::ResultOk: set(static_cast<std::int64_t>(static_cast<std::uint64_t>(get(0)) << 1)); break;
+                case IROpcode::ResultErr: set(static_cast<std::int64_t>((static_cast<std::uint64_t>(get(0)) << 1) | 1u)); break;
+                case IROpcode::ResultTry: { auto packed=get(0); if ((static_cast<std::uint64_t>(packed)&1u)!=0u) return packed; set(packed >> 1); break; }
+                case IROpcode::OptionSome: set(static_cast<std::int64_t>((static_cast<std::uint64_t>(get(0)) << 1) | 1u)); break;
+                case IROpcode::OptionNone: set(0); break;
+                case IROpcode::MakeAggregate: case IROpcode::ExtractField: case IROpcode::MakeClosure:
+                    throw std::runtime_error("PCIR oracle aggregate/closure value runtime is not implemented yet");
+                case IROpcode::Return: return inst.args.empty() ? 0 : get(0);
+                case IROpcode::Phi: case IROpcode::Nop: break;
+                case IROpcode::ConstString: throw std::runtime_error("PCIR oracle string runtime is not implemented in this native-core build");
+                }
+                if (jumped) break;
+            }
+            if (!jumped) return 0;
+        }
+        throw std::runtime_error("Paracine trap: PCIR execution step limit exceeded");
+    }
+
+    const IRProgram& program_;
+    std::unordered_map<std::string, const IRFunction*> functions_;
+    std::size_t callDepth_ = 0;
+};
+
+// --- PMIR: target-aware Windows x86-64 machine representation ---------------
+enum class PMIROpcode {
+    ConstInt, ConstBool, ConstNull, Copy, Add, Sub, Mul, Div, Mod, BitAnd, BitOr, BitXor,
+    Shl, Shr, Neg, BitNot, Not, Eq, Ne, Lt, Le, Gt, Ge, And, Or, Branch, BranchIf, Call, Return, Nop
+};
+
+struct PMIRInstruction {
+    PMIROpcode op = PMIROpcode::Nop;
+    std::uint32_t destSlot = 0;
+    std::vector<std::uint32_t> srcSlots;
+    std::vector<std::uint32_t> targets;
+    std::string callee;
+    std::int64_t immediate = 0;
+    bool hasImmediate = false;
+};
+
+struct PMIRBlock { std::uint32_t id = 0; std::string label; std::vector<PMIRInstruction> instructions; };
+struct PMIRFunction {
+    std::string name; std::string returnType; std::vector<std::uint32_t> parameterSlots;
+    std::vector<PMIRBlock> blocks; std::uint32_t frameSize = 0; std::uint32_t outgoingArea = 32; std::uint32_t totalSlots = 0;
+};
+struct PMIRProgram { std::vector<PMIRFunction> functions; };
+
+class PMIRLowerer {
+public:
+    PMIRProgram lower(const IRProgram& ir) const {
+        PMIRProgram out;
+        for (const auto& fn : ir.functions) out.functions.push_back(lowerFunction(fn));
+        return out;
+    }
+private:
+    static std::uint32_t align16(std::uint32_t v) { return (v + 15u) & ~15u; }
+    static PMIROpcode map(IROpcode op) {
+        switch (op) {
+        case IROpcode::ConstInt:return PMIROpcode::ConstInt; case IROpcode::ConstBool:return PMIROpcode::ConstBool; case IROpcode::ConstNull:return PMIROpcode::ConstNull;
+        case IROpcode::Copy:return PMIROpcode::Copy; case IROpcode::Add:return PMIROpcode::Add; case IROpcode::Sub:return PMIROpcode::Sub; case IROpcode::Mul:return PMIROpcode::Mul;
+        case IROpcode::Div:return PMIROpcode::Div; case IROpcode::Mod:return PMIROpcode::Mod; case IROpcode::BitAnd:return PMIROpcode::BitAnd; case IROpcode::BitOr:return PMIROpcode::BitOr;
+        case IROpcode::BitXor:return PMIROpcode::BitXor; case IROpcode::Shl:return PMIROpcode::Shl; case IROpcode::Shr:return PMIROpcode::Shr; case IROpcode::Neg:return PMIROpcode::Neg;
+        case IROpcode::BitNot:return PMIROpcode::BitNot; case IROpcode::Not:return PMIROpcode::Not; case IROpcode::Eq:return PMIROpcode::Eq; case IROpcode::Ne:return PMIROpcode::Ne;
+        case IROpcode::Lt:return PMIROpcode::Lt; case IROpcode::Le:return PMIROpcode::Le; case IROpcode::Gt:return PMIROpcode::Gt; case IROpcode::Ge:return PMIROpcode::Ge;
+        case IROpcode::And:return PMIROpcode::And; case IROpcode::Or:return PMIROpcode::Or; case IROpcode::Branch:return PMIROpcode::Branch; case IROpcode::BranchIf:return PMIROpcode::BranchIf;
+        case IROpcode::Call:return PMIROpcode::Call; case IROpcode::Return:return PMIROpcode::Return; default:return PMIROpcode::Nop;
+        }
+    }
+    PMIRFunction lowerFunction(const IRFunction& fn) const {
+        PMIRFunction out; out.name=fn.name; out.returnType=fn.returnType; out.totalSlots=fn.totalVregs;
+        for (auto v : fn.parameterVregs) out.parameterSlots.push_back(static_cast<std::uint32_t>(v));
+        std::size_t maxArgs = 0;
+        for (const auto& b : fn.blocks) for (const auto& i : b.instructions) if (i.op == IROpcode::Call) maxArgs = std::max(maxArgs, i.args.size());
+        out.outgoingArea = static_cast<std::uint32_t>(32 + (maxArgs > 4 ? (maxArgs - 4) * 8 : 0));
+        out.frameSize = align16(fn.totalVregs * 8u + out.outgoingArea);
+        for (const auto& b : fn.blocks) {
+            PMIRBlock pb; pb.id=static_cast<std::uint32_t>(b.id); pb.label=b.labelName;
+            for (const auto& phi : b.phiNodes) {
+                if (!phi.phiInputs.empty()) { PMIRInstruction p; p.op=PMIROpcode::Copy; p.destSlot=static_cast<std::uint32_t>(phi.dest); p.srcSlots={static_cast<std::uint32_t>(phi.phiInputs.front().second)}; pb.instructions.push_back(std::move(p)); }
+            }
+            for (const auto& i : b.instructions) {
+                if (i.op == IROpcode::ConstString) throw std::runtime_error("native PMIR text lowering not implemented yet");
+                if (i.op == IROpcode::CallClosure || i.op == IROpcode::MakeAggregate || i.op == IROpcode::ExtractField || i.op == IROpcode::ResultOk || i.op == IROpcode::ResultErr ||
+                    i.op == IROpcode::ResultTry || i.op == IROpcode::OptionSome || i.op == IROpcode::OptionNone || i.op == IROpcode::MakeClosure)
+                    throw std::runtime_error("native PMIR legalization for aggregate/result/option/closure PCIR is not implemented yet; semantic PCIR is preserved");
+                PMIRInstruction p; p.op=map(i.op); p.destSlot=static_cast<std::uint32_t>(i.dest); p.callee=i.callee; p.immediate=i.immediate; p.hasImmediate=i.hasImmediate;
+                if (i.op == IROpcode::ConstInt) { p.immediate=std::stoll(i.literalText); p.hasImmediate=true; }
+                if (i.op == IROpcode::ConstBool) { p.immediate=i.immediate?1:0; p.hasImmediate=true; }
+                if (i.op == IROpcode::ConstNull) { p.immediate=0; p.hasImmediate=true; }
+                for (auto v:i.args) p.srcSlots.push_back(static_cast<std::uint32_t>(v));
+                for (auto t:i.targetBlocks) p.targets.push_back(static_cast<std::uint32_t>(t));
+                pb.instructions.push_back(std::move(p));
+            }
+            out.blocks.push_back(std::move(pb));
+        }
+        return out;
+    }
+};
+
+
+class PMIRVerifier {
+public:
+    std::vector<std::string> verify(const PMIRProgram& program) const {
+        std::vector<std::string> errors;
+        std::unordered_set<std::string> names;
+        for (const auto& fn : program.functions) {
+            if (!names.insert(fn.name).second) errors.push_back("duplicate PMIR function: " + fn.name);
+            if ((fn.frameSize & 15u) != 0) errors.push_back(fn.name + ": frame is not 16-byte aligned");
+            if (fn.outgoingArea < 32) errors.push_back(fn.name + ": Microsoft x64 shadow space is missing");
+            std::unordered_set<std::uint32_t> blocks;
+            for (const auto& b : fn.blocks) blocks.insert(b.id);
+            auto slotOK = [&](std::uint32_t s) { return s == 0 || s <= fn.totalSlots; };
+            for (auto p : fn.parameterSlots) if (!slotOK(p) || p == 0) errors.push_back(fn.name + ": invalid parameter stack slot");
+            for (const auto& b : fn.blocks) for (const auto& i : b.instructions) {
+                if (!slotOK(i.destSlot)) errors.push_back(fn.name + ": invalid PMIR destination slot");
+                for (auto x : i.srcSlots) if (!slotOK(x) || x == 0) errors.push_back(fn.name + ": invalid PMIR source slot");
+                for (auto t : i.targets) if (!blocks.contains(t)) errors.push_back(fn.name + ": invalid PMIR branch target");
+                if (i.op == PMIROpcode::Branch && i.targets.size() != 1) errors.push_back(fn.name + ": PMIR branch requires one target");
+                if (i.op == PMIROpcode::BranchIf && (i.targets.size() != 2 || i.srcSlots.size() != 1)) errors.push_back(fn.name + ": PMIR conditional branch shape invalid");
+            }
+        }
+        return errors;
+    }
+};
+
+static std::string pmirOpcodeName(PMIROpcode op) {
+    switch(op){
+    case PMIROpcode::ConstInt:return "mov.imm";case PMIROpcode::ConstBool:return "mov.bool";case PMIROpcode::ConstNull:return "mov.null";case PMIROpcode::Copy:return "mov";
+    case PMIROpcode::Add:return "add";case PMIROpcode::Sub:return "sub";case PMIROpcode::Mul:return "imul";case PMIROpcode::Div:return "idiv.defined";case PMIROpcode::Mod:return "imod.defined";
+    case PMIROpcode::BitAnd:return "and";case PMIROpcode::BitOr:return "or";case PMIROpcode::BitXor:return "xor";case PMIROpcode::Shl:return "shl";case PMIROpcode::Shr:return "sar";
+    case PMIROpcode::Neg:return "neg";case PMIROpcode::BitNot:return "not";case PMIROpcode::Not:return "logical.not";case PMIROpcode::Eq:return "cmp.eq";case PMIROpcode::Ne:return "cmp.ne";
+    case PMIROpcode::Lt:return "cmp.lt";case PMIROpcode::Le:return "cmp.le";case PMIROpcode::Gt:return "cmp.gt";case PMIROpcode::Ge:return "cmp.ge";case PMIROpcode::And:return "logical.and";case PMIROpcode::Or:return "logical.or";
+    case PMIROpcode::Branch:return "jmp";case PMIROpcode::BranchIf:return "br.if";case PMIROpcode::Call:return "call";case PMIROpcode::Return:return "ret";case PMIROpcode::Nop:return "nop";}
+    return "?";
+}
+
+std::string pmirToString(const PMIRProgram& program) {
+    std::ostringstream oss;
+    for (const auto& fn : program.functions) {
+        oss << "pmir routine " << fn.name << " frame=" << fn.frameSize << " shadow/out=" << fn.outgoingArea << "\n";
+        for (const auto& b : fn.blocks) {
+            oss << "  .L" << b.id << " " << b.label << ":\n";
+            for (const auto& i : b.instructions) {
+                oss << "    " << pmirOpcodeName(i.op);
+                if (i.destSlot) oss << " s" << i.destSlot;
+                for (auto s:i.srcSlots) oss << " s" << s;
+                if (i.hasImmediate) oss << " " << i.immediate;
+                for (auto t:i.targets) oss << " .L" << t;
+                if (!i.callee.empty()) oss << " " << i.callee;
+                oss << "\n";
+            }
+        }
+        oss << "\n";
+    }
+    return oss.str();
+}
+
+// --- Integrated x86-64 encoder ---------------------------------------------
+struct MachineListingLine { std::size_t offset=0; std::vector<std::uint8_t> bytes; std::string text; };
+struct MachineProgram {
+    std::vector<std::uint8_t> text;
+    std::unordered_map<std::string,std::uint32_t> functionOffsets;
+    std::unordered_map<std::string,std::uint32_t> functionSizes;
+    std::vector<MachineListingLine> listing;
+    std::uint32_t entryOffset=0;
+    std::string entryName;
+};
+
+
+class MachineVerifier {
+public:
+    std::vector<std::string> verify(const MachineProgram& machine) const {
+        std::vector<std::string> errors;
+        if (machine.text.empty()) errors.push_back("machine text section is empty");
+        if (!machine.entryName.empty()) {
+            auto it = machine.functionOffsets.find(machine.entryName);
+            if (it == machine.functionOffsets.end() || it->second != machine.entryOffset) errors.push_back("entry point does not match selected function");
+        }
+        std::vector<std::pair<std::uint32_t,std::uint32_t>> ranges;
+        for (const auto& [name, off] : machine.functionOffsets) {
+            auto sz = machine.functionSizes.find(name);
+            if (sz == machine.functionSizes.end()) { errors.push_back("missing machine function size: " + name); continue; }
+            if (static_cast<std::uint64_t>(off) + sz->second > machine.text.size()) errors.push_back("machine function outside .text: " + name);
+            ranges.emplace_back(off, off + sz->second);
+        }
+        std::sort(ranges.begin(), ranges.end());
+        for (std::size_t i=1;i<ranges.size();++i) if (ranges[i].first < ranges[i-1].second) errors.push_back("machine function ranges overlap");
+        for (const auto& line : machine.listing) {
+            if (line.offset + line.bytes.size() > machine.text.size()) { errors.push_back("machine listing outside .text"); continue; }
+            if (!std::equal(line.bytes.begin(), line.bytes.end(), machine.text.begin()+static_cast<std::ptrdiff_t>(line.offset))) errors.push_back("decoded listing does not match final encoded bytes");
+        }
+        return errors;
+    }
+};
+
+class X64Encoder {
+public:
+    MachineProgram encode(const PMIRProgram& program, const std::string& requestedEntry = {}) const {
+        MachineProgram out;
+        struct CallFix { std::size_t dispPos; std::string callee; };
+        std::vector<CallFix> globalCalls;
+        for (const auto& fn : program.functions) {
+            while (out.text.size() % 16) out.text.push_back(0x90);
+            const std::size_t base = out.text.size();
+            out.functionOffsets[fn.name] = static_cast<std::uint32_t>(base);
+            auto encoded = encodeFunction(fn);
+            for (auto& line : encoded.listing) { line.offset += base; out.listing.push_back(std::move(line)); }
+            for (const auto& c : encoded.calls) globalCalls.push_back({base+c.dispPos,c.callee});
+            out.text.insert(out.text.end(), encoded.bytes.begin(), encoded.bytes.end());
+            out.functionSizes[fn.name] = static_cast<std::uint32_t>(encoded.bytes.size());
+        }
+        for (const auto& fix : globalCalls) {
+            auto it = out.functionOffsets.find(fix.callee);
+            if (it == out.functionOffsets.end()) throw std::runtime_error("native linker unresolved routine: " + fix.callee);
+            std::int64_t rel = static_cast<std::int64_t>(it->second) - static_cast<std::int64_t>(fix.dispPos + 4);
+            if (rel < std::numeric_limits<std::int32_t>::min() || rel > std::numeric_limits<std::int32_t>::max()) throw std::runtime_error("native call relocation out of rel32 range");
+            patch32(out.text, fix.dispPos, static_cast<std::int32_t>(rel));
+        }
+        selectEntry(program, requestedEntry, out);
+        for (auto& line : out.listing) {
+            const std::size_t n = line.bytes.size();
+            if (line.offset + n <= out.text.size()) line.bytes.assign(out.text.begin() + static_cast<std::ptrdiff_t>(line.offset), out.text.begin() + static_cast<std::ptrdiff_t>(line.offset + n));
+        }
+        return out;
+    }
+
+private:
+    struct EncodedFunction { std::vector<std::uint8_t> bytes; std::vector<MachineListingLine> listing; struct Call {std::size_t dispPos;std::string callee;}; std::vector<Call> calls; };
+    struct BranchFix { std::size_t dispPos; std::uint32_t target; };
+
+    static void put32(std::vector<std::uint8_t>& b, std::int32_t v){ for(int i=0;i<4;++i)b.push_back(static_cast<std::uint8_t>((static_cast<std::uint32_t>(v)>>(i*8))&0xff)); }
+    static void put64(std::vector<std::uint8_t>& b, std::uint64_t v){ for(int i=0;i<8;++i)b.push_back(static_cast<std::uint8_t>((v>>(i*8))&0xff)); }
+    static void patch32(std::vector<std::uint8_t>& b,std::size_t p,std::int32_t v){ for(int i=0;i<4;++i)b[p+i]=static_cast<std::uint8_t>((static_cast<std::uint32_t>(v)>>(i*8))&0xff); }
+    static std::int32_t dispForSlot(std::uint32_t slot){ return -static_cast<std::int32_t>(slot*8u); }
+
+    static void movImm(std::vector<std::uint8_t>& b,int reg,std::uint64_t imm){ b.push_back(static_cast<std::uint8_t>(0x48 | (reg>=8?1:0))); b.push_back(static_cast<std::uint8_t>(0xB8+(reg&7))); put64(b,imm); }
+    static void loadRbp(std::vector<std::uint8_t>& b,int reg,std::int32_t disp){ b.push_back(static_cast<std::uint8_t>(0x48 | (reg>=8?4:0))); b.push_back(0x8B); b.push_back(static_cast<std::uint8_t>(0x85|((reg&7)<<3))); put32(b,disp); }
+    static void storeRbp(std::vector<std::uint8_t>& b,int reg,std::int32_t disp){ b.push_back(static_cast<std::uint8_t>(0x48 | (reg>=8?4:0))); b.push_back(0x89); b.push_back(static_cast<std::uint8_t>(0x85|((reg&7)<<3))); put32(b,disp); }
+    static void storeRspRax(std::vector<std::uint8_t>& b,std::int32_t disp){ b.insert(b.end(),{0x48,0x89,0x84,0x24});put32(b,disp); }
+    static void movReg(std::vector<std::uint8_t>& b,int dst,int src){ std::uint8_t rex=0x48; if(src>=8)rex|=4;if(dst>=8)rex|=1;b.push_back(rex);b.push_back(0x89);b.push_back(static_cast<std::uint8_t>(0xC0|((src&7)<<3)|(dst&7))); }
+    static void loadSlot(std::vector<std::uint8_t>& b,int reg,std::uint32_t slot){ loadRbp(b,reg,dispForSlot(slot)); }
+    static void storeSlot(std::vector<std::uint8_t>& b,int reg,std::uint32_t slot){ storeRbp(b,reg,dispForSlot(slot)); }
+    static void epilogue(std::vector<std::uint8_t>& b){ b.insert(b.end(),{0x48,0x89,0xEC,0x5D,0xC3}); }
+    static void normalizeBool(std::vector<std::uint8_t>& b,std::uint8_t setcc){ b.insert(b.end(),{0x48,0x83,0xF8,0x00,0x0F,setcc,0xC0,0x48,0x0F,0xB6,0xC0}); }
+
+    static std::vector<std::uint8_t> slice(const std::vector<std::uint8_t>& b,std::size_t a,std::size_t z){ return std::vector<std::uint8_t>(b.begin()+static_cast<std::ptrdiff_t>(a),b.begin()+static_cast<std::ptrdiff_t>(z)); }
+
+    EncodedFunction encodeFunction(const PMIRFunction& fn) const {
+        EncodedFunction out; auto& b=out.bytes; std::unordered_map<std::uint32_t,std::size_t> blockOffsets; std::vector<BranchFix> branches;
+        auto record=[&](std::size_t start,const std::string& text){out.listing.push_back({start,slice(b,start,b.size()),text});};
+        std::size_t s=b.size(); b.push_back(0x55); b.insert(b.end(),{0x48,0x89,0xE5}); b.insert(b.end(),{0x48,0x81,0xEC}); put32(b,static_cast<std::int32_t>(fn.frameSize)); record(s,"push rbp; mov rbp,rsp; sub rsp,"+std::to_string(fn.frameSize));
+        const int argRegs[4]={1,2,8,9};
+        for(std::size_t i=0;i<fn.parameterSlots.size();++i){ s=b.size(); if(i<4) storeSlot(b,argRegs[i],fn.parameterSlots[i]); else { loadRbp(b,0,static_cast<std::int32_t>(48+(i-4)*8)); storeSlot(b,0,fn.parameterSlots[i]); } record(s,"spill parameter -> s"+std::to_string(fn.parameterSlots[i])); }
+        for(const auto& block:fn.blocks){ blockOffsets[block.id]=b.size(); for(const auto& ins:block.instructions){ s=b.size(); encodeInstruction(fn,ins,b,branches,out.calls); record(s,pmirOpcodeName(ins.op)); } }
+        if(fn.blocks.empty() || b.empty() || b.back()!=0xC3){ s=b.size(); b.insert(b.end(),{0x31,0xC0}); epilogue(b); record(s,"implicit return 0"); }
+        for(const auto& f:branches){ auto it=blockOffsets.find(f.target); if(it==blockOffsets.end())throw std::runtime_error("x64 encoder invalid branch target"); std::int64_t rel=static_cast<std::int64_t>(it->second)-static_cast<std::int64_t>(f.dispPos+4); patch32(b,f.dispPos,static_cast<std::int32_t>(rel)); }
+        return out;
+    }
+
+    static void emitJmp(std::vector<std::uint8_t>& b,std::uint32_t target,std::vector<BranchFix>& fs){ b.push_back(0xE9);std::size_t p=b.size();put32(b,0);fs.push_back({p,target}); }
+    static void emitJcc(std::vector<std::uint8_t>& b,std::uint8_t cc,std::uint32_t target,std::vector<BranchFix>& fs){b.push_back(0x0F);b.push_back(cc);std::size_t p=b.size();put32(b,0);fs.push_back({p,target});}
+    static std::size_t emitLocalJcc(std::vector<std::uint8_t>& b,std::uint8_t cc){b.push_back(0x0F);b.push_back(cc);auto p=b.size();put32(b,0);return p;}
+    static std::size_t emitLocalJmp(std::vector<std::uint8_t>& b){b.push_back(0xE9);auto p=b.size();put32(b,0);return p;}
+    static void patchLocal(std::vector<std::uint8_t>& b,std::size_t p,std::size_t target){patch32(b,p,static_cast<std::int32_t>(static_cast<std::int64_t>(target)-static_cast<std::int64_t>(p+4)));}
+
+    void encodeInstruction(const PMIRFunction&,const PMIRInstruction& i,std::vector<std::uint8_t>& b,std::vector<BranchFix>& branches,std::vector<EncodedFunction::Call>& calls) const {
+        auto unaryLoad=[&](){ if(i.srcSlots.empty())throw std::runtime_error("PMIR unary missing source");loadSlot(b,0,i.srcSlots[0]);};
+        auto binaryLoad=[&](){if(i.srcSlots.size()<2)throw std::runtime_error("PMIR binary missing source");loadSlot(b,0,i.srcSlots[0]);loadSlot(b,10,i.srcSlots[1]);};
+        auto save=[&](){if(i.destSlot)storeSlot(b,0,i.destSlot);};
+        switch(i.op){
+        case PMIROpcode::ConstInt:case PMIROpcode::ConstBool:case PMIROpcode::ConstNull: movImm(b,0,static_cast<std::uint64_t>(i.immediate));save();break;
+        case PMIROpcode::Copy: unaryLoad();save();break;
+        case PMIROpcode::Add:binaryLoad();b.insert(b.end(),{0x4C,0x01,0xD0});save();break;
+        case PMIROpcode::Sub:binaryLoad();b.insert(b.end(),{0x4C,0x29,0xD0});save();break;
+        case PMIROpcode::Mul:binaryLoad();b.insert(b.end(),{0x49,0x0F,0xAF,0xC2});save();break;
+        case PMIROpcode::BitAnd:binaryLoad();b.insert(b.end(),{0x4C,0x21,0xD0});save();break;
+        case PMIROpcode::BitOr:binaryLoad();b.insert(b.end(),{0x4C,0x09,0xD0});save();break;
+        case PMIROpcode::BitXor:binaryLoad();b.insert(b.end(),{0x4C,0x31,0xD0});save();break;
+        case PMIROpcode::And:binaryLoad();b.insert(b.end(),{0x4C,0x21,0xD0});normalizeBool(b,0x95);save();break;
+        case PMIROpcode::Or:binaryLoad();b.insert(b.end(),{0x4C,0x09,0xD0});normalizeBool(b,0x95);save();break;
+        case PMIROpcode::Shl:loadSlot(b,0,i.srcSlots.at(0));loadSlot(b,1,i.srcSlots.at(1));b.insert(b.end(),{0x48,0xD3,0xE0});save();break;
+        case PMIROpcode::Shr:loadSlot(b,0,i.srcSlots.at(0));loadSlot(b,1,i.srcSlots.at(1));b.insert(b.end(),{0x48,0xD3,0xF8});save();break;
+        case PMIROpcode::Neg:unaryLoad();b.insert(b.end(),{0x48,0xF7,0xD8});save();break;
+        case PMIROpcode::BitNot:unaryLoad();b.insert(b.end(),{0x48,0xF7,0xD0});save();break;
+        case PMIROpcode::Not:unaryLoad();normalizeBool(b,0x94);save();break;
+        case PMIROpcode::Eq:case PMIROpcode::Ne:case PMIROpcode::Lt:case PMIROpcode::Le:case PMIROpcode::Gt:case PMIROpcode::Ge:{binaryLoad();b.insert(b.end(),{0x4C,0x39,0xD0});std::uint8_t cc=0x94;if(i.op==PMIROpcode::Ne)cc=0x95;else if(i.op==PMIROpcode::Lt)cc=0x9C;else if(i.op==PMIROpcode::Le)cc=0x9E;else if(i.op==PMIROpcode::Gt)cc=0x9F;else if(i.op==PMIROpcode::Ge)cc=0x9D;b.insert(b.end(),{0x0F,cc,0xC0,0x48,0x0F,0xB6,0xC0});save();break;}
+        case PMIROpcode::Div:case PMIROpcode::Mod:{binaryLoad();b.insert(b.end(),{0x49,0x83,0xFA,0x00});auto jz=emitLocalJcc(b,0x84);b.insert(b.end(),{0x49,0x83,0xFA,0xFF});auto jneNormal=emitLocalJcc(b,0x85);movImm(b,11,0x8000000000000000ull);b.insert(b.end(),{0x4C,0x39,0xD8});auto jneNormal2=emitLocalJcc(b,0x85);if(i.op==PMIROpcode::Mod)b.insert(b.end(),{0x31,0xC0});auto done=emitLocalJmp(b);auto normal=b.size();patchLocal(b,jneNormal,normal);patchLocal(b,jneNormal2,normal);b.insert(b.end(),{0x48,0x99,0x49,0xF7,0xFA});if(i.op==PMIROpcode::Mod)b.insert(b.end(),{0x48,0x89,0xD0});auto afterNormal=emitLocalJmp(b);auto trap=b.size();patchLocal(b,jz,trap);b.insert(b.end(),{0x0F,0x0B});auto finish=b.size();patchLocal(b,done,finish);patchLocal(b,afterNormal,finish);save();break;}
+        case PMIROpcode::Branch:emitJmp(b,i.targets.at(0),branches);break;
+        case PMIROpcode::BranchIf:loadSlot(b,0,i.srcSlots.at(0));b.insert(b.end(),{0x48,0x85,0xC0});emitJcc(b,0x85,i.targets.at(0),branches);emitJmp(b,i.targets.at(1),branches);break;
+        case PMIROpcode::Call:{const int regs[4]={1,2,8,9};for(std::size_t n=0;n<i.srcSlots.size();++n){if(n<4)loadSlot(b,regs[n],i.srcSlots[n]);else{loadSlot(b,0,i.srcSlots[n]);storeRspRax(b,static_cast<std::int32_t>(32+(n-4)*8));}}b.push_back(0xE8);auto p=b.size();put32(b,0);calls.push_back({p,i.callee});save();break;}
+        case PMIROpcode::Return:if(i.srcSlots.empty())b.insert(b.end(),{0x31,0xC0});else loadSlot(b,0,i.srcSlots[0]);epilogue(b);break;
+        case PMIROpcode::Nop:b.push_back(0x90);break;
+        }
+    }
+
+    void selectEntry(const PMIRProgram& program,const std::string& requested,MachineProgram& out) const {
+        auto pick=[&](const std::string& name)->const PMIRFunction*{for(const auto& f:program.functions)if(f.name==name&&f.parameterSlots.empty())return &f;return nullptr;};
+        const PMIRFunction* fn=nullptr;if(!requested.empty())fn=pick(requested);else{for(const char* n:{"main","answer","start"})if((fn=pick(n)))break;if(!fn)for(const auto& f:program.functions)if(f.parameterSlots.empty()){fn=&f;break;}}
+        if(!fn) throw std::runtime_error("native linker: no zero-argument entry routine");
+        out.entryName=fn->name; out.entryOffset=out.functionOffsets.at(fn->name);
+    }
+};
+
+std::string machineListingToString(const MachineProgram& program) {
+    std::ostringstream oss; oss << "entry " << program.entryName << " +0x" << std::hex << program.entryOffset << std::dec << "\n";
+    for(const auto& line:program.listing){oss<<std::hex<<std::setw(8)<<std::setfill('0')<<line.offset<<"  ";for(auto x:line.bytes)oss<<std::setw(2)<<static_cast<unsigned>(x)<<' ';oss<<std::dec<<std::setfill(' ')<<"  "<<line.text<<"\n";}return oss.str();
+}
+
+
+// --- IR emitter -------------------------------------------------------------
+class CppIREmitter {
+public:
+    std::string emit(const IRProgram& program) const {
+        std::ostringstream oss;
+        oss << "#include <cstdint>\n#include <cstdlib>\n#include <limits>\n\n";
+        oss << "namespace paracine_runtime_detail_2026 {\n";
+        oss << "static std::int64_t add(std::int64_t a, std::int64_t b) { return static_cast<std::int64_t>(static_cast<std::uint64_t>(a) + static_cast<std::uint64_t>(b)); }\n";
+        oss << "static std::int64_t sub(std::int64_t a, std::int64_t b) { return static_cast<std::int64_t>(static_cast<std::uint64_t>(a) - static_cast<std::uint64_t>(b)); }\n";
+        oss << "static std::int64_t mul(std::int64_t a, std::int64_t b) { return static_cast<std::int64_t>(static_cast<std::uint64_t>(a) * static_cast<std::uint64_t>(b)); }\n";
+        oss << "static std::int64_t neg(std::int64_t a) { return static_cast<std::int64_t>(0ull - static_cast<std::uint64_t>(a)); }\n";
+        oss << "static std::int64_t div(std::int64_t a, std::int64_t b) { if (b == 0) std::abort(); if (a == std::numeric_limits<std::int64_t>::min() && b == -1) return a; return a / b; }\n";
+        oss << "static std::int64_t mod(std::int64_t a, std::int64_t b) { if (b == 0) std::abort(); if (a == std::numeric_limits<std::int64_t>::min() && b == -1) return 0; return a % b; }\n";
+        oss << "static std::int64_t shl(std::int64_t a, std::int64_t b) { return static_cast<std::int64_t>(static_cast<std::uint64_t>(a) << (static_cast<std::uint64_t>(b) & 63u)); }\n";
+        oss << "static std::int64_t shr(std::int64_t a, std::int64_t b) { return a >> (static_cast<std::uint64_t>(b) & 63u); }\n";
+        oss << "} // namespace paracine_runtime_detail_2026\n\n";
+
+        for (const auto& decl : program.declarationSummaries) emitDeclarationSummary(oss, decl);
+        if (!program.declarationSummaries.empty()) oss << "\n";
+        for (const auto& function : program.functions) emitPrototype(oss, function);
+        if (!program.functions.empty()) oss << "\n";
+        for (const auto& function : program.functions) emitFunction(oss, function);
+
+        const IRFunction* entry = nullptr;
+        for (const auto& function : program.functions) if (function.name == "main" && function.parameterNames.empty()) { entry = &function; break; }
+        oss << "int main() {";
+        if (entry) {
+            if (entry->returnType == "void") oss << " " << cppFunctionName(entry->name) << "(); return 0; ";
+            else oss << " return static_cast<int>(" << cppFunctionName(entry->name) << "()); ";
+        } else {
+            oss << " return 0; ";
+        }
+        oss << "}\n";
+        return oss.str();
+    }
+
+private:
+    static std::string cppFunctionName(const std::string& name) {
+        std::string out = "pcn_";
+        for (char ch : name) out.push_back((std::isalnum(static_cast<unsigned char>(ch)) || ch == '_') ? ch : '_');
+        return out;
+    }
+
+    static std::string cppReturnType(const std::string& type) {
+        if (type == "void") return "void";
+        if (type == "bool") return "bool";
+        // The bootstrap IR currently represents scalar numeric values in 64-bit virtual registers.
+        return "std::int64_t";
+    }
+
+    void emitDeclarationSummary(std::ostringstream& oss, const DeclarationInfo& decl) const {
+        oss << "// " << decl.kind << ": " << decl.name;
+        if (!decl.metadata.empty()) oss << " // " << decl.metadata;
+        oss << "\n";
+    }
+
+    void emitPrototype(std::ostringstream& oss, const IRFunction& function) const {
+        oss << "static " << cppReturnType(function.returnType) << ' ' << cppFunctionName(function.name) << '(';
+        for (std::size_t i = 0; i < function.parameterNames.size(); ++i) {
+            if (i) oss << ", ";
+            oss << "std::int64_t p" << i;
+        }
+        oss << ");\n";
+    }
+
+    void emitFunction(std::ostringstream& oss, const IRFunction& function) const {
+        oss << "// " << function.signature << "\n";
+        oss << "static " << cppReturnType(function.returnType) << ' ' << cppFunctionName(function.name) << '(';
+        for (std::size_t i = 0; i < function.parameterNames.size(); ++i) {
+            if (i) oss << ", ";
+            oss << "std::int64_t p" << i;
+        }
+        oss << ") {\n";
+        oss << "    /* PCIR bootstrap value type: " << irValueTypeName(function.valueType) << " */\n";
+        for (std::uint32_t i = 1; i <= function.totalVregs; ++i) oss << "    std::int64_t v" << i << " = 0;\n";
+        for (std::size_t i = 0; i < function.parameterVregs.size(); ++i) {
+            oss << "    v" << reg(function.parameterVregs[i]) << " = p" << i << "; /* " << function.parameterSignature[i] << " */\n";
+        }
+        if (!function.blocks.empty()) oss << "    goto " << blockLabel(function.blocks.front().id) << ";\n";
+        for (const auto& block : function.blocks) emitBlock(oss, block);
+        if (function.returnType == "void") oss << "    return;\n";
+        else oss << "    return 0; /* unreachable fallback for conservative C++ compilers */\n";
+        oss << "}\n\n";
+    }
+
+    void emitBlock(std::ostringstream& oss, const IRBasicBlock& block) const {
+        oss << blockLabel(block.id) << ": /* " << block.labelName << " */\n";
+        if (!block.predecessors.empty()) {
+            oss << "    /* predecessors: ";
+            for (std::size_t i = 0; i < block.predecessors.size(); ++i) { if (i) oss << ", "; oss << block.predecessors[i]; }
+            oss << " */\n";
+        }
+        for (const auto& phi : block.phiNodes) emitInstruction(oss, phi);
+        for (const auto& inst : block.instructions) emitInstruction(oss, inst);
+        if (block.instructions.empty()) oss << "    ;\n";
+    }
+
+    void emitInstruction(std::ostringstream& oss, const IRInstruction& inst) const {
+        switch (inst.op) {
+        case IROpcode::ConstInt: oss << "    v" << reg(inst.dest) << " = " << sanitizedIntegerLiteral(inst) << ";\n"; break;
+        case IROpcode::ConstString: oss << "    /* text literal retained in PCIR metadata: " << escapedComment(inst.literalText) << " */\n"; break;
+        case IROpcode::ConstBool: oss << "    v" << reg(inst.dest) << " = " << (inst.hasImmediate && inst.immediate ? 1 : 0) << ";\n"; break;
+        case IROpcode::ConstNull: oss << "    v" << reg(inst.dest) << " = 0;\n"; break;
+        case IROpcode::Copy: emitBinaryCopy(oss, inst); break;
+        case IROpcode::Add: emitHelper2(oss, inst, "paracine_runtime_detail_2026::add"); break;
+        case IROpcode::Sub: emitHelper2(oss, inst, "paracine_runtime_detail_2026::sub"); break;
+        case IROpcode::Mul: emitHelper2(oss, inst, "paracine_runtime_detail_2026::mul"); break;
+        case IROpcode::Div: emitHelper2(oss, inst, "paracine_runtime_detail_2026::div"); break;
+        case IROpcode::Mod: emitHelper2(oss, inst, "paracine_runtime_detail_2026::mod"); break;
+        case IROpcode::BitAnd: emitBinary(oss, inst, "&"); break;
+        case IROpcode::BitOr: emitBinary(oss, inst, "|"); break;
+        case IROpcode::BitXor: emitBinary(oss, inst, "^"); break;
+        case IROpcode::Shl: emitHelper2(oss, inst, "paracine_runtime_detail_2026::shl"); break;
+        case IROpcode::Shr: emitHelper2(oss, inst, "paracine_runtime_detail_2026::shr"); break;
+        case IROpcode::Neg: oss << "    v" << reg(inst.dest) << " = paracine_runtime_detail_2026::neg(v" << reg(inst.args[0]) << ");\n"; break;
+        case IROpcode::BitNot: oss << "    v" << reg(inst.dest) << " = ~v" << reg(inst.args[0]) << ";\n"; break;
+        case IROpcode::Not: oss << "    v" << reg(inst.dest) << " = !v" << reg(inst.args[0]) << ";\n"; break;
+        case IROpcode::Eq: emitBinary(oss, inst, "=="); break;
+        case IROpcode::Ne: emitBinary(oss, inst, "!="); break;
+        case IROpcode::Lt: emitBinary(oss, inst, "<"); break;
+        case IROpcode::Le: emitBinary(oss, inst, "<="); break;
+        case IROpcode::Gt: emitBinary(oss, inst, ">"); break;
+        case IROpcode::Ge: emitBinary(oss, inst, ">="); break;
+        case IROpcode::And: emitBinary(oss, inst, "&&"); break;
+        case IROpcode::Or: emitBinary(oss, inst, "||"); break;
+        case IROpcode::Phi:
+            if (!inst.phiInputs.empty()) oss << "    v" << reg(inst.dest) << " = v" << reg(inst.phiInputs.front().second) << "; /* conservative phi */\n";
+            break;
+        case IROpcode::Branch: if (!inst.targetBlocks.empty()) oss << "    goto " << blockLabel(inst.targetBlocks.front()) << ";\n"; break;
+        case IROpcode::BranchIf:
+            if (inst.args.size() && inst.targetBlocks.size() >= 2)
+                oss << "    if (v" << reg(inst.args[0]) << ") goto " << blockLabel(inst.targetBlocks[0]) << "; else goto " << blockLabel(inst.targetBlocks[1]) << ";\n";
+            break;
+        case IROpcode::Call: emitCall(oss, inst); break;
+        case IROpcode::CallClosure:
+            oss << "    /* indirect closure call requires closure environment legalization */\n"; break;
+        case IROpcode::ResultOk: case IROpcode::ResultErr: case IROpcode::ResultTry: case IROpcode::OptionSome: case IROpcode::OptionNone:
+        case IROpcode::MakeAggregate: case IROpcode::ExtractField: case IROpcode::MakeClosure:
+            oss << "    /* semantic PCIR op " << static_cast<int>(inst.op) << " requires portable aggregate runtime legalization */\n"; break;
+        case IROpcode::Return:
+            if (!inst.args.empty()) oss << "    return v" << reg(inst.args[0]) << ";\n";
+            else oss << "    return;\n";
+            break;
+        case IROpcode::Nop: oss << "    /* nop */\n"; break;
+        }
+    }
+
+    void emitBinaryCopy(std::ostringstream& oss, const IRInstruction& inst) const {
+        if (!inst.args.empty()) oss << "    v" << reg(inst.dest) << " = v" << reg(inst.args[0]) << ";\n";
+    }
+    void emitBinary(std::ostringstream& oss, const IRInstruction& inst, const char* op) const {
+        oss << "    v" << reg(inst.dest) << " = v" << reg(inst.args[0]) << ' ' << op << " v" << reg(inst.args[1]) << ";\n";
+    }
+    void emitHelper2(std::ostringstream& oss, const IRInstruction& inst, const char* helper) const {
+        oss << "    v" << reg(inst.dest) << " = " << helper << "(v" << reg(inst.args[0]) << ", v" << reg(inst.args[1]) << ");\n";
+    }
+    void emitCall(std::ostringstream& oss, const IRInstruction& inst) const {
+        const bool isPrint = inst.callee == "print";
+        if (isPrint) { oss << "    /* builtin print is runtime-bound in native Paracine; portability shim omitted */\n"; return; }
+        if (inst.returnType != "void") oss << "    v" << reg(inst.dest) << " = "; else oss << "    ";
+        oss << cppFunctionName(inst.callee) << '(';
+        for (std::size_t i = 0; i < inst.args.size(); ++i) { if (i) oss << ", "; oss << "v" << reg(inst.args[i]); }
+        oss << ");\n";
+    }
+
+    static std::uint32_t reg(VReg value) { return static_cast<std::uint32_t>(value); }
+    static std::string blockLabel(BlockID block) { return "bb_" + std::to_string(static_cast<std::uint32_t>(block)); }
+    static std::string sanitizedIntegerLiteral(const IRInstruction& inst) {
+        std::string out = inst.literalText.empty() ? std::to_string(inst.immediate) : inst.literalText;
+        out.erase(std::remove(out.begin(), out.end(), '_'), out.end());
+        return out;
+    }
+    static std::string escapedComment(const std::string& text) {
+        std::string out;
+        for (char ch : text) out.push_back(ch == '\n' || ch == '\r' ? ' ' : ch);
+        return out;
+    }
+};
+
+// --- PE/COFF backend --------------------------------------------------------
+enum class PECOFFOutputKind {
+	ObjectFile,
+	Executable
+};
+
+struct PECOFFSection {
+	std::string name;
+	std::uint32_t characteristics = 0;
+	std::vector<std::uint8_t> data;
+	std::uint32_t virtualAddress = 0;
+	std::uint32_t virtualSize = 0;
+	std::uint32_t rawPointer = 0;
+	std::uint32_t rawSize = 0;
+};
+
+struct PECOFFImage {
+	std::vector<PECOFFSection> sections;
+	std::vector<std::string> functionNames;
+	std::vector<std::string> functionSignatures;
+	std::vector<std::string> typeNames;
+	std::unordered_map<std::string, std::uint32_t> functionOffsets;
+	std::unordered_map<std::string, std::uint32_t> functionSizes;
+	std::unordered_map<std::string, std::uint32_t> functionFrameSizes;
+	std::unordered_map<std::string, std::uint32_t> unwindOffsets;
+	std::uint32_t entryPointOffset = 0;
+	std::uint32_t entryPointRva = 0;
+	std::uint32_t entrySectionIndex = 0;
+	std::uint64_t imageBase = 0x140000000ull;
+	std::uint32_t fileAlignment = 0x200;
+	std::uint32_t sectionAlignment = 0x1000;
+	std::uint16_t machine = 0x8664;
+};
+
+class ByteBuffer {
+public:
+	void writeU8(std::uint8_t value) {
+		bytes_.push_back(value);
+	}
+
+	void writeU16(std::uint16_t value) {
+		writeIntegral(value);
+	}
+
+	void writeU32(std::uint32_t value) {
+		writeIntegral(value);
+	}
+
+	void writeU64(std::uint64_t value) {
+		writeIntegral(value);
+	}
+
+	void writeBytes(const std::vector<std::uint8_t>& data) {
+		bytes_.insert(bytes_.end(), data.begin(), data.end());
+	}
+
+	void writeBytes(const void* data, std::size_t size) {
+		const auto* ptr = static_cast<const std::uint8_t*>(data);
+		bytes_.insert(bytes_.end(), ptr, ptr + size);
+	}
+
+	void writeString(const std::string& text) {
+		writeBytes(text.data(), text.size());
+	}
+
+	void writeStringZ(const std::string& text) {
+		writeString(text);
+		writeU8(0);
+	}
+
+	void align(std::size_t alignment, std::uint8_t fill = 0) {
+		if (alignment == 0) {
+			return;
+		}
+		const std::size_t remainder = bytes_.size() % alignment;
+		if (remainder == 0) {
+			return;
+		}
+		bytes_.insert(bytes_.end(), alignment - remainder, fill);
+	}
+
+	void patchU16(std::size_t offset, std::uint16_t value) {
+		patchIntegral(offset, value);
+	}
+
+	void patchU32(std::size_t offset, std::uint32_t value) {
+		patchIntegral(offset, value);
+	}
+
+	void patchU64(std::size_t offset, std::uint64_t value) {
+		patchIntegral(offset, value);
+	}
+
+	std::size_t size() const {
+		return bytes_.size();
+	}
+
+	const std::vector<std::uint8_t>& bytes() const {
+		return bytes_;
+	}
+
+	std::vector<std::uint8_t> release() {
+		return std::move(bytes_);
+	}
+
+private:
+	template <typename T>
+	void writeIntegral(T value) {
+		static_assert(std::is_integral_v<T>);
+		for (std::size_t i = 0; i < sizeof(T); ++i) {
+			bytes_.push_back(static_cast<std::uint8_t>((static_cast<std::uint64_t>(value) >> (i * 8)) & 0xffu));
+		}
+	}
+
+	template <typename T>
+	void patchIntegral(std::size_t offset, T value) {
+		static_assert(std::is_integral_v<T>);
+		for (std::size_t i = 0; i < sizeof(T); ++i) {
+			bytes_[offset + i] = static_cast<std::uint8_t>((static_cast<std::uint64_t>(value) >> (i * 8)) & 0xffu);
+		}
+	}
+
+	std::vector<std::uint8_t> bytes_;
+};
+
+class PECOFFGenerator {
+public:
+	std::vector<std::uint8_t> emitObject(const IRProgram& program, const std::string& entry = {}) const {
+		const auto image = buildImage(program, false, entry);
+		return emitCOFFObject(image);
+	}
+
+	std::vector<std::uint8_t> emitExecutable(const IRProgram& program, const std::string& entry = {}) const {
+		const auto image = buildImage(program, true, entry);
+		return emitPEImage(image);
+	}
+
+private:
+	PECOFFImage buildImage(const IRProgram& program, bool includeUnwind, const std::string& entry) const {
+		PECOFFImage image;
+
+		PMIRLowerer pmirLowerer;
+		auto pmir = pmirLowerer.lower(program);
+		X64Encoder encoder;
+		auto machine = encoder.encode(pmir, entry);
+
+		PECOFFSection text;
+		text.name = ".text";
+		text.characteristics = 0x60000020u;
+		text.data = machine.text;
+		text.virtualSize = static_cast<std::uint32_t>(text.data.size());
+		image.functionOffsets = machine.functionOffsets;
+		image.functionSizes = machine.functionSizes;
+		image.entryPointOffset = machine.entryOffset;
+		for (const auto& f : pmir.functions) image.functionFrameSizes[f.name] = f.frameSize;
+
+		PECOFFSection rdata;
+		rdata.name = ".rdata";
+		rdata.characteristics = 0x40000040u;
+		rdata.data = buildMetadataBlob(program);
+		rdata.virtualSize = static_cast<std::uint32_t>(rdata.data.size());
+
+		PECOFFSection data;
+		data.name = ".data";
+		data.characteristics = 0xC0000040u;
+		data.data = buildSummaryBlob(program);
+		data.virtualSize = static_cast<std::uint32_t>(data.data.size());
+
+		PECOFFSection decl;
+		decl.name = ".decl";
+		decl.characteristics = 0x40000040u;
+		decl.data = buildDeclarationBlob(program);
+		decl.virtualSize = static_cast<std::uint32_t>(decl.data.size());
+
+		image.sections.push_back(std::move(text));
+		if (includeUnwind) {
+			PECOFFSection xdata; xdata.name = ".xdata"; xdata.characteristics = 0x40000040u;
+			for (const auto& f : pmir.functions) {
+				while (xdata.data.size() % 4) xdata.data.push_back(0);
+				image.unwindOffsets[f.name] = static_cast<std::uint32_t>(xdata.data.size());
+				auto emit8=[&](std::uint8_t v){xdata.data.push_back(v);};
+				auto emit16=[&](std::uint16_t v){emit8(static_cast<std::uint8_t>(v));emit8(static_cast<std::uint8_t>(v>>8));};
+				const std::uint32_t frame=f.frameSize; const bool large=frame>128;
+				emit8(0x01); emit8(11); emit8(static_cast<std::uint8_t>(large?4:3)); emit8(0x05);
+				emit8(11);
+				if (!large) emit8(static_cast<std::uint8_t>((((frame-8)/8)&0x0F)<<4 | 0x02));
+				else { emit8(0x01); emit16(static_cast<std::uint16_t>(frame/8)); }
+				emit8(4); emit8(0x03); emit8(1); emit8(0x50);
+				while (xdata.data.size() % 4) xdata.data.push_back(0);
 			}
-			else {
-				oss << " return 0; ";
-			}
-			oss << "}\n";
-			return oss.str();
+			xdata.virtualSize=static_cast<std::uint32_t>(xdata.data.size());
+			PECOFFSection pdata; pdata.name=".pdata"; pdata.characteristics=0x40000040u; pdata.data.resize(pmir.functions.size()*12u); pdata.virtualSize=static_cast<std::uint32_t>(pdata.data.size());
+			image.sections.push_back(std::move(xdata)); image.sections.push_back(std::move(pdata));
+		}
+		image.sections.push_back(std::move(rdata));
+		image.sections.push_back(std::move(data));
+		image.sections.push_back(std::move(decl));
+		image.entrySectionIndex = 1;
+		image.entryPointRva = image.sectionAlignment;
+
+		for (const auto& function : program.functions) {
+			image.functionNames.push_back(function.name);
+			image.functionSignatures.push_back(function.signature);
+			image.typeNames.push_back(function.returnType);
 		}
 
-	private:
-		static std::string cppFunctionName(const std::string& name) {
-			std::string out = "pcn_";
-			for (char ch : name) out.push_back((std::isalnum(static_cast<unsigned char>(ch)) || ch == '_') ? ch : '_');
-			return out;
+		return image;
+	}
+
+	std::vector<std::uint8_t> buildMetadataBlob(const IRProgram& program) const {
+		ByteBuffer buffer;
+		buffer.writeStringZ("paracine-pe-coff");
+		buffer.writeU32(static_cast<std::uint32_t>(program.declarationSummaries.size()));
+		for (const auto& decl : program.declarationSummaries) {
+			buffer.writeStringZ(decl.kind);
+			buffer.writeStringZ(decl.name);
+			buffer.writeStringZ(decl.metadata);
+			buffer.writeU8(decl.isPublic ? 1 : 0);
+			buffer.writeU8(decl.isCompileTime ? 1 : 0);
+		}
+		for (const auto& function : program.functions) {
+			buffer.writeStringZ(function.signature);
+			buffer.writeStringZ(function.returnType);
+			buffer.writeStringZ(function.name);
+			buffer.writeU32(function.totalVregs);
+			buffer.writeU32(static_cast<std::uint32_t>(function.blocks.size()));
+		}
+		buffer.align(8);
+		return buffer.release();
+	}
+
+	std::vector<std::uint8_t> buildSummaryBlob(const IRProgram& program) const {
+		ByteBuffer buffer;
+		buffer.writeU32(static_cast<std::uint32_t>(program.declarationSummaries.size()));
+		for (const auto& decl : program.declarationSummaries) {
+			buffer.writeU32(static_cast<std::uint32_t>(decl.kind.size()));
+			buffer.writeU32(static_cast<std::uint32_t>(decl.name.size()));
+			buffer.writeU32(static_cast<std::uint32_t>(decl.metadata.size()));
+		}
+		buffer.writeU32(static_cast<std::uint32_t>(program.functions.size()));
+		for (const auto& function : program.functions) {
+			buffer.writeU32(static_cast<std::uint32_t>(function.parameterNames.size()));
+			buffer.writeU32(static_cast<std::uint32_t>(function.blocks.size()));
+			buffer.writeU32(function.totalVregs);
+		}
+		buffer.align(4);
+		return buffer.release();
+	}
+
+	std::vector<std::uint8_t> buildDeclarationBlob(const IRProgram& program) const {
+		ByteBuffer buffer;
+		for (const auto& decl : program.declarationSummaries) {
+			buffer.writeStringZ(decl.kind);
+			buffer.writeStringZ(decl.name);
+			buffer.writeStringZ(decl.metadata);
+			buffer.writeU8(decl.isPublic ? 1 : 0);
+			buffer.writeU8(decl.isCompileTime ? 1 : 0);
+		}
+		buffer.align(8);
+		return buffer.release();
+	}
+
+	std::vector<std::uint8_t> emitCOFFObject(const PECOFFImage& image) const {
+		ByteBuffer buffer;
+		const std::uint32_t machine = image.machine;
+		const std::uint16_t sectionCount = static_cast<std::uint16_t>(image.sections.size());
+		const std::uint16_t optionalHeaderSize = 0;
+		buffer.writeU16(static_cast<std::uint16_t>(machine));
+		buffer.writeU16(sectionCount);
+		buffer.writeU32(0); // deterministic TimeDateStamp
+		const std::size_t symbolTablePointerOffset = buffer.size();
+		buffer.writeU32(0);
+		const std::size_t symbolCountOffset = buffer.size();
+		buffer.writeU32(0);
+		buffer.writeU16(optionalHeaderSize);
+		buffer.writeU16(0);
+
+		struct COFFSectionInfo {
+			std::size_t headerOffset = 0;
+			std::size_t rawPointerOffset = 0;
+		};
+		std::vector<COFFSectionInfo> sectionInfo(image.sections.size());
+		for (std::size_t i = 0; i < image.sections.size(); ++i) {
+			const auto& section = image.sections[i];
+			sectionInfo[i].headerOffset = buffer.size();
+			writeSectionHeader(buffer, section, 0, static_cast<std::uint32_t>(section.data.size()));
 		}
 
-		static std::string cppReturnType(const std::string& type) {
-			if (type == "void") return "void";
-			if (type == "bool") return "bool";
-			// The bootstrap IR currently represents scalar numeric values in 64-bit virtual registers.
-			return "std::int64_t";
-		}
-
-		void emitDeclarationSummary(std::ostringstream& oss, const DeclarationInfo& decl) const {
-			oss << "// " << decl.kind << ": " << decl.name;
-			if (!decl.metadata.empty()) oss << " // " << decl.metadata;
-			oss << "\n";
-		}
-
-		void emitPrototype(std::ostringstream& oss, const IRFunction& function) const {
-			oss << "static " << cppReturnType(function.returnType) << ' ' << cppFunctionName(function.name) << '(';
-			for (std::size_t i = 0; i < function.parameterNames.size(); ++i) {
-				if (i) oss << ", ";
-				oss << "std::int64_t p" << i;
-			}
-			oss << ");\n";
-		}
-
-		void emitFunction(std::ostringstream& oss, const IRFunction& function) const {
-			oss << "// " << function.signature << "\n";
-			oss << "static " << cppReturnType(function.returnType) << ' ' << cppFunctionName(function.name) << '(';
-			for (std::size_t i = 0; i < function.parameterNames.size(); ++i) {
-				if (i) oss << ", ";
-				oss << "std::int64_t p" << i;
-			}
-			oss << ") {\n";
-			oss << "    /* PCIR bootstrap value type: " << irValueTypeName(function.valueType) << " */\n";
-			for (std::uint32_t i = 1; i <= function.totalVregs; ++i) oss << "    std::int64_t v" << i << " = 0;\n";
-			for (std::size_t i = 0; i < function.parameterVregs.size(); ++i) {
-				oss << "    v" << reg(function.parameterVregs[i]) << " = p" << i << "; /* " << function.parameterSignature[i] << " */\n";
-			}
-			if (!function.blocks.empty()) oss << "    goto " << blockLabel(function.blocks.front().id) << ";\n";
-			for (const auto& block : function.blocks) emitBlock(oss, block);
-			if (function.returnType == "void") oss << "    return;\n";
-			else oss << "    return 0; /* unreachable fallback for conservative C++ compilers */\n";
-			oss << "}\n\n";
-		}
-
-		void emitBlock(std::ostringstream& oss, const IRBasicBlock& block) const {
-			oss << blockLabel(block.id) << ": /* " << block.labelName << " */\n";
-			if (!block.predecessors.empty()) {
-				oss << "    /* predecessors: ";
-				for (std::size_t i = 0; i < block.predecessors.size(); ++i) { if (i) oss << ", "; oss << block.predecessors[i]; }
-				oss << " */\n";
-			}
-			for (const auto& phi : block.phiNodes) emitInstruction(oss, phi);
-			for (const auto& inst : block.instructions) emitInstruction(oss, inst);
-			if (block.instructions.empty()) oss << "    ;\n";
-		}
-
-		void emitInstruction(std::ostringstream& oss, const IRInstruction& inst) const {
-			switch (inst.op) {
-			case IROpcode::ConstInt: oss << "    v" << reg(inst.dest) << " = " << sanitizedIntegerLiteral(inst) << ";\n"; break;
-			case IROpcode::ConstString: oss << "    /* text literal retained in PCIR metadata: " << escapedComment(inst.literalText) << " */\n"; break;
-			case IROpcode::ConstBool: oss << "    v" << reg(inst.dest) << " = " << (inst.hasImmediate && inst.immediate ? 1 : 0) << ";\n"; break;
-			case IROpcode::ConstNull: oss << "    v" << reg(inst.dest) << " = 0;\n"; break;
-			case IROpcode::Copy: emitBinaryCopy(oss, inst); break;
-			case IROpcode::Add: emitHelper2(oss, inst, "pcn_add"); break;
-			case IROpcode::Sub: emitHelper2(oss, inst, "pcn_sub"); break;
-			case IROpcode::Mul: emitHelper2(oss, inst, "pcn_mul"); break;
-			case IROpcode::Div: emitHelper2(oss, inst, "pcn_div"); break;
-			case IROpcode::Mod: emitHelper2(oss, inst, "pcn_mod"); break;
-			case IROpcode::BitAnd: emitBinary(oss, inst, "&"); break;
-			case IROpcode::BitOr: emitBinary(oss, inst, "|"); break;
-			case IROpcode::BitXor: emitBinary(oss, inst, "^"); break;
-			case IROpcode::Shl: emitHelper2(oss, inst, "pcn_shl"); break;
-			case IROpcode::Shr: emitHelper2(oss, inst, "pcn_shr"); break;
-			case IROpcode::Neg: oss << "    v" << reg(inst.dest) << " = pcn_neg(v" << reg(inst.args[0]) << ");\n"; break;
-			case IROpcode::BitNot: oss << "    v" << reg(inst.dest) << " = ~v" << reg(inst.args[0]) << ";\n"; break;
-			case IROpcode::Not: oss << "    v" << reg(inst.dest) << " = !v" << reg(inst.args[0]) << ";\n"; break;
-			case IROpcode::Eq: emitBinary(oss, inst, "=="); break;
-			case IROpcode::Ne: emitBinary(oss, inst, "!="); break;
-			case IROpcode::Lt: emitBinary(oss, inst, "<"); break;
-			case IROpcode::Le: emitBinary(oss, inst, "<="); break;
-			case IROpcode::Gt: emitBinary(oss, inst, ">"); break;
-			case IROpcode::Ge: emitBinary(oss, inst, ">="); break;
-			case IROpcode::And: emitBinary(oss, inst, "&&"); break;
-			case IROpcode::Or: emitBinary(oss, inst, "||"); break;
-			case IROpcode::Phi:
-				if (!inst.phiInputs.empty()) oss << "    v" << reg(inst.dest) << " = v" << reg(inst.phiInputs.front().second) << "; /* conservative phi */\n";
-				break;
-			case IROpcode::Branch: if (!inst.targetBlocks.empty()) oss << "    goto " << blockLabel(inst.targetBlocks.front()) << ";\n"; break;
-			case IROpcode::BranchIf:
-				if (inst.args.size() && inst.targetBlocks.size() >= 2)
-					oss << "    if (v" << reg(inst.args[0]) << ") goto " << blockLabel(inst.targetBlocks[0]) << "; else goto " << blockLabel(inst.targetBlocks[1]) << ";\n";
-				break;
-			case IROpcode::Call: emitCall(oss, inst); break;
-			case IROpcode::Return:
-				if (!inst.args.empty()) oss << "    return v" << reg(inst.args[0]) << ";\n";
-				else oss << "    return;\n";
-				break;
-			case IROpcode::Nop: oss << "    /* nop */\n"; break;
-			}
-		}
-
-		void emitBinaryCopy(std::ostringstream& oss, const IRInstruction& inst) const {
-			if (!inst.args.empty()) oss << "    v" << reg(inst.dest) << " = v" << reg(inst.args[0]) << ";\n";
-		}
-		void emitBinary(std::ostringstream& oss, const IRInstruction& inst, const char* op) const {
-			oss << "    v" << reg(inst.dest) << " = v" << reg(inst.args[0]) << ' ' << op << " v" << reg(inst.args[1]) << ";\n";
-		}
-		void emitHelper2(std::ostringstream& oss, const IRInstruction& inst, const char* helper) const {
-			oss << "    v" << reg(inst.dest) << " = " << helper << "(v" << reg(inst.args[0]) << ", v" << reg(inst.args[1]) << ");\n";
-		}
-		void emitCall(std::ostringstream& oss, const IRInstruction& inst) const {
-			const bool isPrint = inst.callee == "print";
-			if (isPrint) { oss << "    /* builtin print is runtime-bound in native Paracine; portability shim omitted */\n"; return; }
-			if (inst.returnType != "void") oss << "    v" << reg(inst.dest) << " = "; else oss << "    ";
-			oss << cppFunctionName(inst.callee) << '(';
-			for (std::size_t i = 0; i < inst.args.size(); ++i) { if (i) oss << ", "; oss << "v" << reg(inst.args[i]); }
-			oss << ");\n";
-		}
-
-		static std::uint32_t reg(VReg value) { return static_cast<std::uint32_t>(value); }
-		static std::string blockLabel(BlockID block) { return "bb_" + std::to_string(static_cast<std::uint32_t>(block)); }
-		static std::string sanitizedIntegerLiteral(const IRInstruction& inst) {
-			std::string out = inst.literalText.empty() ? std::to_string(inst.immediate) : inst.literalText;
-			out.erase(std::remove(out.begin(), out.end(), '_'), out.end());
-			return out;
-		}
-		static std::string escapedComment(const std::string& text) {
-			std::string out;
-			for (char ch : text) out.push_back(ch == '\n' || ch == '\r' ? ' ' : ch);
-			return out;
-		}
-	};
-
-	// --- PE/COFF backend --------------------------------------------------------
-	enum class PECOFFOutputKind {
-		ObjectFile,
-		Executable
-	};
-
-	struct PECOFFSection {
-		std::string name;
-		std::uint32_t characteristics = 0;
-		std::vector<std::uint8_t> data;
-		std::uint32_t virtualAddress = 0;
-		std::uint32_t virtualSize = 0;
-		std::uint32_t rawPointer = 0;
-		std::uint32_t rawSize = 0;
-	};
-
-	struct PECOFFImage {
-		std::vector<PECOFFSection> sections;
-		std::vector<std::string> functionNames;
-		std::vector<std::string> functionSignatures;
-		std::vector<std::string> typeNames;
-		std::uint32_t entryPointRva = 0;
-		std::uint32_t entrySectionIndex = 0;
-		std::uint64_t imageBase = 0x140000000ull;
-		std::uint32_t fileAlignment = 0x200;
-		std::uint32_t sectionAlignment = 0x1000;
-		std::uint16_t machine = 0x8664;
-	};
-
-	class ByteBuffer {
-	public:
-		void writeU8(std::uint8_t value) {
-			bytes_.push_back(value);
-		}
-
-		void writeU16(std::uint16_t value) {
-			writeIntegral(value);
-		}
-
-		void writeU32(std::uint32_t value) {
-			writeIntegral(value);
-		}
-
-		void writeU64(std::uint64_t value) {
-			writeIntegral(value);
-		}
-
-		void writeBytes(const std::vector<std::uint8_t>& data) {
-			bytes_.insert(bytes_.end(), data.begin(), data.end());
-		}
-
-		void writeBytes(const void* data, std::size_t size) {
-			const auto* ptr = static_cast<const std::uint8_t*>(data);
-			bytes_.insert(bytes_.end(), ptr, ptr + size);
-		}
-
-		void writeString(const std::string& text) {
-			writeBytes(text.data(), text.size());
-		}
-
-		void writeStringZ(const std::string& text) {
-			writeString(text);
-			writeU8(0);
-		}
-
-		void align(std::size_t alignment, std::uint8_t fill = 0) {
-			if (alignment == 0) {
-				return;
-			}
-			const std::size_t remainder = bytes_.size() % alignment;
-			if (remainder == 0) {
-				return;
-			}
-			bytes_.insert(bytes_.end(), alignment - remainder, fill);
-		}
-
-		void patchU16(std::size_t offset, std::uint16_t value) {
-			patchIntegral(offset, value);
-		}
-
-		void patchU32(std::size_t offset, std::uint32_t value) {
-			patchIntegral(offset, value);
-		}
-
-		void patchU64(std::size_t offset, std::uint64_t value) {
-			patchIntegral(offset, value);
-		}
-
-		std::size_t size() const {
-			return bytes_.size();
-		}
-
-		const std::vector<std::uint8_t>& bytes() const {
-			return bytes_;
-		}
-
-		std::vector<std::uint8_t> release() {
-			return std::move(bytes_);
-		}
-
-	private:
-		template <typename T>
-		void writeIntegral(T value) {
-			static_assert(std::is_integral_v<T>);
-			for (std::size_t i = 0; i < sizeof(T); ++i) {
-				bytes_.push_back(static_cast<std::uint8_t>((static_cast<std::uint64_t>(value) >> (i * 8)) & 0xffu));
-			}
-		}
-
-		template <typename T>
-		void patchIntegral(std::size_t offset, T value) {
-			static_assert(std::is_integral_v<T>);
-			for (std::size_t i = 0; i < sizeof(T); ++i) {
-				bytes_[offset + i] = static_cast<std::uint8_t>((static_cast<std::uint64_t>(value) >> (i * 8)) & 0xffu);
-			}
-		}
-
-		std::vector<std::uint8_t> bytes_;
-	};
-
-	class PECOFFGenerator {
-	public:
-		std::vector<std::uint8_t> emitObject(const IRProgram& program) const {
-			const auto image = buildImage(program);
-			return emitCOFFObject(image);
-		}
-
-		std::vector<std::uint8_t> emitExecutable(const IRProgram& program) const {
-			const auto image = buildImage(program);
-			return emitPEImage(image);
-		}
-
-	private:
-		PECOFFImage buildImage(const IRProgram& program) const {
-			PECOFFImage image;
-
-			PECOFFSection text;
-			text.name = ".text";
-			text.characteristics = 0x60000020u;
-			text.data = { 0x31, 0xC0, 0xC3 };
-			text.virtualSize = static_cast<std::uint32_t>(text.data.size());
-
-			PECOFFSection rdata;
-			rdata.name = ".rdata";
-			rdata.characteristics = 0x40000040u;
-			rdata.data = buildMetadataBlob(program);
-			rdata.virtualSize = static_cast<std::uint32_t>(rdata.data.size());
-
-			PECOFFSection data;
-			data.name = ".data";
-			data.characteristics = 0xC0000040u;
-			data.data = buildSummaryBlob(program);
-			data.virtualSize = static_cast<std::uint32_t>(data.data.size());
-
-			PECOFFSection decl;
-			decl.name = ".decl";
-			decl.characteristics = 0x40000040u;
-			decl.data = buildDeclarationBlob(program);
-			decl.virtualSize = static_cast<std::uint32_t>(decl.data.size());
-
-			image.sections.push_back(std::move(text));
-			image.sections.push_back(std::move(rdata));
-			image.sections.push_back(std::move(data));
-			image.sections.push_back(std::move(decl));
-			image.entrySectionIndex = 1;
-			image.entryPointRva = image.sectionAlignment;
-
-			for (const auto& function : program.functions) {
-				image.functionNames.push_back(function.name);
-				image.functionSignatures.push_back(function.signature);
-				image.typeNames.push_back(function.returnType);
-			}
-			for (const auto& decl : program.declarationSummaries) {
-				image.functionNames.push_back(decl.name);
-				image.functionSignatures.push_back(decl.kind + ":" + decl.name);
-				image.typeNames.push_back(decl.metadata);
-			}
-
-			return image;
-		}
-
-		std::vector<std::uint8_t> buildMetadataBlob(const IRProgram& program) const {
-			ByteBuffer buffer;
-			buffer.writeStringZ("paracine-pe-coff");
-			buffer.writeU32(static_cast<std::uint32_t>(program.declarationSummaries.size()));
-			for (const auto& decl : program.declarationSummaries) {
-				buffer.writeStringZ(decl.kind);
-				buffer.writeStringZ(decl.name);
-				buffer.writeStringZ(decl.metadata);
-				buffer.writeU8(decl.isPublic ? 1 : 0);
-				buffer.writeU8(decl.isCompileTime ? 1 : 0);
-			}
-			for (const auto& function : program.functions) {
-				buffer.writeStringZ(function.signature);
-				buffer.writeStringZ(function.returnType);
-				buffer.writeStringZ(function.name);
-				buffer.writeU32(function.totalVregs);
-				buffer.writeU32(static_cast<std::uint32_t>(function.blocks.size()));
-			}
-			buffer.align(8);
-			return buffer.release();
-		}
-
-		std::vector<std::uint8_t> buildSummaryBlob(const IRProgram& program) const {
-			ByteBuffer buffer;
-			buffer.writeU32(static_cast<std::uint32_t>(program.declarationSummaries.size()));
-			for (const auto& decl : program.declarationSummaries) {
-				buffer.writeU32(static_cast<std::uint32_t>(decl.kind.size()));
-				buffer.writeU32(static_cast<std::uint32_t>(decl.name.size()));
-				buffer.writeU32(static_cast<std::uint32_t>(decl.metadata.size()));
-			}
-			buffer.writeU32(static_cast<std::uint32_t>(program.functions.size()));
-			for (const auto& function : program.functions) {
-				buffer.writeU32(static_cast<std::uint32_t>(function.parameterNames.size()));
-				buffer.writeU32(static_cast<std::uint32_t>(function.blocks.size()));
-				buffer.writeU32(function.totalVregs);
-			}
+		for (std::size_t i = 0; i < image.sections.size(); ++i) {
 			buffer.align(4);
-			return buffer.release();
+			const auto rawPointer = static_cast<std::uint32_t>(buffer.size());
+			sectionInfo[i].rawPointerOffset = rawPointer;
+			buffer.writeBytes(image.sections[i].data);
+			buffer.align(4);
+			patchSectionRawPointer(buffer, sectionInfo[i].headerOffset, rawPointer, static_cast<std::uint32_t>(image.sections[i].data.size()));
 		}
 
-		std::vector<std::uint8_t> buildDeclarationBlob(const IRProgram& program) const {
-			ByteBuffer buffer;
-			for (const auto& decl : program.declarationSummaries) {
-				buffer.writeStringZ(decl.kind);
-				buffer.writeStringZ(decl.name);
-				buffer.writeStringZ(decl.metadata);
-				buffer.writeU8(decl.isPublic ? 1 : 0);
-				buffer.writeU8(decl.isCompileTime ? 1 : 0);
-			}
-			buffer.align(8);
-			return buffer.release();
+		const std::size_t symbolTableOffset = buffer.size();
+		std::vector<std::pair<std::string, std::uint32_t>> stringTableEntries;
+		std::size_t symbolCount = 0;
+		for (std::size_t i = 0; i < image.sections.size(); ++i) {
+			writeSymbol(buffer, image.sections[i].name, 0, static_cast<std::int16_t>(i + 1), 3, 0, stringTableEntries);
+			++symbolCount;
+		}
+		for (const auto& name : image.functionNames) {
+			auto it = image.functionOffsets.find(name);
+			const std::uint32_t value = it == image.functionOffsets.end() ? 0u : it->second;
+			writeSymbol(buffer, name, value, 1, 2, 0, stringTableEntries);
+			++symbolCount;
 		}
 
-		std::vector<std::uint8_t> emitCOFFObject(const PECOFFImage& image) const {
-			ByteBuffer buffer;
-			const std::uint32_t machine = image.machine;
-			const std::uint16_t sectionCount = static_cast<std::uint16_t>(image.sections.size());
-			const std::uint16_t optionalHeaderSize = 0;
-			buffer.writeU16(static_cast<std::uint16_t>(machine));
-			buffer.writeU16(sectionCount);
-			buffer.writeU32(0); // deterministic TimeDateStamp
-			const std::size_t symbolTablePointerOffset = buffer.size();
-			buffer.writeU32(0);
-			const std::size_t symbolCountOffset = buffer.size();
-			buffer.writeU32(0);
-			buffer.writeU16(optionalHeaderSize);
-			buffer.writeU16(0);
-
-			struct COFFSectionInfo {
-				std::size_t headerOffset = 0;
-				std::size_t rawPointerOffset = 0;
-			};
-			std::vector<COFFSectionInfo> sectionInfo(image.sections.size());
-			for (std::size_t i = 0; i < image.sections.size(); ++i) {
-				const auto& section = image.sections[i];
-				sectionInfo[i].headerOffset = buffer.size();
-				writeSectionHeader(buffer, section, 0, static_cast<std::uint32_t>(section.data.size()));
-			}
-
-			for (std::size_t i = 0; i < image.sections.size(); ++i) {
-				buffer.align(4);
-				const auto rawPointer = static_cast<std::uint32_t>(buffer.size());
-				sectionInfo[i].rawPointerOffset = rawPointer;
-				buffer.writeBytes(image.sections[i].data);
-				buffer.align(4);
-				patchSectionRawPointer(buffer, sectionInfo[i].headerOffset, rawPointer, static_cast<std::uint32_t>(image.sections[i].data.size()));
-			}
-
-			const std::size_t symbolTableOffset = buffer.size();
-			std::vector<std::pair<std::string, std::uint32_t>> stringTableEntries;
-			std::size_t symbolCount = 0;
-			for (std::size_t i = 0; i < image.sections.size(); ++i) {
-				writeSymbol(buffer, image.sections[i].name, 0, static_cast<std::int16_t>(i + 1), 3, 0, stringTableEntries);
-				++symbolCount;
-			}
-			for (const auto& name : image.functionNames) {
-				writeSymbol(buffer, name, 0, 1, 2, 0, stringTableEntries);
-				++symbolCount;
-			}
-
-			ByteBuffer stringTable;
-			std::uint32_t stringTableSize = 4;
-			for (const auto& entry : stringTableEntries) {
-				stringTableSize += static_cast<std::uint32_t>(entry.first.size() + 1);
-			}
-			stringTable.writeU32(stringTableSize);
-			for (const auto& entry : stringTableEntries) {
-				stringTable.writeStringZ(entry.first);
-			}
-
-			buffer.writeBytes(stringTable.bytes());
-			buffer.patchU32(symbolTablePointerOffset, static_cast<std::uint32_t>(symbolTableOffset));
-			buffer.patchU32(symbolCountOffset, static_cast<std::uint32_t>(symbolCount));
-			return buffer.release();
+		ByteBuffer stringTable;
+		std::uint32_t stringTableSize = 4;
+		for (const auto& entry : stringTableEntries) {
+			stringTableSize += static_cast<std::uint32_t>(entry.first.size() + 1);
+		}
+		stringTable.writeU32(stringTableSize);
+		for (const auto& entry : stringTableEntries) {
+			stringTable.writeStringZ(entry.first);
 		}
 
-		std::vector<std::uint8_t> emitPEImage(PECOFFImage image) const {
-			constexpr std::uint32_t fileAlignment = 0x200;
-			constexpr std::uint32_t sectionAlignment = 0x1000;
-			image.fileAlignment = fileAlignment;
-			image.sectionAlignment = sectionAlignment;
+		buffer.writeBytes(stringTable.bytes());
+		buffer.patchU32(symbolTablePointerOffset, static_cast<std::uint32_t>(symbolTableOffset));
+		buffer.patchU32(symbolCountOffset, static_cast<std::uint32_t>(symbolCount));
+		return buffer.release();
+	}
 
-			const std::size_t sectionCount = image.sections.size();
-			std::uint32_t headersSize = 0x80 + 4 + 20 + 240 + static_cast<std::uint32_t>(sectionCount * 40);
-			headersSize = alignUp(headersSize, fileAlignment);
+	std::vector<std::uint8_t> emitPEImage(PECOFFImage image) const {
+		constexpr std::uint32_t fileAlignment = 0x200;
+		constexpr std::uint32_t sectionAlignment = 0x1000;
+		image.fileAlignment = fileAlignment;
+		image.sectionAlignment = sectionAlignment;
 
-			std::uint32_t virtualAddress = sectionAlignment;
-			std::uint32_t rawPointer = headersSize;
-			for (auto& section : image.sections) {
-				section.virtualAddress = virtualAddress;
-				section.rawPointer = rawPointer;
-				section.rawSize = alignUp(static_cast<std::uint32_t>(section.data.size()), fileAlignment);
-				section.virtualSize = static_cast<std::uint32_t>(section.data.size());
-				virtualAddress = alignUp(virtualAddress + alignUp(section.virtualSize, sectionAlignment), sectionAlignment);
-				rawPointer += section.rawSize;
+		const std::size_t sectionCount = image.sections.size();
+		std::uint32_t headersSize = 0x80 + 4 + 20 + 240 + static_cast<std::uint32_t>(sectionCount * 40);
+		headersSize = alignUp(headersSize, fileAlignment);
+
+		std::uint32_t virtualAddress = sectionAlignment;
+		std::uint32_t rawPointer = headersSize;
+		for (auto& section : image.sections) {
+			section.virtualAddress = virtualAddress;
+			section.rawPointer = rawPointer;
+			section.rawSize = alignUp(static_cast<std::uint32_t>(section.data.size()), fileAlignment);
+			section.virtualSize = static_cast<std::uint32_t>(section.data.size());
+			virtualAddress = alignUp(virtualAddress + alignUp(section.virtualSize, sectionAlignment), sectionAlignment);
+			rawPointer += section.rawSize;
+		}
+
+		if (!image.sections.empty()) {
+			image.entryPointRva = image.sections.front().virtualAddress + image.entryPointOffset;
+		}
+		PECOFFSection* pdataSection=nullptr; PECOFFSection* xdataSection=nullptr;
+		for(auto& sec:image.sections){if(sec.name==".pdata")pdataSection=&sec;else if(sec.name==".xdata")xdataSection=&sec;}
+		if(pdataSection&&xdataSection){
+			ByteBuffer pd;
+			for(const auto& name:image.functionNames){
+				auto off=image.functionOffsets.at(name), size=image.functionSizes.at(name), uw=image.unwindOffsets.at(name);
+				pd.writeU32(image.sections.front().virtualAddress+off); pd.writeU32(image.sections.front().virtualAddress+off+size); pd.writeU32(xdataSection->virtualAddress+uw);
 			}
+			pdataSection->data=pd.release(); pdataSection->virtualSize=static_cast<std::uint32_t>(pdataSection->data.size());
+		}
 
-			if (!image.sections.empty()) {
-				image.entryPointRva = image.sections.front().virtualAddress;
-			}
-
-			ByteBuffer buffer;
-			writeDosHeader(buffer, 0x80);
-			buffer.align(0x80);
-			writePESignature(buffer);
-			writeCOFFHeader(buffer, static_cast<std::uint16_t>(sectionCount), 240);
-			writePEOptionalHeader(buffer, image, headersSize, virtualAddress);
-			for (const auto& section : image.sections) {
-				writeSectionHeader(buffer, section, section.rawPointer, section.rawSize);
-			}
-			buffer.align(fileAlignment);
-			for (const auto& section : image.sections) {
-				if (buffer.size() < section.rawPointer) {
-					buffer.align(fileAlignment);
-				}
-				buffer.writeBytes(section.data);
+		ByteBuffer buffer;
+		writeDosHeader(buffer, 0x80);
+		buffer.align(0x80);
+		writePESignature(buffer);
+		writeCOFFHeader(buffer, static_cast<std::uint16_t>(sectionCount), 240);
+		writePEOptionalHeader(buffer, image, headersSize, virtualAddress);
+		for (const auto& section : image.sections) {
+			writeSectionHeader(buffer, section, section.rawPointer, section.rawSize);
+		}
+		buffer.align(fileAlignment);
+		for (const auto& section : image.sections) {
+			if (buffer.size() < section.rawPointer) {
 				buffer.align(fileAlignment);
 			}
-			return buffer.release();
+			buffer.writeBytes(section.data);
+			buffer.align(fileAlignment);
 		}
-
-		static std::uint32_t alignUp(std::uint32_t value, std::uint32_t alignment) {
-			return alignment == 0 ? value : ((value + alignment - 1u) / alignment) * alignment;
-		}
-
-		void writeSectionHeader(ByteBuffer& buffer, const PECOFFSection& section, std::uint32_t rawPointer, std::uint32_t rawSize) const {
-			char name[8] = {};
-			std::memcpy(name, section.name.data(), std::min<std::size_t>(section.name.size(), 8));
-			buffer.writeBytes(name, sizeof(name));
-			buffer.writeU32(section.virtualSize);
-			buffer.writeU32(section.virtualAddress);
-			buffer.writeU32(rawSize);
-			buffer.writeU32(rawPointer);
-			buffer.writeU32(0);
-			buffer.writeU32(0);
-			buffer.writeU16(0);
-			buffer.writeU16(0);
-			buffer.writeU32(section.characteristics);
-		}
-
-		void patchSectionRawPointer(ByteBuffer& buffer, std::size_t headerOffset, std::uint32_t rawPointer, std::uint32_t rawSize) const {
-			buffer.patchU32(headerOffset + 16, rawSize);
-			buffer.patchU32(headerOffset + 20, rawPointer);
-		}
-
-		void writeSymbol(ByteBuffer& buffer,
-			const std::string& name,
-			std::uint32_t value,
-			std::int16_t sectionNumber,
-			std::uint8_t storageClass,
-			std::uint8_t auxCount,
-			std::vector<std::pair<std::string, std::uint32_t>>& stringTableEntries) const {
-			if (name.size() <= 8) {
-				char symbolName[8] = {};
-				std::memcpy(symbolName, name.data(), name.size());
-				buffer.writeBytes(symbolName, sizeof(symbolName));
-			}
-			else {
-				buffer.writeU32(0);
-				std::uint32_t offset = 4;
-				for (const auto& entry : stringTableEntries) {
-					offset += static_cast<std::uint32_t>(entry.first.size() + 1);
-				}
-				buffer.writeU32(offset);
-				stringTableEntries.emplace_back(name, offset);
-			}
-			buffer.writeU32(value);
-			buffer.writeU16(static_cast<std::uint16_t>(sectionNumber));
-			buffer.writeU16(0);
-			buffer.writeU8(storageClass);
-			buffer.writeU8(auxCount);
-		}
-
-		void writeDosHeader(ByteBuffer& buffer, std::uint32_t peOffset) const {
-			buffer.writeU16(0x5A4D);
-			for (int i = 0; i < 29; ++i) {
-				buffer.writeU16(0);
-			}
-			buffer.writeU32(peOffset);
-		}
-
-		void writePESignature(ByteBuffer& buffer) const {
-			buffer.writeU32(0x00004550);
-		}
-
-		void writeCOFFHeader(ByteBuffer& buffer, std::uint16_t sectionCount, std::uint16_t optionalHeaderSize) const {
-			buffer.writeU16(0x8664); // IMAGE_FILE_MACHINE_AMD64
-			buffer.writeU16(sectionCount);
-			buffer.writeU32(0);      // reproducible TimeDateStamp
-			buffer.writeU32(0);      // PointerToSymbolTable
-			buffer.writeU32(0);      // NumberOfSymbols
-			buffer.writeU16(optionalHeaderSize);
-			buffer.writeU16(0x0022); // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
-		}
-
-		void writePEOptionalHeader(ByteBuffer& buffer, const PECOFFImage& image, std::uint32_t headersSize, std::uint32_t imageSize) const {
-			const std::uint32_t sizeOfCode = image.sections.empty() ? 0 : alignUp(static_cast<std::uint32_t>(image.sections[0].rawSize), image.fileAlignment);
-			std::uint32_t sizeOfInitializedData = 0;
-			for (std::size_t i = 1; i < image.sections.size(); ++i) {
-				sizeOfInitializedData += alignUp(static_cast<std::uint32_t>(image.sections[i].rawSize), image.fileAlignment);
-			}
-
-			buffer.writeU16(0x20B);
-			buffer.writeU8(14);
-			buffer.writeU8(0);
-			buffer.writeU32(sizeOfCode);
-			buffer.writeU32(sizeOfInitializedData);
-			buffer.writeU32(0);
-			buffer.writeU32(image.entryPointRva);
-			buffer.writeU32(image.sections.empty() ? 0 : image.sections.front().virtualAddress);
-			buffer.writeU64(image.imageBase);
-			buffer.writeU32(image.sectionAlignment);
-			buffer.writeU32(image.fileAlignment);
-			buffer.writeU16(6);
-			buffer.writeU16(0);
-			buffer.writeU16(0);
-			buffer.writeU16(0);
-			buffer.writeU16(6);
-			buffer.writeU16(0);
-			buffer.writeU32(0);
-			buffer.writeU32(imageSize);
-			buffer.writeU32(headersSize);
-			buffer.writeU32(0);
-			buffer.writeU16(3);
-			buffer.writeU16(0x8160);
-			buffer.writeU64(0x100000);
-			buffer.writeU64(0x1000);
-			buffer.writeU64(0x100000);
-			buffer.writeU64(0x1000);
-			buffer.writeU32(0);
-			buffer.writeU32(16);
-			for (int i = 0; i < 16; ++i) {
-				buffer.writeU32(0);
-				buffer.writeU32(0);
-			}
-		}
-	};
-
-	std::string opcodeName(IROpcode op) {
-		switch (op) {
-		case IROpcode::ConstInt: return "const.int"; case IROpcode::ConstString: return "const.text";
-		case IROpcode::ConstBool: return "const.bool"; case IROpcode::ConstNull: return "const.null";
-		case IROpcode::Copy: return "copy"; case IROpcode::Add: return "add"; case IROpcode::Sub: return "sub";
-		case IROpcode::Mul: return "mul"; case IROpcode::Div: return "div"; case IROpcode::Mod: return "mod";
-		case IROpcode::BitAnd: return "bit.and"; case IROpcode::BitOr: return "bit.or"; case IROpcode::BitXor: return "bit.xor";
-		case IROpcode::Shl: return "shl"; case IROpcode::Shr: return "shr"; case IROpcode::Neg: return "neg";
-		case IROpcode::BitNot: return "bit.not"; case IROpcode::Not: return "not"; case IROpcode::Eq: return "eq";
-		case IROpcode::Ne: return "ne"; case IROpcode::Lt: return "lt"; case IROpcode::Le: return "le";
-		case IROpcode::Gt: return "gt"; case IROpcode::Ge: return "ge"; case IROpcode::And: return "and";
-		case IROpcode::Or: return "or"; case IROpcode::Phi: return "phi"; case IROpcode::Branch: return "br";
-		case IROpcode::BranchIf: return "br.if"; case IROpcode::Call: return "call"; case IROpcode::Return: return "ret";
-		case IROpcode::Nop: return "nop";
-		}
-		return "?";
+		return buffer.release();
 	}
 
-	std::string irToString(const IRProgram& program) {
-		std::ostringstream oss;
-		for (const auto& fn : program.functions) {
-			oss << "pcir routine " << fn.signature << "\n";
-			for (const auto& block : fn.blocks) {
-				oss << block.labelName << ":\n";
-				auto emitInst = [&](const IRInstruction& inst) {
-					oss << "    ";
-					if (inst.dest != VReg::None) oss << 'v' << static_cast<std::uint32_t>(inst.dest) << " = ";
-					oss << opcodeName(inst.op);
-					if (!inst.callee.empty()) oss << ' ' << inst.callee;
-					if (!inst.literalText.empty()) oss << ' ' << inst.literalText;
-					for (auto arg : inst.args) oss << " v" << static_cast<std::uint32_t>(arg);
-					for (auto target : inst.targetBlocks) oss << " bb_" << static_cast<std::uint32_t>(target);
-					oss << " : " << irValueTypeName(inst.valueType) << "\n";
-					};
-				for (const auto& phi : block.phiNodes) emitInst(phi);
-				for (const auto& inst : block.instructions) emitInst(inst);
-			}
-			oss << "\n";
-		}
-		return oss.str();
+	static std::uint32_t alignUp(std::uint32_t value, std::uint32_t alignment) {
+		return alignment == 0 ? value : ((value + alignment - 1u) / alignment) * alignment;
 	}
 
-	// --- Driver -----------------------------------------------------------------
+	void writeSectionHeader(ByteBuffer& buffer, const PECOFFSection& section, std::uint32_t rawPointer, std::uint32_t rawSize) const {
+		char name[8] = {};
+		std::memcpy(name, section.name.data(), std::min<std::size_t>(section.name.size(), 8));
+		buffer.writeBytes(name, sizeof(name));
+		buffer.writeU32(section.virtualSize);
+		buffer.writeU32(section.virtualAddress);
+		buffer.writeU32(rawSize);
+		buffer.writeU32(rawPointer);
+		buffer.writeU32(0);
+		buffer.writeU32(0);
+		buffer.writeU16(0);
+		buffer.writeU16(0);
+		buffer.writeU32(section.characteristics);
+	}
+
+	void patchSectionRawPointer(ByteBuffer& buffer, std::size_t headerOffset, std::uint32_t rawPointer, std::uint32_t rawSize) const {
+		buffer.patchU32(headerOffset + 16, rawSize);
+		buffer.patchU32(headerOffset + 20, rawPointer);
+	}
+
+	void writeSymbol(ByteBuffer& buffer,
+		const std::string& name,
+		std::uint32_t value,
+		std::int16_t sectionNumber,
+		std::uint8_t storageClass,
+		std::uint8_t auxCount,
+		std::vector<std::pair<std::string, std::uint32_t>>& stringTableEntries) const {
+		if (name.size() <= 8) {
+			char symbolName[8] = {};
+			std::memcpy(symbolName, name.data(), name.size());
+			buffer.writeBytes(symbolName, sizeof(symbolName));
+		} else {
+			buffer.writeU32(0);
+			std::uint32_t offset = 4;
+			for (const auto& entry : stringTableEntries) {
+				offset += static_cast<std::uint32_t>(entry.first.size() + 1);
+			}
+			buffer.writeU32(offset);
+			stringTableEntries.emplace_back(name, offset);
+		}
+		buffer.writeU32(value);
+		buffer.writeU16(static_cast<std::uint16_t>(sectionNumber));
+		buffer.writeU16(0);
+		buffer.writeU8(storageClass);
+		buffer.writeU8(auxCount);
+	}
+
+	void writeDosHeader(ByteBuffer& buffer, std::uint32_t peOffset) const {
+		buffer.writeU16(0x5A4D);
+		for (int i = 0; i < 29; ++i) {
+			buffer.writeU16(0);
+		}
+		buffer.writeU32(peOffset);
+	}
+
+	void writePESignature(ByteBuffer& buffer) const {
+		buffer.writeU32(0x00004550);
+	}
+
+	void writeCOFFHeader(ByteBuffer& buffer, std::uint16_t sectionCount, std::uint16_t optionalHeaderSize) const {
+		buffer.writeU16(0x8664); // IMAGE_FILE_MACHINE_AMD64
+		buffer.writeU16(sectionCount);
+		buffer.writeU32(0);      // reproducible TimeDateStamp
+		buffer.writeU32(0);      // PointerToSymbolTable
+		buffer.writeU32(0);      // NumberOfSymbols
+		buffer.writeU16(optionalHeaderSize);
+		buffer.writeU16(0x0022); // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+	}
+
+	void writePEOptionalHeader(ByteBuffer& buffer, const PECOFFImage& image, std::uint32_t headersSize, std::uint32_t imageSize) const {
+		const std::uint32_t sizeOfCode = image.sections.empty() ? 0 : alignUp(static_cast<std::uint32_t>(image.sections[0].rawSize), image.fileAlignment);
+		std::uint32_t sizeOfInitializedData = 0;
+		for (std::size_t i = 1; i < image.sections.size(); ++i) {
+			sizeOfInitializedData += alignUp(static_cast<std::uint32_t>(image.sections[i].rawSize), image.fileAlignment);
+		}
+
+		buffer.writeU16(0x20B);
+		buffer.writeU8(14);
+		buffer.writeU8(0);
+		buffer.writeU32(sizeOfCode);
+		buffer.writeU32(sizeOfInitializedData);
+		buffer.writeU32(0);
+		buffer.writeU32(image.entryPointRva);
+		buffer.writeU32(image.sections.empty() ? 0 : image.sections.front().virtualAddress);
+		buffer.writeU64(image.imageBase);
+		buffer.writeU32(image.sectionAlignment);
+		buffer.writeU32(image.fileAlignment);
+		buffer.writeU16(6);
+		buffer.writeU16(0);
+		buffer.writeU16(0);
+		buffer.writeU16(0);
+		buffer.writeU16(6);
+		buffer.writeU16(0);
+		buffer.writeU32(0);
+		buffer.writeU32(imageSize);
+		buffer.writeU32(headersSize);
+		buffer.writeU32(0);
+		buffer.writeU16(3);
+		buffer.writeU16(0x8160);
+		buffer.writeU64(0x100000);
+		buffer.writeU64(0x1000);
+		buffer.writeU64(0x100000);
+		buffer.writeU64(0x1000);
+		buffer.writeU32(0);
+		buffer.writeU32(16);
+		std::uint32_t exceptionRva=0, exceptionSize=0;
+		for(const auto& sec:image.sections) if(sec.name==".pdata"){exceptionRva=sec.virtualAddress;exceptionSize=sec.virtualSize;}
+		for (int i = 0; i < 16; ++i) {
+			if(i==3){buffer.writeU32(exceptionRva);buffer.writeU32(exceptionSize);}
+			else{buffer.writeU32(0);buffer.writeU32(0);}
+		}
+	}
+};
+
+std::string opcodeName(IROpcode op) {
+    switch (op) {
+    case IROpcode::ConstInt: return "const.int"; case IROpcode::ConstString: return "const.text";
+    case IROpcode::ConstBool: return "const.bool"; case IROpcode::ConstNull: return "const.null";
+    case IROpcode::Copy: return "copy"; case IROpcode::Add: return "add"; case IROpcode::Sub: return "sub";
+    case IROpcode::Mul: return "mul"; case IROpcode::Div: return "div"; case IROpcode::Mod: return "mod";
+    case IROpcode::BitAnd: return "bit.and"; case IROpcode::BitOr: return "bit.or"; case IROpcode::BitXor: return "bit.xor";
+    case IROpcode::Shl: return "shl"; case IROpcode::Shr: return "shr"; case IROpcode::Neg: return "neg";
+    case IROpcode::BitNot: return "bit.not"; case IROpcode::Not: return "not"; case IROpcode::Eq: return "eq";
+    case IROpcode::Ne: return "ne"; case IROpcode::Lt: return "lt"; case IROpcode::Le: return "le";
+    case IROpcode::Gt: return "gt"; case IROpcode::Ge: return "ge"; case IROpcode::And: return "and";
+    case IROpcode::Or: return "or"; case IROpcode::Phi: return "phi"; case IROpcode::Branch: return "br";
+    case IROpcode::BranchIf: return "br.if"; case IROpcode::Call: return "call"; case IROpcode::CallClosure: return "call.closure";
+    case IROpcode::MakeAggregate: return "aggregate.make"; case IROpcode::ExtractField: return "aggregate.field";
+    case IROpcode::ResultOk: return "result.ok"; case IROpcode::ResultErr: return "result.err"; case IROpcode::ResultTry: return "result.try";
+    case IROpcode::OptionSome: return "option.some"; case IROpcode::OptionNone: return "option.none"; case IROpcode::MakeClosure: return "closure.make";
+    case IROpcode::Return: return "ret"; case IROpcode::Nop: return "nop";
+    }
+    return "?";
+}
+
+std::string irToString(const IRProgram& program) {
+    std::ostringstream oss;
+    for (const auto& fn : program.functions) {
+        oss << "pcir routine " << fn.signature << "\n";
+        for (const auto& block : fn.blocks) {
+            oss << block.labelName << ":\n";
+            auto emitInst = [&](const IRInstruction& inst) {
+                oss << "    ";
+                if (inst.dest != VReg::None) oss << 'v' << static_cast<std::uint32_t>(inst.dest) << " = ";
+                oss << opcodeName(inst.op);
+                if (!inst.callee.empty()) oss << ' ' << inst.callee;
+                if (!inst.literalText.empty()) oss << ' ' << inst.literalText;
+                for (auto arg : inst.args) oss << " v" << static_cast<std::uint32_t>(arg);
+                for (auto target : inst.targetBlocks) oss << " bb_" << static_cast<std::uint32_t>(target);
+                oss << " : " << irValueTypeName(inst.valueType) << "\n";
+            };
+            for (const auto& phi : block.phiNodes) emitInst(phi);
+            for (const auto& inst : block.instructions) emitInst(inst);
+        }
+        oss << "\n";
+    }
+    return oss.str();
+}
+
+static const char* borrowKindName(BorrowKind k) { return k==BorrowKind::Owned?"own":k==BorrowKind::Exclusive?"exclusive":"shared"; }
+
+std::string skmToString(const SemanticAnalysisResult& analysis) {
+    std::ostringstream oss;
+    oss << "SAGE Semantic Knowledge Model\n";
+    oss << "symbols: " << analysis.skm.symbols.size() << "\n";
+    for (const auto& s : analysis.skm.symbols) oss << "  #"<<s.id<<" "<<s.routine<<"::"<<s.name<<" : "<<s.typeName<<" ["<<(s.isMutable?"var":"let")<<(s.isParameter?", param "+s.parameterMode:"")<<"] points "<<s.firstPoint<<".."<<s.lastPoint<<"\n";
+    oss << "borrow regions: " << analysis.skm.borrowRegions.size() << "\n";
+    for (const auto& b : analysis.skm.borrowRegions) oss << "  r"<<b.id<<" "<<borrowKindName(b.kind)<<" "<<b.sourceName<<" (#"<<b.sourceSymbol<<") "<<b.beginPoint<<".."<<b.endPoint<<(b.closureId?" closure$"+std::to_string(b.closureId):"")<<(b.escaping?" ESCAPES":"")<<"\n";
+    oss << "closures: " << analysis.skm.closures.size() << "\n";
+    for(const auto& c:analysis.skm.closures){oss<<"  closure$"<<c.closureId<<" (";for(std::size_t i=0;i<c.parameterTypes.size();++i){if(i)oss<<", ";oss<<c.parameterTypes[i];}oss<<") -> "<<c.returnType<<" effects [";if(c.effects.empty())oss<<"pure";else{bool first=true;for(const auto&e:c.effects){if(!first)oss<<',';first=false;oss<<e;}}oss<<"]"<<(c.moveCapture?" move":"")<<"\n";}
+    oss << "closure captures: " << analysis.skm.closureCaptures.size() << "\n";
+    for (const auto& c : analysis.skm.closureCaptures) oss << "  closure$"<<c.closureId<<" captures "<<borrowKindName(c.kind)<<" "<<c.name<<" : "<<c.typeName<<(c.escaping?" [escaping]":"")<<"\n";
+    oss << "generic specializations: " << analysis.skm.specializations.size() << "\n";
+    for (const auto& g : analysis.skm.specializations) { oss << "  "<<g.genericRoutine<<" -> "<<g.specializationName<<" {"; bool first=true; for(const auto&[k,v]:g.substitutions){if(!first)oss<<", ";first=false;oss<<k<<'='<<v;} oss<<"}\n"; }
+    oss << "capability resolutions: " << analysis.skm.capabilityResolutions.size() << "\n";
+    for (const auto& c : analysis.skm.capabilityResolutions) { oss << "  "<<c.subjectType<<" is "<<c.capability<<": "<<(c.satisfied?"yes":"no"); if(!c.evidence.empty()){oss<<" via ";for(std::size_t i=0;i<c.evidence.size();++i){if(i)oss<<", ";oss<<c.evidence[i];}} oss<<"\n"; }
+    oss << "effect edges: " << analysis.skm.effectEdges.size() << "\n";
+    for (const auto& e : analysis.skm.effectEdges) { oss << "  "<<e.caller<<" -> "<<e.callee<<" ["; if(e.effects.empty())oss<<"pure"; else {bool first=true;for(const auto&x:e.effects){if(!first)oss<<',';first=false;oss<<x;}} oss<<"]\n"; }
+    oss << "layouts: " << analysis.skm.layouts.size() << "\n";
+    for (const auto& l : analysis.skm.layouts) { oss << "  "<<l.typeName<<" size="<<l.size<<" align="<<l.alignment<<(l.nicheOptimized?" niche":"")<<"\n"; for(const auto&f:l.fieldOffsets)oss<<"    +"<<f.second<<" "<<f.first<<"\n"; }
+    oss << "structural facts: " << analysis.skm.structuralFacts.size() << "\n";
+    for (const auto& f : analysis.skm.structuralFacts) oss << "  " << f << "\n";
+    return oss.str();
+}
+
+// --- Compiler pipeline + command interface ----------------------------------
+struct CompilerOptions {
+    int optimizationLevel = 2;
+    std::string entry;
+};
+
+struct CompilationArtifacts {
+    Program program;
+    SemanticAnalysisResult analysis;
+    IRProgram pcir;
+    PMIRProgram pmir;
+    MachineProgram machine;
+};
+
+static std::string readSourceFile(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("failed to read file: " + path.string());
+    return std::string((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+}
+
+static void writeTextFile(const std::filesystem::path& path, const std::string& text) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) throw std::runtime_error("failed to write file: " + path.string());
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+}
+
+static void writeBinaryFile(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) throw std::runtime_error("failed to write file: " + path.string());
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+static CompilationArtifacts compileAll(const std::string& source, const CompilerOptions& options, bool needMachine = true) {
+    CompilationArtifacts out;
+    Lexer lexer(source);
+    auto tokens = lexer.tokenize();
+    Parser parser(std::move(tokens));
+    out.program = parser.parse();
+
+    SemanticAnalyzer semantic;
+    out.analysis = semantic.analyze(out.program);
+    SAGEEngine sage;
+    sage.analyze(out.program, out.analysis);
+    if (!out.analysis.succeeded()) return out;
+
+    SemanticSpecializer specializer;
+    Program specializedProgram = specializer.specialize(out.program, out.analysis);
+    out.pcir = lowerProgramToIR(specializedProgram);
+    PCIRVerifier verifier;
+    auto before = verifier.verify(out.pcir);
+    if (!before.empty()) {
+        std::ostringstream oss; oss << "internal compiler error: invalid PCIR before optimization";
+        for (const auto& e : before) oss << "\n  " << e;
+        throw std::runtime_error(oss.str());
+    }
+    PCIROptimizer optimizer(options.optimizationLevel);
+    optimizer.optimize(out.pcir);
+    auto after = verifier.verify(out.pcir);
+    if (!after.empty()) {
+        std::ostringstream oss; oss << "internal compiler error: optimizer produced invalid PCIR";
+        for (const auto& e : after) oss << "\n  " << e;
+        throw std::runtime_error(oss.str());
+    }
+
+    if (needMachine) {
+        PMIRLowerer pmirLowerer;
+        out.pmir = pmirLowerer.lower(out.pcir);
+        PMIRVerifier pmirVerifier;
+        auto pmirErrors = pmirVerifier.verify(out.pmir);
+        if (!pmirErrors.empty()) { std::ostringstream oss; oss << "internal compiler error: invalid PMIR"; for (const auto& e : pmirErrors) oss << "\n  " << e; throw std::runtime_error(oss.str()); }
+        X64Encoder encoder;
+        out.machine = encoder.encode(out.pmir, options.entry);
+        MachineVerifier machineVerifier;
+        auto machineErrors = machineVerifier.verify(out.machine);
+        if (!machineErrors.empty()) { std::ostringstream oss; oss << "internal compiler error: machine verification failed"; for (const auto& e : machineErrors) oss << "\n  " << e; throw std::runtime_error(oss.str()); }
+    }
+    return out;
+}
+
+static std::string effectSetText(const std::set<std::string>& effects) {
+    if (effects.empty()) return "pure";
+    std::ostringstream oss; bool first=true;
+    for (const auto& e : effects) { if (!first) oss << ','; first=false; oss << e; }
+    return oss.str();
+}
+
+[[maybe_unused]] static int runNativeExecutable(const std::filesystem::path& exe) {
+#ifdef _WIN32
+    std::string command = "\"" + std::filesystem::absolute(exe).string() + "\"";
+    std::vector<char> mutableCommand(command.begin(), command.end()); mutableCommand.push_back('\0');
+    STARTUPINFOA si{}; si.cb = sizeof(si); PROCESS_INFORMATION pi{};
+    if (!CreateProcessA(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        throw std::runtime_error("failed to launch native executable (Win32 error " + std::to_string(GetLastError()) + ")");
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 0; GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return static_cast<int>(exitCode);
+#else
+    (void)exe;
+    return -1;
+#endif
+}
+
+static std::filesystem::path withExtension(const std::filesystem::path& source, const char* extension) {
+    auto p = source; p.replace_extension(extension); return p;
+}
+
+static void printHelp(std::ostream& os) {
+    os <<
+        "PARACINE 2026 native compiler\n\n"
+        "Usage:\n"
+        "  paracine build <file.pcn> [-o file.exe] [-O0|-O1|-O2|-O3] [--entry name]\n"
+        "  paracine run <file.pcn> [-O0|-O1|-O2|-O3] [--entry name]\n"
+        "  paracine check <file.pcn>\n"
+        "  paracine sage <file.pcn> [-o file.skm]\n"
+        "  paracine test <file.pcn>\n"
+        "  paracine emit cpp|obj|exe <file.pcn> [-o file]\n"
+        "  paracine ir <file.pcn> [-o file.pcir]\n"
+        "  paracine mir <file.pcn> [-o file.pmir]\n"
+        "  paracine asm <file.pcn> [-o file.asm]\n"
+        "  paracine obj <file.pcn> [-o file.obj]\n"
+        "  paracine pe <file.pcn> [-o file.exe]\n"
+        "  paracine explain <file.pcn>\n"
+        "  paracine inspect <file.pcn>\n"
+        "  paracine fmt <file.pcn>  (reserved; formatter not yet lossless)\n"
+        "  paracine clean <file.pcn>\n\n"
+        "Legacy compatibility:\n"
+        "  paracine <file.pcn> [--check|--ast|--ir|--mir|--asm|--pe|--coff|--cpp] [--out file]\n";
+}
+
 }  // namespace pcn
 
 int main(int argc, char** argv) {
-	if (argc < 2) {
-		std::cerr << "Usage: paracine <source.pcn> [--check|--ast|--ir|--pe|--coff|--cpp] [--out file]\n";
-		return 1;
-	}
+    if (argc < 2) { pcn::printHelp(std::cout); return 0; }
+    try {
+        std::vector<std::string> args; for (int i=1;i<argc;++i) args.emplace_back(argv[i]);
+        auto isSource = [](const std::string& s) { return std::filesystem::path(s).extension() == ".pcn"; };
+        std::string command, emitKind, sourceArg, outputArg, legacyMode;
+        pcn::CompilerOptions options;
 
-	std::string outputMode = "pe";
-	std::string outputPath;
-	for (int i = 2; i < argc; ++i) {
-		std::string arg = argv[i];
-		if (arg == "--check") outputMode = "check";
-		else if (arg == "--ast") outputMode = "ast";
-		else if (arg == "--ir") outputMode = "ir";
-		else if (arg == "--coff") outputMode = "coff";
-		else if (arg == "--pe") outputMode = "pe";
-		else if (arg == "--cpp") outputMode = "cpp";
-		else if (arg == "--out" && i + 1 < argc) outputPath = argv[++i];
-		else { std::cerr << "unknown option: " << arg << "\n"; return 1; }
-	}
+        if (isSource(args[0])) {
+            sourceArg = args[0]; legacyMode = "pe";
+            for (std::size_t i=1;i<args.size();++i) {
+                const auto& a=args[i];
+                if (a=="--check") legacyMode="check"; else if(a=="--ast") legacyMode="ast"; else if(a=="--ir") legacyMode="ir";
+                else if(a=="--mir") legacyMode="mir"; else if(a=="--asm") legacyMode="asm"; else if(a=="--coff") legacyMode="obj";
+                else if(a=="--pe") legacyMode="pe"; else if(a=="--cpp") legacyMode="cpp";
+                else if((a=="--out"||a=="-o")&&i+1<args.size()) outputArg=args[++i];
+                else if(a.rfind("-O",0)==0&&a.size()==3&&a[2]>='0'&&a[2]<='3') options.optimizationLevel=a[2]-'0';
+                else if(a=="--entry"&&i+1<args.size()) options.entry=args[++i];
+                else throw std::runtime_error("unknown option: "+a);
+            }
+            command=legacyMode;
+        } else {
+            command=args[0];
+            std::size_t i=1;
+            if(command=="help"||command=="--help"||command=="-h"){pcn::printHelp(std::cout);return 0;}
+            if(command=="emit") { if(i>=args.size()) throw std::runtime_error("emit requires cpp, obj, or exe"); emitKind=args[i++]; }
+            if(i<args.size() && isSource(args[i])) sourceArg=args[i++];
+            for(;i<args.size();++i){const auto&a=args[i];if((a=="-o"||a=="--out")&&i+1<args.size())outputArg=args[++i];
+                else if(a.rfind("-O",0)==0&&a.size()==3&&a[2]>='0'&&a[2]<='3')options.optimizationLevel=a[2]-'0';
+                else if(a=="--entry"&&i+1<args.size())options.entry=args[++i];else throw std::runtime_error("unknown option: "+a);}
+            if(command=="emit") { if(emitKind=="cpp")command="cpp";else if(emitKind=="obj")command="obj";else if(emitKind=="exe")command="pe";else throw std::runtime_error("unknown emit kind: "+emitKind); }
+        }
 
-	std::ifstream input(argv[1], std::ios::binary);
-	if (!input) { std::cerr << "failed to read file: " << argv[1] << "\n"; return 1; }
-	std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        if(command=="clean") {
+            if(sourceArg.empty()) throw std::runtime_error("clean requires a .pcn source path");
+            std::filesystem::path src=sourceArg; std::size_t removed=0;
+            for(const char* ext:{".exe",".obj",".cpp",".pcir",".pmir",".asm"}){auto f=pcn::withExtension(src,ext);std::error_code ec;if(std::filesystem::remove(f,ec))++removed;}
+            std::cout<<"Paracine clean: removed "<<removed<<" generated artifact(s).\n"; return 0;
+        }
+        if(sourceArg.empty()) throw std::runtime_error("command requires a .pcn source file");
+        std::filesystem::path sourcePath=sourceArg;
+        std::string source=pcn::readSourceFile(sourcePath);
+        if(command=="fmt") throw std::runtime_error("fmt is reserved by the Paracine interface, but this native-core build does not yet have a lossless formatter; source was not modified");
+        const bool needMachine = command!="check" && command!="ast" && command!="cpp" && command!="ir" && command!="explain" && command!="sage";
+        auto artifacts=pcn::compileAll(source,options,needMachine);
+        if(!artifacts.analysis.succeeded()){pcn::printSemanticDiagnostics(artifacts.analysis);return 1;}
 
-	try {
-		pcn::Lexer lexer(source);
-		auto tokens = lexer.tokenize();
-		pcn::Parser parser(std::move(tokens));
-		pcn::Program program = parser.parse();
+        auto writeOrPrint=[&](const std::string& text,const std::string& defaultExt){if(outputArg.empty()&&defaultExt.empty())std::cout<<text;else{std::filesystem::path p=outputArg.empty()?pcn::withExtension(sourcePath,defaultExt.c_str()):std::filesystem::path(outputArg);pcn::writeTextFile(p,text);std::cout<<"wrote "<<p.string()<<"\n";}};
 
-		pcn::SemanticAnalyzer analyzer;
-		auto analysis = analyzer.analyze(program);
-		if (!analysis.succeeded()) { pcn::printSemanticDiagnostics(analysis); return 1; }
+        if(command=="check") {
+            std::cout<<"Paracine check succeeded: "<<artifacts.program.routines.size()<<" routine(s), "<<artifacts.program.declarations.size()<<" declaration(s). SAGE/SKM semantic checks passed. PCIR verified.\n";
+            for(const auto& [name,effects]:artifacts.analysis.resolvedEffects)std::cout<<"  "<<name<<" with "<<pcn::effectSetText(effects)<<"\n";
+            return 0;
+        }
+        if(command=="ast") { writeOrPrint(pcn::programToString(artifacts.program)+"\n",outputArg.empty()?"":".ast"); return 0; }
+        if(command=="sage") { writeOrPrint(pcn::skmToString(artifacts.analysis),outputArg.empty()?"":".skm"); return 0; }
+        if(command=="ir") { writeOrPrint(pcn::irToString(artifacts.pcir),outputArg.empty()?"":".pcir"); return 0; }
+        if(command=="mir") { writeOrPrint(pcn::pmirToString(artifacts.pmir),outputArg.empty()?"":".pmir"); return 0; }
+        if(command=="asm") { writeOrPrint(pcn::machineListingToString(artifacts.machine),outputArg.empty()?"":".asm"); return 0; }
+        if(command=="explain") {
+            std::cout<<"SAGE/SKM semantic report\n";
+            for(const auto& r:artifacts.program.routines){auto key=r.name+"#"+std::to_string(r.parameters.size());auto it=artifacts.analysis.resolvedEffects.find(key);std::cout<<"  routine "<<r.name<<": effects="<<(it==artifacts.analysis.resolvedEffects.end()?"pure":pcn::effectSetText(it->second))<<", parameters="<<r.parameters.size()<<"\n";}
+            std::cout<<"PCIR: "<<artifacts.pcir.functions.size()<<" function(s), optimization -O"<<options.optimizationLevel<<"\n";return 0;
+        }
+        if(command=="cpp") { pcn::CppIREmitter e; auto text=e.emit(artifacts.pcir); if(outputArg.empty())std::cout<<text;else pcn::writeTextFile(outputArg,text); return 0; }
 
-		if (outputMode == "check") {
-			std::cout << "Paracine check succeeded: " << program.routines.size() << " routine(s), "
-				<< program.declarations.size() << " declaration(s).\n";
-			return 0;
-		}
-		if (outputMode == "ast") {
-			const std::string text = pcn::programToString(program) + "\n";
-			if (outputPath.empty()) std::cout << text;
-			else { std::ofstream out(outputPath, std::ios::binary); out << text; }
-			return 0;
-		}
+        if(command=="run") {
+            pcn::PCIRInterpreter oracle(artifacts.pcir); auto oracleResult=oracle.run(options.entry);
+            pcn::PECOFFGenerator generator; auto bytes=generator.emitExecutable(artifacts.pcir, options.entry);
+            auto exe=pcn::withExtension(sourcePath,".exe"); pcn::writeBinaryFile(exe,bytes);
+#ifdef _WIN32
+            int nativeResult=pcn::runNativeExecutable(exe);
+            if(static_cast<std::int64_t>(nativeResult)!=oracleResult) { std::cerr<<"native/oracle mismatch: native="<<nativeResult<<" PCIR="<<oracleResult<<"\n"; return 2; }
+            std::cout<<"Paracine run completed with exit code "<<nativeResult<<" (PCIR oracle matched).\n"; return nativeResult;
+#else
+            std::cout<<"Paracine PCIR oracle result: "<<oracleResult<<". PE32+ emitted to "<<exe.string()<<"; native execution requires Windows x86-64.\n"; return 0;
+#endif
+        }
+        if(command=="test") {
+            pcn::PCIRInterpreter oracle(artifacts.pcir); auto value=oracle.run(options.entry);
+            pcn::PECOFFGenerator generator; auto obj=generator.emitObject(artifacts.pcir, options.entry); auto pe=generator.emitExecutable(artifacts.pcir, options.entry);
+            if(obj.empty()||pe.empty())throw std::runtime_error("native backend emitted empty artifact");
+            std::cout<<"Paracine test passed: SAGE/SKM + PCIR verifier + optimizer + PMIR + x64 encoder + COFF + PE. Oracle exit="<<value<<".\n"; return 0;
+        }
+        if(command=="inspect") {
+            std::cout<<"Paracine native pipeline\n  SAGE core: verified\n  PCIR functions: "<<artifacts.pcir.functions.size()<<"\n  PMIR functions: "<<artifacts.pmir.functions.size()<<"\n  machine .text bytes: "<<artifacts.machine.text.size()<<"\n  entry: "<<artifacts.machine.entryName<<" +0x"<<std::hex<<artifacts.machine.entryOffset<<std::dec<<"\n";return 0;
+        }
 
-		auto ir = pcn::lowerProgramToIR(program);
-		if (outputMode == "ir") {
-			const std::string text = pcn::irToString(ir);
-			if (outputPath.empty()) std::cout << text;
-			else { std::ofstream out(outputPath, std::ios::binary); out << text; }
-			return 0;
-		}
-		if (outputMode == "cpp") {
-			pcn::CppIREmitter emitter;
-			const std::string text = emitter.emit(ir);
-			if (outputPath.empty()) std::cout << text;
-			else { std::ofstream out(outputPath, std::ios::binary); if (!out) throw std::runtime_error("failed to write file: " + outputPath); out << text; }
-			return 0;
-		}
-
-		pcn::PECOFFGenerator generator;
-		std::vector<std::uint8_t> binary = outputMode == "coff" ? generator.emitObject(ir) : generator.emitExecutable(ir);
-		if (!outputPath.empty()) {
-			std::ofstream output(outputPath, std::ios::binary);
-			if (!output) { std::cerr << "failed to write file: " << outputPath << "\n"; return 1; }
-			output.write(reinterpret_cast<const char*>(binary.data()), static_cast<std::streamsize>(binary.size()));
-		}
-		else {
-			std::cout.write(reinterpret_cast<const char*>(binary.data()), static_cast<std::streamsize>(binary.size()));
-		}
-		return 0;
-	}
-	catch (const std::exception& ex) {
-		std::cerr << "error: " << ex.what() << "\n";
-		return 1;
-	}
+        pcn::PECOFFGenerator generator;
+        if(command=="obj") { auto bytes=generator.emitObject(artifacts.pcir, options.entry); auto p=outputArg.empty()?pcn::withExtension(sourcePath,".obj"):std::filesystem::path(outputArg);pcn::writeBinaryFile(p,bytes);std::cout<<"wrote COFF object "<<p.string()<<" ("<<bytes.size()<<" bytes)\n";return 0; }
+        if(command=="pe"||command=="build") { auto bytes=generator.emitExecutable(artifacts.pcir, options.entry); auto p=outputArg.empty()?pcn::withExtension(sourcePath,".exe"):std::filesystem::path(outputArg);pcn::writeBinaryFile(p,bytes);std::cout<<"wrote PE32+ executable "<<p.string()<<" ("<<bytes.size()<<" bytes)\n";return 0; }
+        if(command=="package"||command=="bench"||command=="profile") throw std::runtime_error(command+" is reserved by the Paracine interface but its full package/profiling subsystem is not implemented in this native-core build");
+        throw std::runtime_error("unknown command: "+command);
+    } catch(const std::exception& ex) { std::cerr<<"error: "<<ex.what()<<"\n"; return 1; }
 }
 
