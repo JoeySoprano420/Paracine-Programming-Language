@@ -4452,3 +4452,1625 @@ Optional:
 .pcn → PCIR → C++20 → .cpp
 
 Clear to people. Obvious to machines.
+
+## *** ##
+
+# Paracine `text` / `string` Semantic and Native Representation Expansion
+
+## Governing definition
+
+Paracine shall represent `text` and `string` as two distinct language types with distinct semantic meaning, ownership behavior, mutation authority, PCIR identity, and target representation.
+
+The frozen Edition-2026 rule is:
+
+**`text` is an immutable borrowed UTF-8 slice.**
+
+**`string` is its owning counterpart.**
+
+The two types are related, but they are not aliases and must never collapse into a single semantic or IR type.
+
+The intended model is:
+
+```text
+text
+    immutable
+    borrowed
+    valid UTF-8
+    pointer + byte count
+    no ownership of backing storage
+    freely share-borrowable
+    no mutation operations
+    no allocation required merely to view
+
+string
+    owning
+    mutable
+    valid UTF-8 string storage
+    owns capacity/storage
+    participates in move/drop semantics
+    mutation requires exclusive access
+    growth may allocate
+    converting to text may borrow without copying
+```
+
+For truly arbitrary binary data whose contents are not required to remain valid UTF-8, Paracine continues to use:
+
+```text
+buffer<ubyte>
+view<ubyte>
+span<ubyte>
+array<ubyte, N>
+raw<ubyte>
+```
+
+This preserves the specification's separation between human-readable UTF-8 text and general-purpose byte storage.
+
+---
+
+# 1. Add distinct semantic types
+
+The current semantic layer must stop representing both `text` and `string` with `SemanticTypeKind::String`.
+
+Replace the existing conceptual form:
+
+```cpp
+enum class SemanticTypeKind {
+    Unknown,
+    Void,
+    Bool,
+    Number,
+    String,
+    Null,
+    Custom
+};
+```
+
+with:
+
+```cpp
+enum class SemanticTypeKind {
+    Unknown,
+    Void,
+    Bool,
+    Number,
+    Text,
+    String,
+    Null,
+    Custom
+};
+```
+
+`Text` and `String` must remain separate through:
+
+```text
+parsing
+↓
+typed syntax
+↓
+SAGE
+↓
+SKM
+↓
+PCIR
+↓
+optimization
+↓
+target legalization
+↓
+PMIR
+↓
+x86-64
+```
+
+They must not become distinguishable only at PMIR or ABI lowering.
+
+SAGE is the authoritative semantic layer, and PCIR is the authoritative semantic optimization representation, so the distinction must already exist before PCIR construction.
+
+## Semantic constructors
+
+Add:
+
+```cpp
+inline SemanticType makeTextType() {
+    return {SemanticTypeKind::Text, "text"};
+}
+
+inline SemanticType makeStringType() {
+    return {SemanticTypeKind::String, "string"};
+}
+```
+
+Then update:
+
+```cpp
+semanticTypeFromName()
+semanticTypeName()
+isAssignableTo()
+isTruthyCompatible()
+generic substitution
+capability resolution
+closure capture typing
+SKM serialization
+```
+
+so `text` and `string` are never treated as identical merely because both contain UTF-8 data.
+
+For example:
+
+```cpp
+inline SemanticType semanticTypeFromName(const std::string& name) {
+    if (name.empty()) return makeUnknownType();
+    if (name == "void") return makeVoidType();
+    if (name == "bool") return makeBoolType();
+
+    if (isNumericTypeName(name))
+        return {SemanticTypeKind::Number, name};
+
+    if (name == "text")
+        return makeTextType();
+
+    if (name == "string")
+        return makeStringType();
+
+    if (name == "null" || name == "nothing")
+        return makeNullType();
+
+    return makeCustomType(name);
+}
+```
+
+There must be no equivalent of:
+
+```cpp
+if (name == "text" || name == "string")
+    return sameType;
+```
+
+after this change.
+
+---
+
+# 2. Add `IRValueKind::Text`
+
+PCIR must preserve the semantic distinction.
+
+The current IR model should be expanded from:
+
+```cpp
+enum class IRValueKind {
+    Unknown,
+    Void,
+    Bool,
+    Int64,
+    String,
+    ...
+};
+```
+
+to:
+
+```cpp
+enum class IRValueKind {
+    Unknown,
+    Void,
+    Bool,
+    Int64,
+
+    Text,
+    String,
+
+    Null,
+    Function,
+    Aggregate,
+    Result,
+    Option,
+    Closure
+};
+```
+
+Add separate constructors:
+
+```cpp
+inline IRValueType makeIRTextType() {
+    return {IRValueKind::Text, "text"};
+}
+
+inline IRValueType makeIRStringType() {
+    return {IRValueKind::String, "string"};
+}
+```
+
+and update:
+
+```cpp
+irValueTypeName()
+irValueTypeFromName()
+IR verification
+PCIR printer
+PCIR interpreter
+optimizer
+PMIR legalization
+C++20 exporter
+ABI inspector
+```
+
+accordingly.
+
+The type-name conversion becomes:
+
+```cpp
+IRValueType irValueTypeFromName(const std::string& name) const {
+    if (name == "void") return makeIRVoidType();
+    if (name == "bool") return makeIRBoolType();
+    if (isNumericTypeName(name)) return makeIRIntType();
+
+    if (name == "text")
+        return makeIRTextType();
+
+    if (name == "string")
+        return makeIRStringType();
+
+    if (name == "null")
+        return makeIRNullType();
+
+    // result / option / closure / aggregate...
+}
+```
+
+This eliminates the current semantic collapse in which both source types are lowered through `makeIRStringType()`.
+
+---
+
+# 3. String literals produce `text`
+
+A normal quoted Paracine literal:
+
+```pcn
+"Hello, world"
+```
+
+must have type:
+
+```text
+text
+```
+
+not:
+
+```text
+string
+```
+
+This follows directly from the language's borrowed immutable-text model and from the README's native milestone, which explicitly identifies **text literals** as a foundational supported feature.
+
+The AST node may remain named `StringExpr` internally if desired for compatibility, although renaming it to `TextLiteralExpr` would make the compiler architecture clearer.
+
+Semantically:
+
+```cpp
+else if constexpr (std::is_same_v<T, StringExpr>) {
+    return makeTextType();
+}
+```
+
+And during PCIR construction:
+
+```cpp
+else if constexpr (std::is_same_v<T, StringExpr>) {
+    lastValueType_ = makeIRTextType();
+    return emitConst(IROpcode::ConstText, node.value);
+}
+```
+
+The preferred opcode should therefore become:
+
+```cpp
+ConstText
+```
+
+rather than using `ConstString` for immutable literals.
+
+A compatibility alias may temporarily exist internally:
+
+```cpp
+ConstStringLegacy
+```
+
+but new PCIR should not use it.
+
+## Literal storage
+
+A literal is immutable static UTF-8 storage.
+
+Conceptually:
+
+```text
+"Paracine"
+
+.rdata:
+    50 61 72 61 63 69 6E 65
+```
+
+and the resulting native `text` value is:
+
+```text
+{
+    ptr   = address_of_literal,
+    count = 8
+}
+```
+
+The README requires source decoding as UTF-8 and identifies `text` as UTF-8 content.
+
+---
+
+# 4. Define the native representation of `text`
+
+The existing rich-value legalization model should retain `text` as a borrowed two-word slice:
+
+```cpp
+struct NativeText {
+    const std::uint8_t* ptr;
+    std::size_t count;
+};
+```
+
+On Windows x86-64:
+
+```text
+offset 0: pointer       8 bytes
+offset 8: byte count    8 bytes
+
+size:      16
+alignment: 8
+```
+
+The count is a UTF-8 **byte count**, not necessarily a Unicode scalar-value count.
+
+`text` itself does not:
+
+```text
+allocate
+grow
+free storage
+mutate bytes
+own capacity
+```
+
+An empty safe `text` must use the canonical non-null sentinel required by the specification:
+
+```text
+ptr   = canonical_non_null_empty_sentinel
+count = 0
+```
+
+That requirement exists specifically so:
+
+```text
+option<text>
+```
+
+can use the null pointer as a guaranteed niche.
+
+Therefore:
+
+```text
+empty text:
+    ptr != null
+    count == 0
+
+none option<text>:
+    ptr == null
+```
+
+must remain an ABI invariant.
+
+---
+
+# 5. Define the native representation of `string`
+
+`string` is the owning counterpart of `text`.
+
+The canonical implementation representation should therefore be an owned UTF-8 buffer:
+
+```cpp
+struct NativeString {
+    std::uint8_t* ptr;
+    std::size_t count;
+    std::size_t capacity;
+};
+```
+
+Conceptually:
+
+```text
+offset 0:  owned byte pointer
+offset 8:  current UTF-8 byte count
+offset 16: allocated byte capacity
+
+size:      24
+alignment: 8
+```
+
+`string` owns its allocation.
+
+Therefore moving a string transfers:
+
+```text
+ptr
+count
+capacity
+```
+
+and invalidates the moved-from ownership state according to normal Paracine move rules.
+
+Destroying a live string releases its owned allocation.
+
+An empty string should use the same safe-empty principles used by other safe buffer-like types where applicable rather than manufacturing dangling pointers.
+
+Because `std.text.string` belongs to the allocation tier, string construction or growth that requires storage belongs to allocation-capable code rather than the allocation-free `core` text layer.
+
+---
+
+# 6. Keep UTF-8 validity as a semantic invariant
+
+`text` is always valid UTF-8.
+
+`string`, as the owning counterpart of `text`, should likewise maintain valid UTF-8 whenever exposed as a normal safe Paracine `string`.
+
+Safe mutation operations may therefore not leave a string permanently containing malformed UTF-8.
+
+For example:
+
+```text
+append(text)             safe
+append(char)             safe
+insert(char)             safe
+replace(text, text)      safe
+truncate(char-boundary)  safe
+```
+
+Operations that work directly with bytes must either:
+
+```text
+prove the resulting sequence remains UTF-8
+```
+
+or return a checked result such as:
+
+```pcn
+result<void, utf8_error>
+```
+
+or remain behind an unsafe/raw boundary.
+
+Arbitrary binary payloads therefore belong in:
+
+```pcn
+buffer<ubyte>
+```
+
+rather than normal `string`.
+
+This is also consistent with the specification's production security baseline, which explicitly includes UTF-8 validation.
+
+---
+
+# 7. Add explicit conversions
+
+No implicit conversion should silently change ownership.
+
+The specification already rejects broad implicit numeric conversion, and the same explicitness principle should govern ownership-changing text/string transformations.
+
+## `string.to_text()`
+
+Borrow an immutable view into an existing owned string:
+
+```pcn
+routine to_text(self: string) gives text
+```
+
+Conceptually:
+
+```text
+string
+    ptr ------+
+    count ----|----> text { ptr, count }
+    capacity  |
+```
+
+No allocation is necessary.
+
+No bytes are copied.
+
+The returned `text` borrow may not outlive the source `string`.
+
+SAGE must therefore record returned-borrow provenance from the source string.
+
+Conceptually:
+
+```pcn
+routine to_text(self: string) gives text
+    @from(self)
+```
+
+or the equivalent compiler-intrinsic provenance fact.
+
+The README makes returned-borrow provenance explicit and states that borrow regions are inferred and nonlexical.
+
+## `text.to_string()`
+
+Create owned mutable storage containing the text:
+
+```pcn
+routine to_string(self: text) gives string
+    with alloc
+```
+
+This operation:
+
+```text
+allocates capacity
+copies UTF-8 bytes
+establishes string ownership
+preserves UTF-8 validity
+```
+
+and therefore contributes:
+
+```text
+alloc
+```
+
+to the inferred effect set.
+
+Because allocating growth operations are fallible under the language rules, the underlying standard-library API should expose the appropriate fallible form as well, for example:
+
+```pcn
+routine try_to_string(self: text)
+    gives result<string, alloc_error>
+    with alloc
+```
+
+with any convenience trapping form contributing the appropriate trap effect.
+
+---
+
+# 8. Add dedicated PCIR conversion operations
+
+Conversions must survive semantic lowering rather than becoming opaque runtime calls too early.
+
+Add PCIR operations such as:
+
+```cpp
+TextToString,
+StringToText
+```
+
+or, more explicitly:
+
+```cpp
+TextCloneToString,
+StringBorrowAsText
+```
+
+Suggested semantics:
+
+```text
+string.borrow_text %string
+    -> text
+
+text.clone_string %text
+    -> string
+```
+
+Example PCIR:
+
+```text
+v1 = const.text "hello" : text
+v2 = text.to_string v1 : string
+v3 = string.to_text v2 : text
+```
+
+Their semantic behavior is different:
+
+```text
+text.to_string
+    ownership-producing
+    potentially allocating
+    effectful
+
+string.to_text
+    borrow-producing
+    nonallocating
+    ownership-preserving
+```
+
+The optimizer must not erase that distinction.
+
+---
+
+# 9. Add SAGE ownership rules
+
+`text` and `string` must participate differently in ownership analysis.
+
+## `text`
+
+A `text` value is a borrowed immutable slice.
+
+Reading it creates or extends only a shared borrow.
+
+Multiple simultaneous readers are legal:
+
+```pcn
+routine inspect(a: text, b: text)
+    ...
+```
+
+A `text` cannot authorize mutation of its backing bytes.
+
+Therefore:
+
+```text
+shared text borrow + shared text borrow
+    legal
+
+shared text borrow + mutation through same storage
+    illegal unless semantic ownership proves disjointness/lifetime separation
+```
+
+Because `text` contains borrowed storage, SAGE must retain its provenance.
+
+## `string`
+
+A `string` owns mutable storage.
+
+Normal parameter modes apply exactly as specified by Paracine:
+
+```pcn
+s: string
+```
+
+means:
+
+```text
+shared borrow
+```
+
+and therefore cannot mutate the string.
+
+```pcn
+var s: string
+```
+
+means:
+
+```text
+exclusive borrow
+```
+
+and permits mutation.
+
+```pcn
+own s: string
+```
+
+means:
+
+```text
+ownership transfer
+```
+
+and permits consuming/replacing/reallocating operations.
+
+The frozen specification explicitly defines default parameters as shared borrows, `var` as exclusive borrowing, and `own` as ownership transfer.
+
+---
+
+# 10. Enforce mutation authority
+
+String mutation must not merely depend on whether the local declaration used:
+
+```pcn
+var
+```
+
+It must depend on the actual borrow/ownership state known to SAGE.
+
+For example:
+
+```pcn
+routine inspect(s: string)
+    s.append("!")       # error
+```
+
+The parameter is a shared borrow.
+
+Mutation is illegal.
+
+Correct:
+
+```pcn
+routine modify(var s: string)
+    s.append("!")
+```
+
+or:
+
+```pcn
+routine consume(own s: string) gives string
+    s.append("!")
+    give s
+```
+
+SAGE must reject any operation requiring mutable storage when the active authority is only shared.
+
+This follows Paracine's general safety guarantee of no shared/mutable alias violation.
+
+---
+
+# 11. Add string mutation capabilities
+
+Paracine capability satisfaction is structural by name/signature with deterministic lookup.
+
+String operations should use that framework rather than creating a completely separate mutation system.
+
+Conceptually, built-in/library capabilities may describe operations such as:
+
+```pcn
+capability appendable<S, T>
+    routine append(var self: S, value: T)
+```
+
+A `string` can structurally satisfy appropriate capabilities such as:
+
+```text
+appendable<string, text>
+appendable<string, char>
+clearable<string>
+resizable<string>
+```
+
+The critical rule remains:
+
+**capability satisfaction says the operation exists; borrow authority says whether this particular call may mutate this particular value.**
+
+Those are independent questions.
+
+For example:
+
+```text
+string satisfies appendable<string,text>
+```
+
+does not make this legal:
+
+```pcn
+routine f(s: string)
+    s.append("x")
+```
+
+because `s` remains only shared.
+
+It becomes legal through:
+
+```pcn
+routine f(var s: string)
+    s.append("x")
+```
+
+---
+
+# 12. Integrate mutation with the effect system
+
+Paracine's effect set is fixed as:
+
+```text
+alloc
+io
+thread
+trap
+unsafe
+```
+
+with `pure` meaning the empty set.
+
+There is **no separate generic `mutate` effect** in the frozen Edition-2026 effect set.
+
+Therefore mutation itself should be governed by borrow authority, while additional consequences contribute existing effects.
+
+Examples:
+
+```pcn
+routine clear(var s: string)
+```
+
+may remain:
+
+```text
+pure
+```
+
+if it merely changes count without allocating or trapping.
+
+But:
+
+```pcn
+routine append(var s: string, value: text)
+```
+
+may require:
+
+```text
+alloc
+```
+
+because growth can require reallocation.
+
+Likewise:
+
+```text
+reserve
+grow
+insert
+replace
+to_string
+```
+
+may contribute:
+
+```text
+alloc
+```
+
+when allocation is possible.
+
+An implementation should therefore not invent:
+
+```text
+with mutate
+```
+
+unless the language specification itself is deliberately changed.
+
+Instead, Paracine should preserve the clean separation:
+
+```text
+borrow/ownership system
+    answers:
+    "may this code mutate this value?"
+
+effect system
+    answers:
+    "what externally relevant or exceptional operations may this routine perform?"
+```
+
+---
+
+# 13. Add nonlexical borrow behavior for `string.to_text()`
+
+This is especially important.
+
+Consider:
+
+```pcn
+routine example(var s: string)
+    let view = s.to_text()
+    inspect(view)
+
+    s.clear()
+```
+
+This should be legal.
+
+The immutable borrow created by:
+
+```pcn
+s.to_text()
+```
+
+ends after the last use of:
+
+```text
+view
+```
+
+so the later exclusive mutation:
+
+```pcn
+s.clear()
+```
+
+does not overlap it.
+
+But this is illegal:
+
+```pcn
+routine example(var s: string)
+    let view = s.to_text()
+
+    s.clear()
+    inspect(view)
+```
+
+because the shared text borrow remains live through `inspect(view)` and overlaps the attempted exclusive mutation.
+
+The README requires inferred **nonlexical** borrow regions rather than explicit lifetime parameters.
+
+SKM should therefore record something conceptually equivalent to:
+
+```text
+borrow region:
+    source = s
+    kind   = shared
+    begin  = string.to_text
+    end    = last use of view
+```
+
+---
+
+# 14. Make closure capture rules distinguish `text` and `string`
+
+Closure capture must preserve the same distinction.
+
+Reading outer `text`:
+
+```pcn
+let message: text = "hello"
+
+let f = routine()
+    use(message)
+```
+
+creates a shared capture.
+
+Reading an outer `string` without mutation:
+
+```pcn
+let name: string = ...
+
+let f = routine()
+    inspect(name)
+```
+
+also creates a shared capture.
+
+Mutating the string:
+
+```pcn
+var name: string = ...
+
+let f = routine()
+    name.append("!")
+```
+
+requires an exclusive capture.
+
+Moving the string:
+
+```pcn
+let f = move routine()
+    consume(name)
+```
+
+creates an owned capture where legal.
+
+These are exactly the general closure capture categories established by the specification:
+
+```text
+read     -> shared
+mutate   -> exclusive
+consume  -> own
+```
+
+
+---
+
+# 15. Give PCIR distinct text/string operations
+
+PCIR should not force all text and string behavior through generic calls.
+
+Useful semantic operations include:
+
+```text
+const.text
+text.length
+text.compare
+text.slice
+text.validate
+text.to_string
+
+string.new
+string.from_text
+string.to_text
+string.length
+string.capacity
+string.reserve
+string.append
+string.insert
+string.erase
+string.clear
+string.truncate
+string.dispose
+```
+
+Whether all become primitive PCIR opcodes is an optimizer/backend design choice.
+
+At minimum, the following semantic distinctions must be visible:
+
+```text
+immutable borrow
+owned mutable storage
+allocation
+reallocation
+borrowed projection
+ownership transfer
+destruction
+```
+
+This gives optimization enough information to eliminate unnecessary copies and allocations while still preserving borrow and effect correctness.
+
+---
+
+# 16. Teach the optimizer about `text`
+
+`text` is an excellent optimization type because it is immutable.
+
+Legal transformations include:
+
+```text
+constant length folding
+constant equality folding
+literal deduplication
+slice folding
+repeated-borrow elimination
+CSE of immutable text operations
+inlining of text views
+elimination of unused text materializations
+```
+
+For example:
+
+```pcn
+let x = "Paracine"
+let n = x.count()
+```
+
+may reduce to:
+
+```text
+n = 8
+```
+
+where semantics permit.
+
+Two identical static literals may share backing storage because neither can mutate it.
+
+---
+
+# 17. Teach the optimizer about `string`
+
+String optimizations require stronger proofs because ownership and mutation matter.
+
+Potential optimizations include:
+
+```text
+reserve folding
+capacity propagation
+allocation sinking
+allocation elimination
+move elision
+string-to-text borrow forwarding
+copy elimination
+SROA of temporary strings
+dead string construction elimination
+```
+
+For example:
+
+```pcn
+let owned = "hello".to_string()
+let view = owned.to_text()
+consume(view)
+```
+
+may be optimized aggressively if SAGE proves:
+
+```text
+owned does not escape
+no mutation occurs
+no API requires ownership
+```
+
+Potentially the owned `string` allocation may disappear entirely and `view` may reference the literal directly.
+
+But that transformation is legal only when semantic proof confirms no observable ownership or mutation difference.
+
+Paracine's optimizer must independently prove every transformation; advisory SAGE/stylometric information may never manufacture semantic authority.
+
+---
+
+# 18. Extend rich-value ABI legalization
+
+The ABI layer must now maintain two separate representations.
+
+## `text`
+
+```text
+ABI class: borrowed rich slice
+size:      16
+align:     8
+fields:
+    ptr
+    count
+ownership:
+    none
+drop:
+    none
+mutation:
+    impossible through text
+```
+
+## `string`
+
+```text
+ABI class: owned mutable buffer
+size:      24
+align:     8
+fields:
+    ptr
+    count
+    capacity
+ownership:
+    owning
+drop:
+    releases allocation
+mutation:
+    requires exclusive/owned authority
+```
+
+Both are native Paracine types and therefore are not automatically foreign-ABI-compatible. The README explicitly lists both `text` and `string` among the types requiring explicit foreign wrappers or thunks.
+
+---
+
+# 19. Add PMIR operations
+
+Target legalization can lower semantic PCIR into PMIR forms such as:
+
+```text
+PMIR_TEXT_ADDR
+PMIR_TEXT_COUNT
+
+PMIR_STRING_ADDR
+PMIR_STRING_COUNT
+PMIR_STRING_CAPACITY
+
+PMIR_STRING_BORROW_TEXT
+PMIR_STRING_MOVE
+PMIR_STRING_DROP
+PMIR_STRING_GROW
+```
+
+For:
+
+```pcn
+let t = s.to_text()
+```
+
+PMIR requires only projection of:
+
+```text
+s.ptr
+s.count
+```
+
+There is no allocation and no byte copy.
+
+For:
+
+```pcn
+let s = t.to_string()
+```
+
+PMIR must perform or call the allocation path, copy the byte sequence, and materialize:
+
+```text
+ptr
+count
+capacity
+```
+
+in the new owned object.
+
+---
+
+# 20. Define assignability explicitly
+
+The types should not be implicitly interchangeable.
+
+These should be rejected without an explicit conversion:
+
+```pcn
+let s: string = "hello"
+```
+
+if ordinary literal coercion is not specifically defined to allocate.
+
+The fully explicit form is:
+
+```pcn
+let s: string = "hello".to_string()
+```
+
+Likewise:
+
+```pcn
+routine read(value: text)
+
+var s: string = ...
+read(s)
+```
+
+should either require:
+
+```pcn
+read(s.to_text())
+```
+
+or, if Paracine defines a contextual borrow coercion, that coercion must be:
+
+```text
+nonallocating
+borrow-producing
+lifetime tracked
+never ownership-transferring
+```
+
+It must not be implemented as general type equality.
+
+The compiler must never make this true:
+
+```text
+text == string
+```
+
+at the semantic-type level.
+
+---
+
+# 21. Add diagnostics
+
+Introduce precise diagnostics rather than generic type mismatch errors.
+
+Examples:
+
+```text
+E04xx cannot mutate string through shared borrow
+
+E04xx mutable string borrow overlaps live text view
+
+E03xx string growth requires alloc effect
+
+E03xx text-to-string conversion may allocate
+
+E02xx string value required; found borrowed text
+
+E02xx text value required; explicit string.to_text() conversion available
+
+E04xx use of string after ownership transfer
+
+E04xx returned text borrow outlives source string
+
+E05xx invalid UTF-8 cannot construct safe text
+
+E05xx byte mutation would violate string UTF-8 invariant
+```
+
+Exact numeric assignments can be selected to fit Paracine's final diagnostic registry.
+
+---
+
+# 22. Update SKM
+
+The Semantic Knowledge Model should record enough information to make text/string ownership explicit.
+
+Suggested facts include:
+
+```text
+SKMTypeFact
+    kind = Text | String
+
+SKMBorrowRegionFact
+    sourceSymbol
+    borrowKind
+    beginPoint
+    endPoint
+    projection
+
+SKMOwnershipFact
+    symbol
+    owned
+    moved
+    disposed
+
+SKMTextProvenanceFact
+    textValue
+    backingSymbol
+    staticLiteral
+    byteRange
+
+SKMStringMutationFact
+    stringSymbol
+    operation
+    requiresExclusive
+    mayAllocate
+```
+
+This prevents PCIR, optimizer, and PMIR from independently reconstructing ownership facts.
+
+---
+
+# 23. Preserve distinctions in `result`, `option`, aggregates, and closures
+
+The distinction must survive nesting.
+
+These are all separate layouts and semantics:
+
+```pcn
+option<text>
+option<string>
+
+result<text, E>
+result<string, E>
+
+record A
+    name: text
+
+record B
+    name: string
+
+closure capturing text
+closure owning string
+```
+
+`option<text>` receives the guaranteed null-niche representation because safe empty text uses a non-null sentinel.
+
+`option<string>` must use whatever representation the compiler proves valid for the owning string representation; it must not simply inherit the text niche without proving the required invariant.
+
+---
+
+# 24. Update standard-library layering
+
+The README already separates:
+
+```text
+std.text core
+```
+
+from:
+
+```text
+std.text.string
+```
+
+in the allocation tier.
+
+That should become an architectural boundary.
+
+`std.text` should contain allocation-free immutable operations such as:
+
+```text
+length
+is_empty
+compare
+starts_with
+ends_with
+find
+slice
+UTF-8 traversal
+Unicode scalar iteration
+validation
+```
+
+`std.text.string` should contain owned/mutable operations such as:
+
+```text
+new
+with_capacity
+from_text
+try_from_text
+reserve
+append
+insert
+erase
+replace
+clear
+truncate
+shrink
+into_buffer
+borrow_text
+```
+
+Operations that may grow storage contribute `alloc`.
+
+---
+
+# 25. Update the C++20 exporter
+
+The optional exporter must preserve the same distinction.
+
+A plausible representation is:
+
+```cpp
+struct pcn_text {
+    const std::uint8_t* ptr;
+    std::size_t count;
+};
+
+struct pcn_string {
+    std::uint8_t* ptr;
+    std::size_t count;
+    std::size_t capacity;
+};
+```
+
+The exporter must not reduce both to:
+
+```cpp
+std::string
+```
+
+because that destroys:
+
+```text
+borrow provenance
+nonownership of text
+allocation visibility
+move semantics
+capacity semantics
+ABI equivalence
+```
+
+The C++20 exporter is a semantic-equivalent secondary backend, not permission to weaken Paracine's type model.
+
+---
+
+# 26. Required conformance tests
+
+The implementation should add a dedicated text/string conformance matrix.
+
+Compile-success cases should include:
+
+```pcn
+let t: text = "hello"
+```
+
+```pcn
+let s = "hello".to_string()
+let t = s.to_text()
+```
+
+```pcn
+routine mutate(var s: string)
+    s.append("!")
+```
+
+```pcn
+routine consume(own s: string)
+    ...
+```
+
+```pcn
+routine many_readers(a: text, b: text)
+    ...
+```
+
+NLL success:
+
+```pcn
+routine test(var s: string)
+    let t = s.to_text()
+    inspect(t)
+
+    s.clear()
+```
+
+Expected failures should include:
+
+```pcn
+routine bad(s: string)
+    s.clear()
+```
+
+because `s` is shared.
+
+And:
+
+```pcn
+routine bad(var s: string)
+    let t = s.to_text()
+
+    s.clear()
+    inspect(t)
+```
+
+because the immutable text borrow remains live.
+
+And use-after-move:
+
+```pcn
+routine bad(own s: string)
+    consume(s)
+    inspect(s)
+```
+
+The mandatory Paracine conformance suites already require ownership facts, borrow facts, effect facts, PCIR verification, ABI lowering, and PCIR/native differential testing, so text/string tests must participate in all of those layers rather than only parser tests.
+
+---
+
+# 27. Final implementation rule
+
+The compiler must never again use one internal "String" category to mean both borrowed text and owned mutable string storage.
+
+The permanent model is:
+
+```text
+SOURCE
+
+"hello"
+   │
+   ▼
+ text
+ immutable borrowed UTF-8
+   │
+   ├────────────── string.to_text() ◄──────────────┐
+   │                                               │
+   │                                               │
+   └── text.to_string() ── alloc/copy ──► string  │
+                                          │        │
+                                          │ owned  │
+                                          │ mutable│
+                                          └────────┘
+```
+
+Semantically:
+
+```text
+text   != string
+```
+
+Operationally:
+
+```text
+text   = immutable borrow
+string = owned mutable UTF-8 storage
+```
+
+For arbitrary binary storage:
+
+```text
+buffer<ubyte>
+view<ubyte>
+span<ubyte>
+```
+
+remains the canonical byte-oriented family.
+
+This keeps Paracine aligned with its frozen Edition-2026 rules:
+
+```text
+text is immutable and borrowed
+string owns the storage
+default parameters are shared
+var means exclusive borrowing
+own transfers ownership
+borrow regions are inferred and nonlexical
+allocation contributes alloc
+safe empty text has a canonical non-null representation
+option<text> therefore has a guaranteed null niche
+```
+
+and carries that distinction intact from SAGE through PCIR, optimization, PMIR, x86-64, COFF, PE32+, and the optional C++20 exporter.
+
+## *** ##
+
