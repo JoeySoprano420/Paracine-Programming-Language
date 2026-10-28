@@ -6074,3 +6074,51 @@ and carries that distinction intact from SAGE through PCIR, optimization, PMIR, 
 
 ## *** ##
 
+Paracine native backend upgrade — implementation and verification status
+Status: An executable native backend for a verified, substantial subset of the supplied frontend, NOT a production-ready, complete implementation of every accepted language construct.
+
+Source of patch: the user's exact 7,204-line CRLF attachment Pasted text(20261028-224523).txt (byte-exact after patch application).
+
+Output source: Paracine_Backend_Expanded.cpp, 7,394 physical lines. C++23.
+Changes relative to attached source
+1. Rebased the previously developed rich-value codegen spine onto this exact attachment, replacing the older scalar-only PMIR/PCIR-oracle paths. Native values include records, text, results/options, and monomorphic closure environments. The ABI model includes hidden sret storage, Windows x64 argument lanes and rich-value stack storage.
+2. Corrected choose from an unconditional pseudo-phi into a real sequence of conditional branches with lazily evaluated arms. A choose subject compares the subject against each when condition; subjectless choose requires bool conditions. Non-exhaustive choose expressions are rejected unless an otherwise arm exists.
+3. Made defer scope-exit based, with LIFO expression execution on normal exits, give, return, fail, break, and continue. Return operands are snapshotted before running deferred cleanup. A corner case remains: early-return through the existing native result.try opcode has not been integrated with deferred cleanup.
+4. Fixed an actual segmentation fault during lowering of for loops with break/`continue` by keeping the defer scope-depth stack synchronized with loop targets.
+5. Added a reachable-path verifier that rejects non-void functions that fall through without a return, and explicit void returns at normal routine exit.
+6. Changed the PMIR opcode mapper to fail closed on unhandled instructions instead of silently converting them to NOP.
+7. The optional C++20 emitter now rejects rich-value instructions and print/println it cannot faithfully implement, instead of generating comments/no-op code that appears runnable.
+8. Added native machine execution to the compiler's own test subcommand: on Windows, generate and run a PE through the Windows loader; on Linux x86-64, map emitted self-contained .text as RX and invoke with the Microsoft x64 ABI. On Linux this is direct machine-code execution, not PE loader emulation.
+9. run likewise invokes the emitted Microsoft-x64 machine code on Linux x86-64 for self-contained programs. Native Win32 API calls are not supported in this execution mode.
+Verification performed in this session
+- GCC g++ -std=c++23 -O0: compile success.
+- Clang clang++ -std=c++23 -O0: compile success.
+- Actual emitted x86-64 executions compared against PCIR oracle: 5 programs × O0/O2/O3 = 15/15 passed: choose bool cases (17), choose subject (42), record passing (17), basic defer (17), loop break/continue (18).
+- Additional choose lazy evaluation test: 4/4 passes at O0/O1/O2/O3; untaken arm divides by zero, but is never executed; result 23.
+- Additional generated machine-code tests using compiler test command: concrete closure capture (17), result/try propagation (17) passed.
+- Direct Windows-x64 ABI in-memory native call: string.to_text() returned matching source pointer/count and sret pointer; deferred string.clear() mutated count to zero without touching capacity.
+- file and GNU objdump recognize generated executable as Windows PE32+ x86-64, six sections, with .pdata and .xdata unwind information.
+- C++20 scalar choose export compiled and exited 17; rich C++20 export rejected explicitly.
+- Missing return was rejected; implicit text-to-string assignment was rejected.
+- Unified patch dry-run applied to a copy of the exact attached source; full patch application yielded a byte-for-byte copy of updated compiler.
+What this build still does not support
+Do not describe this build as executing the entire frontend or as industrially production-ready. Important unsupported/incomplete areas include:
+- Owned text.to_string() allocation, growth, deallocation/destruction and allocation failure handling; the direct Windows native emitter correctly rejects it, rather than fabricating ownership of literal memory.
+- Win32 import table, external C/foreign ABIs, import libraries, and native print/println I/O paths.
+- Non-range iterators, multi-binding loops, structural pattern matching/exhaustiveness beyond the implemented choose form, labeled break/`continue`.
+- Complete module/import/linking semantics, constant evaluation, generic container runtime, full array/buffer/view/span operations and variants/enums.
+- Complete native/SAGE borrow and move proofs under every program shape, scope-exit cleanup when result.try early-returns, destructor/drop glue.
+- Complete C++20 rich-value emitter; formatter/package/profile subsystems.
+- A full Windows loader run or MSVC 2022 test was not performed in this Linux environment. Windows-specific loader/unwind/ASLR testing remains necessary.
+- Formal conformance, fuzzing, security hardening, stress tests, stable diagnostics/ABI and release qualification have not been completed.
+This artifact is a validated working backend upgrade and reproducible engineering milestone, not a claim that a many-subsystem language implementation is complete.
+Build and test
+g++ -std=c++23 -O0 Paracine_Backend_Expanded.cpp -o paracine
+./paracine check tests/test_rich.pcn
+./paracine test tests/test_rich.pcn
+./paracine run tests/test_choose.pcn
+./paracine build tests/test_rich.pcn -o result.exe
+On Windows, add Paracine_Backend_Expanded.cpp to an x64 C++23 Visual Studio project, set your .pcn source as the command argument and invoke build, test, or run.
+
+## *** ##
+
