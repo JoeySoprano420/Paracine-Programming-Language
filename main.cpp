@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cctype>
 #include <cstring>
@@ -530,6 +531,19 @@ namespace pcn {
 		SourceLocation location;
 	};
 
+	struct ArrayExpr {
+		std::vector<ExprPtr> elements;
+		SourceSpan span;
+		SourceLocation location;
+	};
+
+	struct IndexExpr {
+		ExprPtr object;
+		ExprPtr index;
+		SourceSpan span;
+		SourceLocation location;
+	};
+
 	struct ConstructField {
 		std::string name;
 		ExprPtr value;
@@ -544,7 +558,7 @@ namespace pcn {
 	};
 
 	struct Expr {
-		using Node = std::variant<NumberExpr, StringExpr, BoolExpr, NullExpr, VariableExpr, UnaryExpr, BinaryExpr, PipelineExpr, RangeExpr, ChooseExpr, CallExpr, TryExpr, ClosureExpr, GroupExpr, MemberExpr, ConstructExpr>;
+		using Node = std::variant<NumberExpr, StringExpr, BoolExpr, NullExpr, VariableExpr, UnaryExpr, BinaryExpr, PipelineExpr, RangeExpr, ChooseExpr, CallExpr, TryExpr, ClosureExpr, GroupExpr, MemberExpr, ConstructExpr, ArrayExpr, IndexExpr>;
 		Node node;
 		SourceSpan span;
 		SourceLocation location;
@@ -1025,6 +1039,8 @@ namespace pcn {
 		Void,
 		Bool,
 		Int64,
+		Float32,
+		Float64,
 		Text,
 		String,
 		Null,
@@ -1060,6 +1076,12 @@ namespace pcn {
 		return { IRValueKind::Text, "text" };
 	}
 
+	inline IRValueType makeIRFloatType(const std::string& type) {
+		if (type == "float") return { IRValueKind::Float32, "float" };
+		if (type == "double") return { IRValueKind::Float64, "double" };
+		throw std::runtime_error("expected IEEE-754 float/double type");
+	}
+
 	inline IRValueType makeIRStringType() {
 		return { IRValueKind::String, "string" };
 	}
@@ -1077,6 +1099,8 @@ namespace pcn {
 		case IRValueKind::Void: return "void";
 		case IRValueKind::Bool: return "bool";
 		case IRValueKind::Int64: return "int64";
+		case IRValueKind::Float32: return "float";
+		case IRValueKind::Float64: return "double";
 		case IRValueKind::Text: return "text";
 		case IRValueKind::String: return "string";
 		case IRValueKind::Null: return "null";
@@ -1092,6 +1116,7 @@ namespace pcn {
 	// --- IR types ---------------------------------------------------------------
 	enum class IROpcode {
 		ConstInt,
+		ConstFloat,
 		ConstText,
 		ConstBool,
 		ConstNull,
@@ -1131,6 +1156,7 @@ namespace pcn {
 		TextEquals,
 		MakeAggregate,
 		ExtractField,
+		ArrayIndex,
 		ResultOk,
 		ResultErr,
 		ResultIsErr,
@@ -1395,6 +1421,22 @@ namespace pcn {
 	}
 	static bool typeIsOption(const std::string& typeName, std::string* valueType = nullptr) {
 		try { auto t = CanonicalTypeParser(typeName).parse(); if (t.head != "option" || t.args.size() != 1)return false; if (valueType)*valueType = canonicalTypeText(t.args[0]); return true; }
+		catch (...) { return false; }
+	}
+
+	static bool typeIsArray(const std::string& name, std::string* element = nullptr,
+		std::size_t* count = nullptr) {
+		try {
+			const auto t = CanonicalTypeParser(name).parse();
+			if (t.head != "array" || t.args.size() != 2 || !t.args[1].args.empty()) return false;
+			const auto& digits = t.args[1].head;
+			if (digits.empty() || !std::all_of(digits.begin(), digits.end(), [](unsigned char c) {return std::isdigit(c) != 0; })) return false;
+			const auto n = std::stoull(digits);
+			if (n > (1ull << 20)) return false; // compiler resource bound; not a source-language maximum
+			if (element) *element = canonicalTypeText(t.args[0]);
+			if (count) *count = static_cast<std::size_t>(n);
+			return true;
+		}
 		catch (...) { return false; }
 	}
 
@@ -1845,7 +1887,7 @@ namespace pcn {
 				expectSymbol(")");
 				return tuple + ")";
 			}
-			if (peek().kind != TokenKind::Identifier && peek().kind != TokenKind::Keyword) {
+			if (peek().kind != TokenKind::Identifier && peek().kind != TokenKind::Keyword && peek().kind != TokenKind::Number) {
 				throw std::runtime_error("expected type name");
 			}
 			std::string name = consume().text;
@@ -2035,6 +2077,12 @@ namespace pcn {
 				}
 				else if constexpr (std::is_same_v<T, ConstructExpr>) {
 					return AstFactory::makeExpr(Expr{ ConstructExpr{ value.typeName, value.fields, span, location }, span, location }, span);
+				}
+				else if constexpr (std::is_same_v<T, ArrayExpr>) {
+					return AstFactory::makeExpr(Expr{ ArrayExpr{ value.elements, span, location }, span, location }, span);
+				}
+				else if constexpr (std::is_same_v<T, IndexExpr>) {
+					return AstFactory::makeExpr(Expr{ IndexExpr{ value.object, value.index, span, location }, span, location }, span);
 				}
 				else {
 					return AstFactory::makeExpr(Expr{ GroupExpr{ value.expression, span, location }, span, location }, span);
@@ -2294,15 +2342,32 @@ namespace pcn {
 		}
 
 		ExprPtr parsePipeline() {
+			// Edition-2026 pipeline stages are normal calls with the left-hand value
+			// supplied as their first argument. Desugar *before* SAGE so effects,
+			// overload selection, ownership and generic specialization see exactly
+			// the call that will run; never evaluate a discarded pipeline stage.
 			auto expr = parseLogicalOr();
 			while (matchSymbol("->")) {
 				auto location = previous().location;
-				std::vector<ExprPtr> stages;
-				stages.push_back(parseCall());
-				auto start = expr ? expr->span.start : location;
-				auto end = stages.back() ? stages.back()->span.end : location;
-				auto nodeSpan = SourceSpan{ start, end };
-				expr = makeExpr(PipelineExpr{ expr, std::move(stages), nodeSpan, location }, nodeSpan, location);
+				auto stage = parseCall();
+				ExprPtr callee;
+				std::vector<ExprPtr> arguments;
+				std::vector<std::string> genericArguments;
+				if (const auto* call = std::get_if<CallExpr>(&stage->node)) {
+					callee = call->callee;
+					arguments = call->arguments;
+					genericArguments = call->genericArguments;
+				}
+				else if (std::holds_alternative<VariableExpr>(stage->node)) {
+					callee = stage;
+				}
+				else {
+					throw std::runtime_error("E0214 pipeline stage must be a routine name or a routine call");
+				}
+				arguments.insert(arguments.begin(), expr);
+				SourceSpan span{ expr->span.start, stage->span.end };
+				expr = makeExpr(CallExpr{ callee, std::move(arguments),
+										 std::move(genericArguments), span, location }, span, location);
 			}
 			return expr;
 		}
@@ -2468,6 +2533,14 @@ namespace pcn {
 		ExprPtr parseCall() {
 			auto expr = parsePrimary();
 			for (;;) {
+				if (matchSymbol("[")) {
+					const auto start = expr->span.start;
+					auto idx = parseExpression();
+					auto close = expectSymbol("]");
+					const SourceSpan span{ start,close.location };
+					expr = makeExpr(IndexExpr{ expr,idx,span,start }, span, start);
+					continue;
+				}
 				if (matchSymbol(".")) {
 					auto memberToken = expectIdentifier();
 					auto span = SourceSpan{ expr ? expr->span.start : memberToken.location, memberToken.location };
@@ -2519,6 +2592,16 @@ namespace pcn {
 		}
 
 		ExprPtr parsePrimary() {
+			if (matchSymbol("[")) {
+				auto start = previous().location;
+				std::vector<ExprPtr> elements;
+				if (!checkSymbol("]")) {
+					do { elements.push_back(parseExpression()); } while (matchSymbol(",") && !checkSymbol("]"));
+				}
+				const auto close = expectSymbol("]");
+				SourceSpan span{ start,close.location };
+				return makeExpr(ArrayExpr{ std::move(elements),span,start }, span, start);
+			}
 			if (matchKeyword("move")) { auto start = previous().location; expectKeyword("routine"); return parseClosureExpression(true, start); }
 			if (matchKeyword("routine")) { auto start = previous().location; return parseClosureExpression(false, start); }
 			if (matchSymbol("(")) {
@@ -2585,6 +2668,120 @@ namespace pcn {
 		std::size_t nextClosureId_ = 0;
 	};
 
+
+	// Canonical, side-effect-free top-level compile-time constants.  This pass
+	// resolves dependencies and cycles before the semantic checker or backend runs.
+	// It intentionally rejects constructs for which constant semantics are not yet
+	// implemented instead of generating a runtime expression disguised as `const`.
+	class TopLevelConstantResolver {
+		using Value = std::variant<std::int64_t, bool, std::string>;
+		std::unordered_map<std::string, const ConstDecl*> declarations_;
+		std::unordered_map<std::string, Value> values_;
+		std::unordered_set<std::string> active_;
+		static std::int64_t modular(std::uint64_t v) { return std::bit_cast<std::int64_t>(v); }
+		static std::int64_t integer(const Value& v) {
+			if (auto p = std::get_if<std::int64_t>(&v)) return *p;
+			throw std::runtime_error("E0231 constant expression requires an integer operand");
+		}
+		static bool boolean(const Value& v) {
+			if (auto p = std::get_if<bool>(&v)) return *p;
+			throw std::runtime_error("E0231 constant expression requires a boolean operand");
+		}
+		Value eval(const ExprPtr& e) {
+			if (!e) throw std::runtime_error("E0231 missing constant initializer");
+			return std::visit([&](const auto& n)->Value {
+				using T = std::decay_t<decltype(n)>;
+				if constexpr (std::is_same_v<T, NumberExpr>) {
+					if (n.value.find('.') != std::string::npos)
+						throw std::runtime_error("E0231 floating-point const evaluation is not yet supported");
+					try {
+						std::string digits = n.value;
+						digits.erase(std::remove(digits.begin(), digits.end(), '_'), digits.end());
+						const bool hex = digits.size() > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X');
+						const bool bin = digits.size() > 2 && digits[0] == '0' && (digits[1] == 'b' || digits[1] == 'B');
+						if (bin) digits.erase(0, 2);
+						std::size_t used = 0;
+						auto v = std::stoll(digits, &used, bin ? 2 : hex ? 16 : 10);
+						if (used != digits.size())throw std::invalid_argument("suffix");
+						return static_cast<std::int64_t>(v);
+					}
+					catch (...) { throw std::runtime_error("E0231 invalid or out-of-range integer constant: " + n.value); }
+				}
+				else if constexpr (std::is_same_v<T, BoolExpr>) return n.value;
+				else if constexpr (std::is_same_v<T, StringExpr>) return n.value;
+				else if constexpr (std::is_same_v<T, VariableExpr>) return resolve(n.name);
+				else if constexpr (std::is_same_v<T, GroupExpr>) return eval(n.expression);
+				else if constexpr (std::is_same_v<T, UnaryExpr>) {
+					auto v = eval(n.operand);
+					if (n.op == "-")return modular(0ull - std::bit_cast<std::uint64_t>(integer(v)));
+					if (n.op == "~")return modular(~std::bit_cast<std::uint64_t>(integer(v)));
+					if (n.op == "not" || n.op == "!")return !boolean(v);
+					throw std::runtime_error("E0231 unsupported unary constant operator: " + n.op);
+				}
+				else if constexpr (std::is_same_v<T, BinaryExpr>) {
+					auto a = eval(n.left);
+					if (n.op == "and" || n.op == "&&") { if (!boolean(a))return false; return boolean(eval(n.right)); }
+					if (n.op == "or" || n.op == "||") { if (boolean(a))return true; return boolean(eval(n.right)); }
+					auto b = eval(n.right);
+					if (n.op == "==" || n.op == "!=") {
+						if (a.index() != b.index())throw std::runtime_error("E0231 incompatible types in constant equality");
+						bool same = a == b; return n.op == "==" ? same : !same;
+					}
+					auto x = integer(a), y = integer(b);
+					auto ux = std::bit_cast<std::uint64_t>(x), uy = std::bit_cast<std::uint64_t>(y);
+					if (n.op == "+")return modular(ux + uy);
+					if (n.op == "-")return modular(ux - uy);
+					if (n.op == "*")return modular(ux * uy);
+					if (n.op == "&")return modular(ux & uy);
+					if (n.op == "|")return modular(ux | uy);
+					if (n.op == "^")return modular(ux ^ uy);
+					if (n.op == "<<")return modular(ux << (uy & 63u));
+					if (n.op == ">>")return x >> (uy & 63u);
+					if (n.op == "/") { if (!y)throw std::runtime_error("E0232 division by zero in constant"); if (x == INT64_MIN && y == -1)return x; return x / y; }
+					if (n.op == "%") { if (!y)throw std::runtime_error("E0232 remainder by zero in constant"); if (x == INT64_MIN && y == -1)return std::int64_t{ 0 }; return x % y; }
+					if (n.op == "<")return x < y;
+					if (n.op == "<=")return x <= y;
+					if (n.op == ">")return x > y;
+					if (n.op == ">=")return x >= y;
+					throw std::runtime_error("E0231 unsupported binary constant operator: " + n.op);
+				}
+				else throw std::runtime_error("E0231 constant initializer must be a pure compile-time expression");
+				}, e->node);
+		}
+		Value resolve(const std::string& name) {
+			if (auto i = values_.find(name); i != values_.end())return i->second;
+			auto d = declarations_.find(name);
+			if (d == declarations_.end())throw std::runtime_error("E0231 unknown constant: " + name);
+			if (!active_.insert(name).second)throw std::runtime_error("E0233 circular constant definition: " + name);
+			auto result = eval(d->second->value);
+			active_.erase(name);
+			auto type = d->second->typeName;
+			if (type.empty())type = std::holds_alternative<bool>(result) ? "bool" : std::holds_alternative<std::string>(result) ? "text" : "int";
+			const bool good = (type == "bool" && std::holds_alternative<bool>(result)) ||
+				(type == "text" && std::holds_alternative<std::string>(result)) ||
+				((type == "int" || type == "long") && std::holds_alternative<std::int64_t>(result));
+			if (!good)throw std::runtime_error("E0234 constant '" + name + "' initializer does not match declared type '" + type + "'");
+			if (type == "int") { auto x = integer(result); if (x<INT32_MIN || x>INT32_MAX) throw std::runtime_error("E0234 32-bit int constant out of range: " + name); }
+			values_[name] = result;
+			return result;
+		}
+	public:
+		void resolveProgram(Program& p) {
+			declarations_.clear(); values_.clear(); active_.clear();
+			for (const auto& d : p.declarations) if (const auto* c = std::get_if<ConstDecl>(&d.node)) {
+				if (!declarations_.emplace(c->name, c).second)throw std::runtime_error("E0233 duplicate constant: " + c->name);
+			}
+			for (auto& d : p.declarations) if (auto* c = std::get_if<ConstDecl>(&d.node)) {
+				auto v = resolve(c->name);
+				if (c->typeName.empty())c->typeName = std::holds_alternative<bool>(v) ? "bool" : std::holds_alternative<std::string>(v) ? "text" : "int";
+				SourceSpan span = c->value->span;
+				if (auto n = std::get_if<std::int64_t>(&v))c->value = AstFactory::makeExpr(NumberExpr{ std::to_string(*n),span,span.start }, span);
+				else if (auto b = std::get_if<bool>(&v))c->value = AstFactory::makeExpr(BoolExpr{ *b,span,span.start }, span);
+				else c->value = AstFactory::makeExpr(StringExpr{ std::get<std::string>(v),span,span.start }, span);
+			}
+		}
+	};
+
 	// --- Frontend: parsing and semantic analysis --------------------------------
 	class SemanticAnalyzer {
 	public:
@@ -2593,6 +2790,7 @@ namespace pcn {
 			routines_.clear();
 			nominalTypes_.clear();
 			closureSignatures_.clear();
+			globalConstTypes_.clear();
 			declarationScopes_.clear();
 			pushDeclarationScope();
 			for (const auto& declaration : program.declarations) {
@@ -2740,7 +2938,8 @@ namespace pcn {
 				else if constexpr (std::is_same_v<T, ConstDecl>) {
 					DeclarationInfo info{ node.name, "const", node.isPublic, node.isCompileTime, node.typeName };
 					result_.declarations.push_back(std::move(info));
-					declareSymbol(node.location, node.name, { semanticTypeFromName(node.typeName), false, false });
+					if (!globalConstTypes_.emplace(node.name, SymbolInfo{ semanticTypeFromName(node.typeName), false, false }).second)
+						report(node.location, "duplicate global constant: " + node.name);
 				}
 				else if constexpr (std::is_same_v<T, CapabilityDecl>) {
 					registerNominal(node.name, "capability", node.isPublic, false, node.location);
@@ -3300,6 +3499,8 @@ namespace pcn {
 		SemanticType analyzeUnaryExpr(const UnaryExpr& node) {
 			auto operandType = analyzeExpr(node.operand);
 			if (node.op == "-" || node.op == "~") {
+				if (node.op == "~" && (operandType.name == "float" || operandType.name == "double"))
+					report(node.location, "E0346 bitwise complement requires integer type");
 				if (!isNumericType(operandType) && operandType.kind != SemanticTypeKind::Unknown) {
 					report(node.location, "unary '" + node.op + "' requires a numeric operand, got " + semanticTypeName(operandType));
 				}
@@ -3416,10 +3617,20 @@ namespace pcn {
 			return makeUnknownType();
 		}
 
+		void checkNumericCompatibility(const BinaryExpr& node, const SemanticType& left, const SemanticType& right) {
+			if (left.kind == SemanticTypeKind::Number && right.kind == SemanticTypeKind::Number &&
+				left.name != "number" && right.name != "number" && left.name != right.name)
+				report(node.location, "E0345 no implicit conversion between numeric types '" + left.name + "' and '" + right.name + "'");
+		}
+
 		SemanticType analyzeArithmeticBinary(const BinaryExpr& node, const SemanticType& leftType, const SemanticType& rightType) {
 			if ((!isNumericType(leftType) || !isNumericType(rightType)) && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
 				report(node.location, "arithmetic operator '" + node.op + "' requires numbers");
 			}
+			checkNumericCompatibility(node, leftType, rightType);
+			if ((leftType.name == "float" || leftType.name == "double" || rightType.name == "float" || rightType.name == "double") &&
+				(node.op == "%" || node.op == "&" || node.op == "|" || node.op == "^" || node.op == "<<" || node.op == ">>"))
+				report(node.location, "E0346 integer-only operator applied to floating-point operand");
 			if (isNumericType(leftType) && leftType.name != "number") return leftType;
 			if (isNumericType(rightType) && rightType.name != "number") return rightType;
 			return (isNumericType(leftType) || isNumericType(rightType) || leftType.kind == SemanticTypeKind::Unknown || rightType.kind == SemanticTypeKind::Unknown)
@@ -3439,6 +3650,7 @@ namespace pcn {
 			if ((!isNumericType(leftType) || !isNumericType(rightType)) && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
 				report(node.location, "comparison operator '" + node.op + "' requires numbers");
 			}
+			checkNumericCompatibility(node, leftType, rightType);
 			return makeBoolType();
 		}
 
@@ -3476,6 +3688,7 @@ namespace pcn {
 			if (!isAssignableTo(leftType, rightType) && !isAssignableTo(rightType, leftType) && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
 				report(node.location, "equality comparison requires compatible types");
 			}
+			if (isNumericType(leftType) && isNumericType(rightType))checkNumericCompatibility(node, leftType, rightType);
 			return makeBoolType();
 		}
 
@@ -3565,6 +3778,33 @@ namespace pcn {
 				}
 				else if constexpr (std::is_same_v<T, ConstructExpr>) {
 					return analyzeConstructExpr(node);
+				}
+				else if constexpr (std::is_same_v<T, ArrayExpr>) {
+					if (node.elements.empty()) { report(node.location, "empty array literal requires explicit constructor support"); return makeUnknownType(); }
+					auto first = analyzeExpr(node.elements.front());
+					std::string element = first.kind == SemanticTypeKind::Number && first.name == "number" ?
+						(std::holds_alternative<NumberExpr>(node.elements.front()->node) &&
+							std::get<NumberExpr>(node.elements.front()->node).value.find('.') != std::string::npos ? "double" : "int")
+						: semanticTypeName(first);
+					if (element == "unknown" || element == "void" || element == "string") report(node.location, "unsupported or owning element in fixed-array literal");
+					for (std::size_t n = 1; n < node.elements.size(); ++n) {
+						auto next = analyzeExpr(node.elements[n]);
+						if (!isAssignableTo(semanticTypeFromName(element), next)) report(node.location, "array literal elements must have a common type");
+					}
+					return makeCustomType("array<" + element + "," + std::to_string(node.elements.size()) + ">");
+				}
+				else if constexpr (std::is_same_v<T, IndexExpr>) {
+					const auto base = analyzeExpr(node.object);
+					auto idx = analyzeExpr(node.index);
+					std::string element; std::size_t count = 0;
+					if (!typeIsArray(base.name, &element, &count)) { report(node.location, "indexing requires array<T,N>"); return makeUnknownType(); }
+					if (idx.kind != SemanticTypeKind::Number)report(node.location, "array index must be integer");
+					if (auto* lit = std::get_if<NumberExpr>(&node.index->node)) {
+						if (lit->value.find('.') != std::string::npos)report(node.location, "array index must be integer");
+						else try { if (std::stoull(lit->value) >= count)report(node.location, "array index out of bounds"); }
+						catch (...) { report(node.location, "invalid array index"); }
+					}
+					return semanticTypeFromName(element);
 				}
 				else {
 					return makeUnknownType();
@@ -3658,7 +3898,8 @@ namespace pcn {
 					return &symbolIt->second;
 				}
 			}
-			return nullptr;
+			auto global = globalConstTypes_.find(name);
+			return global == globalConstTypes_.end() ? nullptr : &global->second;
 		}
 
 		void declareSymbol(SourceLocation location, const std::string& name, SymbolInfo symbol) {
@@ -3837,6 +4078,7 @@ namespace pcn {
 		}
 
 		SemanticAnalysisResult result_;
+		std::unordered_map<std::string, SymbolInfo> globalConstTypes_;
 		std::unordered_map<std::string, std::vector<RoutineSignature>> routines_;
 		std::unordered_map<std::string, NominalRecord> nominalTypes_;
 		std::unordered_map<std::string, RoutineSignature> closureSignatures_;
@@ -3968,6 +4210,11 @@ namespace pcn {
 			else if constexpr (std::is_same_v<T, BinaryExpr>) { if (n.op == "==" || n.op == "!=" || n.op == "<" || n.op == "<=" || n.op == ">" || n.op == ">=" || n.op == "and" || n.op == "or" || n.op == "&&" || n.op == "||")return "bool"; return inferExprType(n.left); }
 			else if constexpr (std::is_same_v<T, GroupExpr>)return inferExprType(n.expression);
 			else if constexpr (std::is_same_v<T, ConstructExpr>)return n.typeName;
+			else if constexpr (std::is_same_v<T, ArrayExpr>)return "array<" + (n.elements.empty() ? std::string("unknown") :
+				std::holds_alternative<NumberExpr>(n.elements.front()->node) ?
+				(std::get<NumberExpr>(n.elements.front()->node).value.find('.') != std::string::npos ? std::string("double") : std::string("int")) :
+				inferExprType(n.elements.front())) + "," + std::to_string(n.elements.size()) + ">";
+			else if constexpr (std::is_same_v<T, IndexExpr>) { std::string el; return typeIsArray(inferExprType(n.object), &el) ? el : "unknown"; }
 			else if constexpr (std::is_same_v<T, ClosureExpr>)return "closure$" + std::to_string(n.closureId);
 			else if constexpr (std::is_same_v<T, TryExpr>) { std::string ok, err; auto x = inferExprType(n.operand); return typeIsResult(x, &ok, &err) ? ok : "unknown"; }
 			else if constexpr (std::is_same_v<T, MemberExpr>) { auto o = inferExprType(n.object); auto ni = result_->nominalTypes.find(o); if (ni != result_->nominalTypes.end())for (const auto& f : ni->second.fields)if (f.first == n.member)return f.second; return "unknown"; }
@@ -4032,6 +4279,8 @@ namespace pcn {
 			else if constexpr (std::is_same_v<T, TryExpr>)walkExpr(n.operand, inClosure);
 			else if constexpr (std::is_same_v<T, MemberExpr>)walkExpr(n.object, inClosure);
 			else if constexpr (std::is_same_v<T, ConstructExpr>)for (auto& f : n.fields)walkExpr(f.value, inClosure);
+			else if constexpr (std::is_same_v<T, ArrayExpr>)for (auto& item : n.elements)walkExpr(item, inClosure);
+			else if constexpr (std::is_same_v<T, IndexExpr>) { walkExpr(n.object, inClosure); walkExpr(n.index, inClosure); }
 			else if constexpr (std::is_same_v<T, CallExpr>)walkCall(n, inClosure);
 			else if constexpr (std::is_same_v<T, ClosureExpr>)analyzeClosure(n);
 				}, e->node);
@@ -4081,6 +4330,8 @@ namespace pcn {
 			else if constexpr (std::is_same_v<T, GroupExpr>)inferClosureExprEffects(n.expression, out);
 			else if constexpr (std::is_same_v<T, MemberExpr>)inferClosureExprEffects(n.object, out);
 			else if constexpr (std::is_same_v<T, ConstructExpr>)for (auto& f : n.fields)inferClosureExprEffects(f.value, out);
+			else if constexpr (std::is_same_v<T, ArrayExpr>)for (auto& item : n.elements)inferClosureExprEffects(item, out);
+			else if constexpr (std::is_same_v<T, IndexExpr>) { inferClosureExprEffects(n.object, out); inferClosureExprEffects(n.index, out); out.insert("trap"); }
 				}, e->node);
 		}
 		void inferClosureStmtEffects(const std::vector<StmtPtr>& ss, std::set<std::string>& out) {
@@ -4102,7 +4353,7 @@ namespace pcn {
 			std::unordered_set<std::string>locals; for (const auto& p : c.parameters)locals.insert(p.name); std::unordered_map<std::string, CaptureUse>captures;
 			auto note = [&](const std::string& name, BorrowKind kind, SourceLocation loc) {if (locals.contains(name))return; if (auto* ls = lookup(name)) { auto& sf = result_->skm.symbols[ls->factIndex]; auto& cu = captures[name]; cu.kind = cu.symbolId ? stronger(cu.kind, kind) : kind; cu.symbolId = sf.id; cu.typeName = ls->typeName; cu.location = loc; touch(name, point_); }};
 			std::function<void(const ExprPtr&)> scanExpr; std::function<void(const std::vector<StmtPtr>&)> scanStmts;
-			scanExpr = [&](const ExprPtr& e) {if (!e)return; std::visit([&](const auto& n) {using T = std::decay_t<decltype(n)>; if constexpr (std::is_same_v<T, VariableExpr>)note(n.name, c.moveCapture ? BorrowKind::Owned : BorrowKind::Shared, n.location); else if constexpr (std::is_same_v<T, UnaryExpr>)scanExpr(n.operand); else if constexpr (std::is_same_v<T, BinaryExpr>) { scanExpr(n.left); scanExpr(n.right); } else if constexpr (std::is_same_v<T, CallExpr>) { auto* r = resolveCall(n); for (std::size_t i = 0; i < n.arguments.size(); ++i) { if (auto* v = std::get_if<VariableExpr>(&n.arguments[i]->node)) { BorrowKind k = BorrowKind::Shared; if (c.moveCapture)k = BorrowKind::Owned; else if (r && i < r->parameters.size()) { auto m = r->parameters[i].mode; k = m == "own" ? BorrowKind::Owned : m == "var" ? BorrowKind::Exclusive : BorrowKind::Shared; }note(v->name, k, v->location); }scanExpr(n.arguments[i]); } } else if constexpr (std::is_same_v<T, GroupExpr>)scanExpr(n.expression); else if constexpr (std::is_same_v<T, TryExpr>)scanExpr(n.operand); else if constexpr (std::is_same_v<T, MemberExpr>)scanExpr(n.object); else if constexpr (std::is_same_v<T, ConstructExpr>)for (auto& f : n.fields)scanExpr(f.value); else if constexpr (std::is_same_v<T, PipelineExpr>) { scanExpr(n.input); for (auto& s : n.stages)scanExpr(s); } else if constexpr (std::is_same_v<T, RangeExpr>) { scanExpr(n.start); scanExpr(n.end); scanExpr(n.step); } else if constexpr (std::is_same_v<T, ChooseExpr>) { scanExpr(n.subject); for (auto& x : n.cases) { scanExpr(x.condition); scanExpr(x.value); }if (n.hasOtherwise)scanExpr(n.otherwiseValue); }}, e->node); };
+			scanExpr = [&](const ExprPtr& e) {if (!e)return; std::visit([&](const auto& n) {using T = std::decay_t<decltype(n)>; if constexpr (std::is_same_v<T, VariableExpr>)note(n.name, c.moveCapture ? BorrowKind::Owned : BorrowKind::Shared, n.location); else if constexpr (std::is_same_v<T, UnaryExpr>)scanExpr(n.operand); else if constexpr (std::is_same_v<T, BinaryExpr>) { scanExpr(n.left); scanExpr(n.right); } else if constexpr (std::is_same_v<T, CallExpr>) { auto* r = resolveCall(n); for (std::size_t i = 0; i < n.arguments.size(); ++i) { if (auto* v = std::get_if<VariableExpr>(&n.arguments[i]->node)) { BorrowKind k = BorrowKind::Shared; if (c.moveCapture)k = BorrowKind::Owned; else if (r && i < r->parameters.size()) { auto m = r->parameters[i].mode; k = m == "own" ? BorrowKind::Owned : m == "var" ? BorrowKind::Exclusive : BorrowKind::Shared; }note(v->name, k, v->location); }scanExpr(n.arguments[i]); } } else if constexpr (std::is_same_v<T, GroupExpr>)scanExpr(n.expression); else if constexpr (std::is_same_v<T, TryExpr>)scanExpr(n.operand); else if constexpr (std::is_same_v<T, MemberExpr>)scanExpr(n.object); else if constexpr (std::is_same_v<T, ConstructExpr>)for (auto& f : n.fields)scanExpr(f.value); else if constexpr (std::is_same_v<T, ArrayExpr>)for (auto& e : n.elements)scanExpr(e); else if constexpr (std::is_same_v<T, IndexExpr>) { scanExpr(n.object); scanExpr(n.index); } else if constexpr (std::is_same_v<T, PipelineExpr>) { scanExpr(n.input); for (auto& s : n.stages)scanExpr(s); } else if constexpr (std::is_same_v<T, RangeExpr>) { scanExpr(n.start); scanExpr(n.end); scanExpr(n.step); } else if constexpr (std::is_same_v<T, ChooseExpr>) { scanExpr(n.subject); for (auto& x : n.cases) { scanExpr(x.condition); scanExpr(x.value); }if (n.hasOtherwise)scanExpr(n.otherwiseValue); }}, e->node); };
 			scanStmts = [&](const std::vector<StmtPtr>& ss) {for (auto& s : ss)std::visit([&](const auto& n) {using T = std::decay_t<decltype(n)>; if constexpr (std::is_same_v<T, LetStmt> || std::is_same_v<T, VarStmt>) { scanExpr(n.initializer); locals.insert(n.name); } else if constexpr (std::is_same_v<T, AssignStmt>) { if (!locals.contains(n.name))note(n.name, c.moveCapture ? BorrowKind::Owned : BorrowKind::Exclusive, n.location); scanExpr(n.value); } else if constexpr (std::is_same_v<T, ExprStmt>)scanExpr(n.expression); else if constexpr (std::is_same_v<T, ReturnStmt>) { if (n.hasValue)scanExpr(n.value); } else if constexpr (std::is_same_v<T, GiveStmt>)scanExpr(n.value); else if constexpr (std::is_same_v<T, FailStmt>)scanExpr(n.expression); else if constexpr (std::is_same_v<T, IfStmt>) { scanExpr(n.condition); scanStmts(n.thenBranch); scanStmts(n.elseBranch); } else if constexpr (std::is_same_v<T, WhileStmt>) { scanExpr(n.condition); scanStmts(n.body); } else if constexpr (std::is_same_v<T, EachStmt>) { scanExpr(n.range); for (auto& x : n.bindings)locals.insert(x); scanStmts(n.body); } else if constexpr (std::is_same_v<T, UnsafeStmt>)scanStmts(n.body); else if constexpr (std::is_same_v<T, DeferStmt>)scanExpr(n.expression); else if constexpr (std::is_same_v<T, BlockStmt>)scanStmts(n.statements); }, s->node); };
 			if (c.hasExpressionBody)scanExpr(c.expressionBody); else scanStmts(c.blockBody);
 			for (const auto& [name, cu] : captures) { result_->skm.closureCaptures.push_back({ c.closureId,cu.symbolId,name,cu.typeName,cu.kind,false,cu.location }); if (auto* ls = lookup(name))addBorrow(*ls, name, cu.kind, point_, point_, c.closureId, false, cu.location); }
@@ -4359,6 +4610,13 @@ namespace pcn {
 				else if constexpr (std::is_same_v<T, ConstructExpr>) {
 					for (const auto& f : node.fields) collectExprEffects(f.value, facts);
 				}
+				else if constexpr (std::is_same_v<T, ArrayExpr>) {
+					for (const auto& e : node.elements) collectExprEffects(e, facts);
+				}
+				else if constexpr (std::is_same_v<T, IndexExpr>) {
+					collectExprEffects(node.object, facts); collectExprEffects(node.index, facts);
+					facts.direct.insert("trap");
+				}
 				}, expr->node);
 		}
 
@@ -4489,6 +4747,13 @@ namespace pcn {
 				}
 				else if constexpr (std::is_same_v<T, ConstructExpr>) {
 					for (const auto& f : node.fields) analyzeBorrowExpr(f.value, state);
+				}
+				else if constexpr (std::is_same_v<T, ArrayExpr>) {
+					for (const auto& item : node.elements)analyzeBorrowExpr(item, state);
+				}
+				else if constexpr (std::is_same_v<T, IndexExpr>) {
+					analyzeBorrowExpr(node.object, state);
+					analyzeBorrowExpr(node.index, state);
 				}
 				}, expr->node);
 		}
@@ -4861,6 +5126,8 @@ namespace pcn {
 			else if constexpr (std::is_same_v<T, GroupExpr>) { auto x = n; x.expression = rewriteExpr(n.expression, m); return AstFactory::makeExpr(std::move(x), span); }
 			else if constexpr (std::is_same_v<T, MemberExpr>) { auto x = n; x.object = rewriteExpr(n.object, m); return AstFactory::makeExpr(std::move(x), span); }
 			else if constexpr (std::is_same_v<T, ConstructExpr>) { auto x = n; x.typeName = subst(n.typeName, m); for (auto& f : x.fields)f.value = rewriteExpr(f.value, m); return AstFactory::makeExpr(std::move(x), span); }
+			else if constexpr (std::is_same_v<T, ArrayExpr>) { auto x = n; for (auto& v : x.elements)v = rewriteExpr(v, m); return AstFactory::makeExpr(std::move(x), span); }
+			else if constexpr (std::is_same_v<T, IndexExpr>) { auto x = n; x.object = rewriteExpr(x.object, m); x.index = rewriteExpr(x.index, m); return AstFactory::makeExpr(std::move(x), span); }
 			else return std::make_shared<const Expr>(*e);
 				}, e->node);
 		}
@@ -4883,7 +5150,7 @@ namespace pcn {
 		}
 		std::vector<StmtPtr> rewriteStatements(const std::vector<StmtPtr>& ss, const std::map<std::string, std::string>& m) { std::vector<StmtPtr>out; out.reserve(ss.size()); for (auto& s : ss)out.push_back(rewriteStmt(s, m)); return out; }
 		Routine rewriteRoutine(const Routine& r, const std::map<std::string, std::string>& m, const std::string& name) { Routine x = r; x.name = name; x.genericParameters.clear(); x.constraints.clear(); for (auto& p : x.parameters)p = rewriteParameter(p, m); x.returnType = subst(x.returnType, m); x.body = rewriteStatements(x.body, m); return x; }
-		void collectClosuresExpr(const ExprPtr& e, std::vector<const ClosureExpr*>& out) { if (!e)return; std::visit([&](const auto& n) {using T = std::decay_t<decltype(n)>; if constexpr (std::is_same_v<T, ClosureExpr>) { out.push_back(&n); collectClosuresExpr(n.expressionBody, out); collectClosuresStmt(n.blockBody, out); } else if constexpr (std::is_same_v<T, UnaryExpr>)collectClosuresExpr(n.operand, out); else if constexpr (std::is_same_v<T, BinaryExpr>) { collectClosuresExpr(n.left, out); collectClosuresExpr(n.right, out); } else if constexpr (std::is_same_v<T, CallExpr>) { collectClosuresExpr(n.callee, out); for (auto& a : n.arguments)collectClosuresExpr(a, out); } else if constexpr (std::is_same_v<T, PipelineExpr>) { collectClosuresExpr(n.input, out); for (auto& a : n.stages)collectClosuresExpr(a, out); } else if constexpr (std::is_same_v<T, RangeExpr>) { collectClosuresExpr(n.start, out); collectClosuresExpr(n.end, out); collectClosuresExpr(n.step, out); } else if constexpr (std::is_same_v<T, ChooseExpr>) { collectClosuresExpr(n.subject, out); for (auto& c : n.cases) { collectClosuresExpr(c.condition, out); collectClosuresExpr(c.value, out); }collectClosuresExpr(n.otherwiseValue, out); } else if constexpr (std::is_same_v<T, TryExpr>)collectClosuresExpr(n.operand, out); else if constexpr (std::is_same_v<T, GroupExpr>)collectClosuresExpr(n.expression, out); else if constexpr (std::is_same_v<T, MemberExpr>)collectClosuresExpr(n.object, out); else if constexpr (std::is_same_v<T, ConstructExpr>)for (auto& f : n.fields)collectClosuresExpr(f.value, out); }, e->node); }
+		void collectClosuresExpr(const ExprPtr& e, std::vector<const ClosureExpr*>& out) { if (!e)return; std::visit([&](const auto& n) {using T = std::decay_t<decltype(n)>; if constexpr (std::is_same_v<T, ClosureExpr>) { out.push_back(&n); collectClosuresExpr(n.expressionBody, out); collectClosuresStmt(n.blockBody, out); } else if constexpr (std::is_same_v<T, UnaryExpr>)collectClosuresExpr(n.operand, out); else if constexpr (std::is_same_v<T, BinaryExpr>) { collectClosuresExpr(n.left, out); collectClosuresExpr(n.right, out); } else if constexpr (std::is_same_v<T, CallExpr>) { collectClosuresExpr(n.callee, out); for (auto& a : n.arguments)collectClosuresExpr(a, out); } else if constexpr (std::is_same_v<T, PipelineExpr>) { collectClosuresExpr(n.input, out); for (auto& a : n.stages)collectClosuresExpr(a, out); } else if constexpr (std::is_same_v<T, RangeExpr>) { collectClosuresExpr(n.start, out); collectClosuresExpr(n.end, out); collectClosuresExpr(n.step, out); } else if constexpr (std::is_same_v<T, ChooseExpr>) { collectClosuresExpr(n.subject, out); for (auto& c : n.cases) { collectClosuresExpr(c.condition, out); collectClosuresExpr(c.value, out); }collectClosuresExpr(n.otherwiseValue, out); } else if constexpr (std::is_same_v<T, TryExpr>)collectClosuresExpr(n.operand, out); else if constexpr (std::is_same_v<T, GroupExpr>)collectClosuresExpr(n.expression, out); else if constexpr (std::is_same_v<T, MemberExpr>)collectClosuresExpr(n.object, out); else if constexpr (std::is_same_v<T, ConstructExpr>)for (auto& f : n.fields)collectClosuresExpr(f.value, out); else if constexpr (std::is_same_v<T, ArrayExpr>)for (auto& e : n.elements)collectClosuresExpr(e, out); else if constexpr (std::is_same_v<T, IndexExpr>) { collectClosuresExpr(n.object, out); collectClosuresExpr(n.index, out); }}, e->node); }
 		void collectClosuresStmt(const std::vector<StmtPtr>& ss, std::vector<const ClosureExpr*>& out) { for (auto& s : ss)if (s)std::visit([&](const auto& n) {using T = std::decay_t<decltype(n)>; if constexpr (std::is_same_v<T, LetStmt> || std::is_same_v<T, VarStmt>)collectClosuresExpr(n.initializer, out); else if constexpr (std::is_same_v<T, AssignStmt>)collectClosuresExpr(n.value, out); else if constexpr (std::is_same_v<T, ExprStmt>)collectClosuresExpr(n.expression, out); else if constexpr (std::is_same_v<T, ReturnStmt>) { if (n.hasValue)collectClosuresExpr(n.value, out); } else if constexpr (std::is_same_v<T, GiveStmt>)collectClosuresExpr(n.value, out); else if constexpr (std::is_same_v<T, IfStmt>) { collectClosuresExpr(n.condition, out); collectClosuresStmt(n.thenBranch, out); collectClosuresStmt(n.elseBranch, out); } else if constexpr (std::is_same_v<T, EachStmt>) { collectClosuresExpr(n.range, out); collectClosuresStmt(n.body, out); } else if constexpr (std::is_same_v<T, UnsafeStmt>)collectClosuresStmt(n.body, out); else if constexpr (std::is_same_v<T, DeferStmt>)collectClosuresExpr(n.expression, out); else if constexpr (std::is_same_v<T, FailStmt>)collectClosuresExpr(n.expression, out); else if constexpr (std::is_same_v<T, WhileStmt>) { collectClosuresExpr(n.condition, out); collectClosuresStmt(n.body, out); } else if constexpr (std::is_same_v<T, BlockStmt>)collectClosuresStmt(n.statements, out); }, s->node); }
 		void synthesizeClosures(Program& out, const SemanticAnalysisResult& analysis) { std::vector<const ClosureExpr*> closures; for (const auto& r : out.routines)collectClosuresStmt(r.body, closures); std::unordered_set<std::size_t>seen; for (auto* c : closures) { if (!seen.insert(c->closureId).second)continue; Routine fn; fn.name = "closure$" + std::to_string(c->closureId) + "$call"; fn.returnType = c->returnType.empty() ? "void" : c->returnType; fn.location = c->location; fn.span = c->span; for (const auto& cap : analysis.skm.closureCaptures)if (cap.closureId == c->closureId) { Parameter p; p.name = cap.name; p.typeName = cap.typeName; p.location = cap.location; p.mode = cap.kind == BorrowKind::Owned ? "own" : cap.kind == BorrowKind::Exclusive ? "var" : "shared"; fn.parameters.push_back(p); }for (auto p : c->parameters)fn.parameters.push_back(p); if (c->hasExpressionBody) { auto st = GiveStmt{ c->expressionBody,c->span,c->location }; fn.body.push_back(AstFactory::makeStmt(std::move(st), c->span)); } else fn.body = c->blockBody; out.routines.push_back(std::move(fn)); } }
 		const SemanticAnalysisResult* analysis_ = nullptr; std::unordered_map<std::string, std::string>callSpecializations_;
@@ -4897,6 +5164,10 @@ namespace pcn {
 			routineReturnTypes_.clear();
 			routineParameters_.clear();
 			nominalTypeNames_.clear();
+			globalConstants_.clear();
+			for (const auto& d : program.declarations)
+				if (const auto* c = std::get_if<ConstDecl>(&d.node))
+					globalConstants_.emplace(c->name, std::make_pair(c->typeName, c->value));
 			nominalFieldTypes_.clear();
 			collectNominalNames(program.declarations);
 			for (const auto& routine : program.routines) {
@@ -5081,7 +5352,7 @@ namespace pcn {
 		IRValueType irValueTypeFromName(const std::string& name) const {
 			if (name == "void") return makeIRVoidType();
 			if (name == "bool") return makeIRBoolType();
-			if (name == "float" || name == "double") throw std::runtime_error("native codegen for floating-point values requires real XMM/IEEE-754 lowering; integer reinterpretation is forbidden");
+			if (name == "float" || name == "double") return makeIRFloatType(name);
 			if (isNumericTypeName(name)) return makeIRIntType();
 			if (name == "text") return makeIRTextType();
 			if (name == "string") return makeIRStringType();
@@ -5089,7 +5360,7 @@ namespace pcn {
 			if (name.rfind("result<", 0) == 0) return { IRValueKind::Result, name };
 			if (name.rfind("option<", 0) == 0) return { IRValueKind::Option, name };
 			if (name.rfind("closure$", 0) == 0) return { IRValueKind::Closure, name };
-			if (!name.empty() && (name.front() == '(' || nominalTypeNames_.count(name))) return { IRValueKind::Aggregate, name };
+			if (!name.empty() && (name.front() == '(' || nominalTypeNames_.count(name) || typeIsArray(name))) return { IRValueKind::Aggregate, name };
 			if (name.empty()) return makeIRUnknownType();
 			return { IRValueKind::Function, name };
 		}
@@ -5203,6 +5474,29 @@ namespace pcn {
 				}, statement->node);
 		}
 
+		VReg lowerExprWithExpected(const ExprPtr& expr, const IRValueType& expected) {
+			if (expr && (expected.kind == IRValueKind::Float32 || expected.kind == IRValueKind::Float64)) {
+				if (const auto* number = std::get_if<NumberExpr>(&expr->node)) {
+					// Contextual fitting of a numeric literal, not an implicit numeric conversion.
+					IRInstruction i; i.op = IROpcode::ConstFloat;
+					i.dest = allocateVReg(); i.valueType = expected; i.literalText = number->value;
+					lastValueType_ = expected; const auto dest = i.dest; emit(std::move(i));
+					return dest;
+				}
+			}
+			if (expr && (expected.kind == IRValueKind::Float32 || expected.kind == IRValueKind::Float64)) {
+				if (const auto* unary = std::get_if<UnaryExpr>(&expr->node)) {
+					if (unary->op == "-") {
+						auto v = lowerExprWithExpected(unary->operand, expected);
+						IRInstruction i; i.op = IROpcode::Neg; i.dest = allocateVReg();
+						i.args = { v }; i.valueType = expected; const auto dest = i.dest;
+						emit(std::move(i)); lastValueType_ = expected; return dest;
+					}
+				}
+			}
+			return lowerExpr(expr);
+		}
+
 		void lowerLet(const LetStmt& node) {
 			if (node.initializer) {
 				if (const auto* closure = std::get_if<ClosureExpr>(&node.initializer->node)) {
@@ -5224,7 +5518,7 @@ namespace pcn {
 					return;
 				}
 			}
-			auto value = node.initializer ? lowerExpr(node.initializer) : makeNullValue();
+			auto value = node.initializer ? lowerExprWithExpected(node.initializer, irValueTypeFromName(node.typeName)) : makeNullValue();
 			if (lastValueType_.kind == IRValueKind::String && node.initializer &&
 				std::holds_alternative<VariableExpr>(node.initializer->node)) {
 				const VReg dest = allocateVReg();
@@ -5238,7 +5532,7 @@ namespace pcn {
 		}
 
 		void lowerVar(const VarStmt& node) {
-			auto value = node.initializer ? lowerExpr(node.initializer) : makeNullValue();
+			auto value = node.initializer ? lowerExprWithExpected(node.initializer, irValueTypeFromName(node.typeName)) : makeNullValue();
 			if (lastValueType_.kind == IRValueKind::String && node.initializer &&
 				std::holds_alternative<VariableExpr>(node.initializer->node)) {
 				const VReg dest = allocateVReg();
@@ -5313,7 +5607,7 @@ namespace pcn {
 		}
 
 		void lowerGive(const GiveStmt& node) {
-			auto value = lowerExpr(node.value);
+			auto value = lowerExprWithExpected(node.value, irValueTypeFromName(currentReturnType_));
 			verifyBorrowDoesNotEscape(value, lastValueType_);
 			if (currentReturnType_.rfind("result<", 0) == 0 && lastValueType_.kind != IRValueKind::Result) value = emitTagged(IROpcode::ResultOk, value, { IRValueKind::Result, currentReturnType_ });
 			else if (currentReturnType_.rfind("option<", 0) == 0 && lastValueType_.kind != IRValueKind::Option) value = emitTagged(IROpcode::OptionSome, value, { IRValueKind::Option, currentReturnType_ });
@@ -5580,8 +5874,10 @@ namespace pcn {
 			VReg value = std::visit([&](const auto& node) -> VReg {
 				using T = std::decay_t<decltype(node)>;
 				if constexpr (std::is_same_v<T, NumberExpr>) {
-					if (node.value.find('.') != std::string::npos)
-						throw std::runtime_error("floating-point literal requires IEEE-754 native lowering; integer codegen is forbidden");
+					if (node.value.find('.') != std::string::npos) {
+						lastValueType_ = makeIRFloatType("double");
+						return emitConst(IROpcode::ConstFloat, node.value);
+					}
 					lastValueType_ = makeIRIntType();
 					return emitConst(IROpcode::ConstInt, node.value);
 				}
@@ -5669,6 +5965,31 @@ namespace pcn {
 					}
 					IRInstruction inst; inst.op = IROpcode::ResultTry; inst.dest = allocateVReg(); inst.args.push_back(source); inst.valueType = resultType; inst.typeName = sourceType.name; inst.returnType = currentReturnType_; emit(inst); lastValueType_ = inst.valueType; return inst.dest;
 				}
+				else if constexpr (std::is_same_v<T, ArrayExpr>) {
+					if (node.elements.empty())throw std::runtime_error("cannot lower empty array literal");
+					std::string elemType;
+					const auto firstType = lowerExprType(node.elements.front());
+					elemType = firstType.kind == IRValueKind::Int64 ? "int" : firstType.name;
+					const auto arrayType = "array<" + elemType + "," + std::to_string(node.elements.size()) + ">";
+					IRInstruction inst; inst.op = IROpcode::MakeAggregate; inst.dest = allocateVReg();
+					inst.typeName = arrayType; inst.valueType = { IRValueKind::Aggregate,arrayType };
+					for (std::size_t n = 0; n < node.elements.size(); ++n) {
+						inst.args.push_back(lowerExpr(node.elements[n]));
+						inst.argumentTypes.push_back(std::to_string(n));
+						inst.argumentValueTypes.push_back(lastValueType_);
+					}
+					const auto dest = inst.dest; emit(std::move(inst)); lastValueType_ = { IRValueKind::Aggregate,arrayType }; return dest;
+				}
+				else if constexpr (std::is_same_v<T, IndexExpr>) {
+					const auto arrType = lowerExprType(node.object);
+					std::string elem; std::size_t count = 0;
+					if (!typeIsArray(arrType.name, &elem, &count))throw std::runtime_error("PCIR array index requires array<T,N>");
+					auto a = lowerExpr(node.object), idx = lowerExpr(node.index);
+					IRInstruction inst; inst.op = IROpcode::ArrayIndex; inst.dest = allocateVReg();
+					inst.typeName = arrType.name; inst.valueType = irValueTypeFromName(elem);
+					inst.args = { a,idx }; const auto dest = inst.dest; emit(std::move(inst));
+					lastValueType_ = irValueTypeFromName(elem); return dest;
+				}
 				else if constexpr (std::is_same_v<T, ConstructExpr>) {
 					IRInstruction inst; inst.op = IROpcode::MakeAggregate; inst.dest = allocateVReg(); inst.typeName = node.typeName; inst.valueType = { IRValueKind::Aggregate, node.typeName };
 					for (const auto& f : node.fields) { auto v = lowerExpr(f.value); inst.args.push_back(v); inst.argumentTypes.push_back(f.name); inst.argumentValueTypes.push_back(lastValueType_); }
@@ -5713,7 +6034,7 @@ namespace pcn {
 					return makeIRBoolType();
 				}
 				else if constexpr (std::is_same_v<T, NumberExpr>) {
-					return makeIRIntType();
+					return node.value.find('.') != std::string::npos ? makeIRFloatType("double") : makeIRIntType();
 				}
 				else if constexpr (std::is_same_v<T, StringExpr>) {
 					return makeIRTextType();
@@ -5723,12 +6044,23 @@ namespace pcn {
 				}
 				else if constexpr (std::is_same_v<T, VariableExpr>) {
 					auto it = localValueTypes_.find(node.name);
-					return it != localValueTypes_.end() ? it->second : makeIRUnknownType();
+					if (it != localValueTypes_.end())return it->second;
+					if (auto g = globalConstants_.find(node.name); g != globalConstants_.end())return irValueTypeFromName(g->second.first);
+					return makeIRUnknownType();
 				}
 				else if constexpr (std::is_same_v<T, UnaryExpr>) {
-					return node.op == "!" || node.op == "not" ? makeIRBoolType() : makeIRIntType();
+					return node.op == "!" || node.op == "not" ? makeIRBoolType() : lowerExprType(node.operand);
 				}
 				else if constexpr (std::is_same_v<T, BinaryExpr>) {
+					auto a = lowerExprType(node.left), b = lowerExprType(node.right);
+					if (a.kind == IRValueKind::Float32 || a.kind == IRValueKind::Float64) {
+						auto result = binaryValueType(node.op);
+						return result.kind == IRValueKind::Bool ? result : a;
+					}
+					if (b.kind == IRValueKind::Float32 || b.kind == IRValueKind::Float64) {
+						auto result = binaryValueType(node.op);
+						return result.kind == IRValueKind::Bool ? result : b;
+					}
 					return binaryValueType(node.op);
 				}
 				else if constexpr (std::is_same_v<T, CallExpr>) {
@@ -5762,6 +6094,16 @@ namespace pcn {
 					auto inner = lowerExprType(node.operand); std::string okType, errType;
 					return typeIsResult(inner.name, &okType, &errType) ? irValueTypeFromName(okType) : makeIRUnknownType();
 				}
+				else if constexpr (std::is_same_v<T, ArrayExpr>) {
+					if (node.elements.empty())return makeIRUnknownType();
+					auto first = lowerExprType(node.elements.front());
+					const std::string elem = first.kind == IRValueKind::Int64 ? "int" : first.name;
+					return { IRValueKind::Aggregate,"array<" + elem + "," + std::to_string(node.elements.size()) + ">" };
+				}
+				else if constexpr (std::is_same_v<T, IndexExpr>) {
+					const auto arr = lowerExprType(node.object);
+					std::string elem; return typeIsArray(arr.name, &elem) ? irValueTypeFromName(elem) : makeIRUnknownType();
+				}
 				else if constexpr (std::is_same_v<T, ConstructExpr>) {
 					return { IRValueKind::Aggregate, node.typeName };
 				}
@@ -5785,9 +6127,9 @@ namespace pcn {
 
 		VReg lowerVariable(const std::string& name) {
 			auto it = locals_.find(name);
-			if (it != locals_.end()) {
-				return it->second;
-			}
+			if (it != locals_.end()) return it->second;
+			if (auto g = globalConstants_.find(name); g != globalConstants_.end())
+				return lowerExprWithExpected(g->second.second, irValueTypeFromName(g->second.first));
 			VReg value = allocateVReg();
 			locals_[name] = value;
 			return value;
@@ -5797,7 +6139,7 @@ namespace pcn {
 			IRInstruction inst;
 			auto dest = allocateVReg();
 			inst.dest = dest;
-			inst.valueType = node.op == "!" || node.op == "not" ? makeIRBoolType() : makeIRIntType();
+			inst.valueType = node.op == "!" || node.op == "not" ? makeIRBoolType() : lowerExprType(node.operand);
 			inst.args.push_back(lowerExpr(node.operand));
 			if (node.op == "-") {
 				inst.op = IROpcode::Neg;
@@ -5817,12 +6159,66 @@ namespace pcn {
 		}
 
 		VReg lowerBinary(const BinaryExpr& node) {
+			// Source-level logical operators short-circuit.  Use an explicit CFG
+			// and a shared destination slot rather than eagerly evaluating RHS.
+			// The same branch semantics are used by PCIR, PMIR and native x64.
+			if (node.op == "and" || node.op == "&&" || node.op == "or" || node.op == "||") {
+				const bool isAnd = node.op == "and" || node.op == "&&";
+				const VReg left = lowerExpr(node.left);
+				const VReg destination = allocateVReg();
+				const BlockID evaluateRight = createBlock("logic.rhs");
+				const BlockID skipRight = createBlock("logic.short");
+				const BlockID join = createBlock("logic.join");
+				IRInstruction branch; branch.op = IROpcode::BranchIf;
+				branch.args = { left };
+				branch.targetBlocks = isAnd ? std::vector<BlockID>{evaluateRight, skipRight}
+				: std::vector<BlockID>{ skipRight, evaluateRight };
+				emit(std::move(branch)); currentTerminated_ = true;
+				currentBlock_ = skipRight; currentTerminated_ = false;
+				IRInstruction constant; constant.op = IROpcode::ConstBool;
+				constant.dest = allocateVReg(); constant.valueType = makeIRBoolType();
+				constant.immediate = isAnd ? 0 : 1; constant.hasImmediate = true;
+				const VReg shortValue = constant.dest; emit(std::move(constant));
+				IRInstruction fromShort; fromShort.op = IROpcode::Copy;
+				fromShort.dest = destination; fromShort.args = { shortValue };
+				fromShort.valueType = makeIRBoolType(); emit(std::move(fromShort));
+				emitBranch(join);
+				currentBlock_ = evaluateRight; currentTerminated_ = false;
+				const VReg rhs = lowerExpr(node.right);
+				IRInstruction fromRight; fromRight.op = IROpcode::Copy;
+				fromRight.dest = destination; fromRight.args = { rhs };
+				fromRight.valueType = makeIRBoolType(); emit(std::move(fromRight));
+				emitBranch(join);
+				currentBlock_ = join; currentTerminated_ = false;
+				lastValueType_ = makeIRBoolType();
+				return destination;
+			}
 			IRInstruction inst;
 			auto dest = allocateVReg();
 			inst.dest = dest;
+			const auto lt = lowerExprType(node.left);
+			const auto rt = lowerExprType(node.right);
+			const bool leftFP = lt.kind == IRValueKind::Float32 || lt.kind == IRValueKind::Float64;
+			const bool rightFP = rt.kind == IRValueKind::Float32 || rt.kind == IRValueKind::Float64;
+			const bool leftLiteral = node.left && std::holds_alternative<NumberExpr>(node.left->node);
+			const bool rightLiteral = node.right && std::holds_alternative<NumberExpr>(node.right->node);
+			const IRValueType valueType = (leftLiteral && rightFP) ? rt :
+				(rightLiteral && leftFP) ? lt :
+				leftFP ? lt : (rightFP ? rt : makeIRIntType());
+			if (leftFP && rightFP && lt.kind != rt.kind &&
+				!(node.left && std::holds_alternative<NumberExpr>(node.left->node)) &&
+				!(node.right && std::holds_alternative<NumberExpr>(node.right->node)))
+				throw std::runtime_error("IEEE-754 operands have different widths; conversion must be explicit");
+			if ((leftFP || rightFP) && (node.op == "%" || node.op == "&" || node.op == "|" ||
+				node.op == "^" || node.op == "<<" || node.op == ">>"))
+				throw std::runtime_error("floating-point operands do not support integer bitwise/remainder operations");
 			inst.valueType = binaryValueType(node.op);
-			inst.args.push_back(lowerExpr(node.left));
-			inst.args.push_back(lowerExpr(node.right));
+			if (leftFP || rightFP) {
+				if (inst.valueType.kind != IRValueKind::Bool) inst.valueType = valueType;
+				inst.argumentValueTypes = { valueType, valueType };
+			}
+			inst.args.push_back(lowerExprWithExpected(node.left, valueType));
+			inst.args.push_back(lowerExprWithExpected(node.right, valueType));
 			if (node.op == "+") inst.op = IROpcode::Add;
 			else if (node.op == "-") inst.op = IROpcode::Sub;
 			else if (node.op == "*") inst.op = IROpcode::Mul;
@@ -5917,8 +6313,13 @@ namespace pcn {
 			inst.typeName = inst.returnType;
 			inst.callSignature = calleeSignature(node.callee);
 			inst.valueType = irValueTypeFromName(inst.returnType);
+			std::size_t argIndex = 0;
 			for (const auto& argument : node.arguments) {
-				auto argumentValue = lowerExpr(argument);
+				IRValueType expected = makeIRUnknownType();
+				if (auto it = routineParameters_.find(inst.callee); it != routineParameters_.end() && argIndex < it->second.size())
+					expected = irValueTypeFromName(it->second[argIndex].typeName);
+				auto argumentValue = lowerExprWithExpected(argument, expected);
+				++argIndex;
 				inst.args.push_back(argumentValue);
 				inst.argumentTypes.push_back(argumentTypeName(argument));
 				inst.argumentValueTypes.push_back(lastValueType_);
@@ -5988,7 +6389,8 @@ namespace pcn {
 			auto dest = allocateVReg();
 			inst.dest = dest;
 			inst.literalText = text;
-			inst.valueType = op == IROpcode::ConstText ? makeIRTextType() : makeIRIntType();
+			inst.valueType = op == IROpcode::ConstText ? makeIRTextType() :
+				op == IROpcode::ConstFloat ? makeIRFloatType("double") : makeIRIntType();
 			emit(std::move(inst));
 			return dest;
 		}
@@ -6061,6 +6463,7 @@ namespace pcn {
 		struct ClosureBinding { std::string functionName; std::vector<std::string> captures; };
 		std::unordered_map<std::string, std::string> routineReturnTypes_;
 		std::unordered_map<std::string, std::vector<Parameter>> routineParameters_;
+		std::unordered_map<std::string, std::pair<std::string, ExprPtr>> globalConstants_;
 		std::unordered_map<std::string, ClosureBinding> closureBindings_;
 		std::unordered_set<std::string> nominalTypeNames_;
 		std::unordered_map<std::string, std::unordered_map<std::string, std::string>> nominalFieldTypes_;
@@ -6127,6 +6530,24 @@ namespace pcn {
 				return r != VReg::None && v <= fn.totalVregs;
 				};
 			for (const auto& p : fn.parameterVregs) if (!validReg(p)) errors.push_back(fn.name + ": invalid parameter vreg");
+			// A valid vreg number does not establish that any instruction produced
+			// its contents. Check the complete function def-use universe; branch-
+			// specific initialization is handled separately by semantic dataflow.
+			std::unordered_set<std::uint32_t> defined;
+			std::vector<std::uint32_t> used;
+			for (auto r : fn.parameterVregs) defined.insert(static_cast<std::uint32_t>(r));
+			for (const auto& block : fn.blocks) {
+				for (const auto& inst : block.phiNodes) {
+					if (inst.dest != VReg::None) defined.insert(static_cast<std::uint32_t>(inst.dest));
+					for (auto [pred, v] : inst.phiInputs) { (void)pred; used.push_back(static_cast<std::uint32_t>(v)); }
+				}
+				for (const auto& inst : block.instructions) {
+					if (inst.dest != VReg::None) defined.insert(static_cast<std::uint32_t>(inst.dest));
+					for (auto v : inst.args) used.push_back(static_cast<std::uint32_t>(v));
+				}
+			}
+			for (auto v : used) if (!defined.contains(v))
+				errors.push_back(fn.name + ": operand v" + std::to_string(v) + " has no definition in PCIR");
 			for (const auto& block : fn.blocks) {
 				if (block.id == BlockID::None) errors.push_back(fn.name + ": block has invalid id 0");
 				bool terminated = false;
@@ -6194,7 +6615,7 @@ namespace pcn {
 
 		static bool pure(IROpcode op) {
 			switch (op) {
-			case IROpcode::ConstInt: case IROpcode::ConstBool: case IROpcode::ConstNull: case IROpcode::Copy:
+			case IROpcode::ConstInt: case IROpcode::ConstFloat: case IROpcode::ConstBool: case IROpcode::ConstNull: case IROpcode::Copy:
 			case IROpcode::Add: case IROpcode::Sub: case IROpcode::Mul: case IROpcode::BitAnd: case IROpcode::BitOr:
 			case IROpcode::BitXor: case IROpcode::Shl: case IROpcode::Shr: case IROpcode::Neg: case IROpcode::BitNot:
 			case IROpcode::Not: case IROpcode::Eq: case IROpcode::Ne: case IROpcode::Lt: case IROpcode::Le:
@@ -6259,7 +6680,8 @@ namespace pcn {
 					}
 					continue;
 				}
-				if (pure(inst.op) && inst.dest != VReg::None && (inst.args.size() == 1 || inst.args.size() == 2)) {
+				if (pure(inst.op) && inst.dest != VReg::None && (inst.args.size() == 1 || inst.args.size() == 2) &&
+					std::none_of(inst.argumentValueTypes.begin(), inst.argumentValueTypes.end(), [](const IRValueType& t) {return t.kind == IRValueKind::Float32 || t.kind == IRValueKind::Float64; })) {
 					auto a = constants.find(key(inst.args[0]));
 					auto b = inst.args.size() == 2 ? constants.find(key(inst.args[1])) : constants.end();
 					if (a != constants.end() && (inst.args.size() == 1 || b != constants.end())) {
@@ -6426,6 +6848,16 @@ namespace pcn {
 				}
 				if (t.head == "view" || t.head == "span" || t.head == "ref" || t.head == "mut") { ABITypeLayout x; x.kind = ABIRepresentationKind::Aggregate; x.typeName = name; x.size = 16; x.alignment = 8; x.rich = true; x.fields = { { "ptr","raw",0,false },{ "count","size",8,false } }; return x; }
 				if (t.head == "buffer") { ABITypeLayout x; x.kind = ABIRepresentationKind::Aggregate; x.typeName = name; x.size = 24; x.alignment = 8; x.rich = true; x.fields = { { "ptr","raw",0,false },{ "count","size",8,false },{ "capacity","size",16,false } }; return x; }
+				if (t.head == "array" && t.args.size() == 2) {
+					std::string element; std::size_t count = 0;
+					if (!typeIsArray(name, &element, &count))throw std::runtime_error("invalid array type: " + name);
+					auto el = layout(element); if (el.size == 0)throw std::runtime_error("array of zero-sized element unsupported");
+					if (count > std::numeric_limits<std::size_t>::max() / el.size)throw std::runtime_error("array byte size overflow");
+					ABITypeLayout x; x.kind = ABIRepresentationKind::Aggregate; x.typeName = name; x.rich = true;
+					x.alignment = el.alignment; x.size = el.size * count;
+					for (std::size_t k = 0; k < count; ++k)x.fields.push_back({ std::to_string(k),element,k * el.size,false });
+					return x;
+				}
 				if (t.tuple) {
 					ABITypeLayout x; x.kind = ABIRepresentationKind::Aggregate; x.typeName = name; x.rich = true; std::size_t off = 0, al = 1;
 					for (std::size_t i = 0; i < t.args.size(); ++i) { auto tn = canonicalTypeText(t.args[i]); auto fl = layout(tn); off = alignUp(off, fl.alignment); x.fields.push_back({ std::to_string(i),tn,off,false }); off += fl.size; al = std::max(al, fl.alignment); }x.alignment = al; x.size = alignUp(off, al); return x;
@@ -6573,14 +7005,56 @@ namespace pcn {
 			}
 		}
 
+		static std::int64_t floatBinary(IROpcode op, std::int64_t a, std::int64_t b, bool single) {
+			auto compute = [&](auto lhs, auto rhs) -> std::int64_t {
+				using T = decltype(lhs);
+				switch (op) {
+				case IROpcode::Eq:return lhs == rhs;
+				case IROpcode::Ne:return lhs != rhs;
+				case IROpcode::Lt:return lhs < rhs;
+				case IROpcode::Le:return lhs <= rhs;
+				case IROpcode::Gt:return lhs > rhs;
+				case IROpcode::Ge:return lhs >= rhs;
+				default:break;
+				}
+				T result{};
+				switch (op) {
+				case IROpcode::Add: result = lhs + rhs; break;
+				case IROpcode::Sub: result = lhs - rhs; break;
+				case IROpcode::Mul: result = lhs * rhs; break;
+				case IROpcode::Div: result = lhs / rhs; break;
+				default:throw std::runtime_error("unsupported IEEE-754 oracle instruction");
+				}
+				if constexpr (sizeof(T) == 4) { std::uint32_t bits; std::memcpy(&bits, &result, 4); return static_cast<std::int64_t>(bits); }
+				else { std::uint64_t bits; std::memcpy(&bits, &result, 8); return static_cast<std::int64_t>(bits); }
+				};
+			if (single) { std::uint32_t x = static_cast<std::uint32_t>(a), y = static_cast<std::uint32_t>(b); float f, g; std::memcpy(&f, &x, 4); std::memcpy(&g, &y, 4); return compute(f, g); }
+			std::uint64_t x = static_cast<std::uint64_t>(a), y = static_cast<std::uint64_t>(b); double f, g; std::memcpy(&f, &x, 8); std::memcpy(&g, &y, 8); return compute(f, g);
+		}
+
 		Value execute(const IRFunction& fn, const std::vector<Value>& args) {
 			if (callDepth_++ > 1024)throw std::runtime_error("Paracine trap: recursion limit exceeded in PCIR oracle"); struct Guard { std::size_t& d; ~Guard() { --d; } }guard{ callDepth_ }; std::vector<Value>regs(fn.totalVregs + 1); for (std::size_t i = 0; i < std::min(args.size(), fn.parameterVregs.size()); ++i)regs[static_cast<std::uint32_t>(fn.parameterVregs[i])] = args[i]; std::unordered_map<std::uint32_t, std::size_t>bi; for (std::size_t i = 0; i < fn.blocks.size(); ++i)bi[static_cast<std::uint32_t>(fn.blocks[i].id)] = i; std::size_t current = 0; BlockID pred = BlockID::None; std::size_t steps = 0;
 			while (steps++ < 10000000) {
-				const auto& block = fn.blocks.at(current); for (const auto& phi : block.phiNodes) { if (phi.dest == VReg::None || phi.phiInputs.empty())continue; VReg sel = phi.phiInputs.front().second; for (auto [p, v] : phi.phiInputs)if (p == pred) { sel = v; break; }regs[static_cast<std::uint32_t>(phi.dest)] = regs[static_cast<std::uint32_t>(sel)]; }bool jumped = false; for (const auto& inst : block.instructions) {
+				const auto& block = fn.blocks.at(current); for (const auto& phi : block.phiNodes) { if (phi.dest == VReg::None || phi.phiInputs.empty())continue; VReg sel = VReg::None; for (auto [p, v] : phi.phiInputs)if (p == pred) { sel = v; break; }if (sel == VReg::None)throw std::runtime_error("PCIR phi missing predecessor input"); regs[static_cast<std::uint32_t>(phi.dest)] = regs[static_cast<std::uint32_t>(sel)]; }bool jumped = false; for (const auto& inst : block.instructions) {
 					auto get = [&](std::size_t n)->Value {return regs.at(static_cast<std::uint32_t>(inst.args.at(n))); }; auto set = [&](Value v) {if (inst.dest != VReg::None)regs.at(static_cast<std::uint32_t>(inst.dest)) = std::move(v); }; switch (inst.op) {
-					case IROpcode::ConstInt:set(scalar(std::stoll(inst.literalText))); break; case IROpcode::ConstBool:set(scalar(inst.immediate ? 1 : 0)); break; case IROpcode::ConstNull:set(scalar(0)); break; case IROpcode::ConstText: { auto v = object("text"); v.object->text = inst.literalText; set(v); break; }case IROpcode::Copy:set(get(0)); break;
-					case IROpcode::Neg:set(scalar(static_cast<std::int64_t>(0u - static_cast<std::uint64_t>(asInt(get(0)))))); break; case IROpcode::BitNot:set(scalar(~asInt(get(0)))); break; case IROpcode::Not:set(scalar(asInt(get(0)) == 0)); break;
-					case IROpcode::Add:case IROpcode::Sub:case IROpcode::Mul:case IROpcode::Div:case IROpcode::Mod:case IROpcode::BitAnd:case IROpcode::BitOr:case IROpcode::BitXor:case IROpcode::Shl:case IROpcode::Shr:case IROpcode::Eq:case IROpcode::Ne:case IROpcode::Lt:case IROpcode::Le:case IROpcode::Gt:case IROpcode::Ge:case IROpcode::And:case IROpcode::Or:set(scalar(binary(inst.op, asInt(get(0)), asInt(get(1))))); break;
+					case IROpcode::ConstInt:set(scalar(std::stoll(inst.literalText))); break;
+					case IROpcode::ConstFloat: {
+						if (inst.valueType.kind == IRValueKind::Float32) { float x = std::stof(inst.literalText); std::uint32_t bits; std::memcpy(&bits, &x, 4); set(scalar(bits)); }
+						else { double x = std::stod(inst.literalText); std::uint64_t bits; std::memcpy(&bits, &x, 8); set(scalar(static_cast<std::int64_t>(bits))); }break;
+					}case IROpcode::ConstBool:set(scalar(inst.immediate ? 1 : 0)); break; case IROpcode::ConstNull:set(scalar(0)); break; case IROpcode::ConstText: { auto v = object("text"); v.object->text = inst.literalText; set(v); break; }case IROpcode::Copy:set(get(0)); break;
+					case IROpcode::Neg: {
+						auto v = static_cast<std::uint64_t>(asInt(get(0)));
+						if (inst.valueType.kind == IRValueKind::Float32) v ^= 0x80000000u;
+						else if (inst.valueType.kind == IRValueKind::Float64) v ^= 0x8000000000000000ull;
+						else v = 0u - v;
+						set(scalar(static_cast<std::int64_t>(v))); break;
+					}case IROpcode::BitNot:set(scalar(~asInt(get(0)))); break; case IROpcode::Not:set(scalar(asInt(get(0)) == 0)); break;
+					case IROpcode::Add:case IROpcode::Sub:case IROpcode::Mul:case IROpcode::Div:case IROpcode::Mod:case IROpcode::BitAnd:case IROpcode::BitOr:case IROpcode::BitXor:case IROpcode::Shl:case IROpcode::Shr:case IROpcode::Eq:case IROpcode::Ne:case IROpcode::Lt:case IROpcode::Le:case IROpcode::Gt:case IROpcode::Ge:case IROpcode::And:case IROpcode::Or: {
+						if (!inst.argumentValueTypes.empty() &&
+							(inst.argumentValueTypes[0].kind == IRValueKind::Float32 || inst.argumentValueTypes[0].kind == IRValueKind::Float64))
+							set(scalar(floatBinary(inst.op, asInt(get(0)), asInt(get(1)), inst.argumentValueTypes[0].kind == IRValueKind::Float32)));
+						else set(scalar(binary(inst.op, asInt(get(0)), asInt(get(1))))); break;
+					}
 					case IROpcode::Branch:pred = block.id; current = bi.at(static_cast<std::uint32_t>(inst.targetBlocks.at(0))); jumped = true; break; case IROpcode::BranchIf:pred = block.id; current = bi.at(static_cast<std::uint32_t>(asInt(get(0)) ? inst.targetBlocks.at(0) : inst.targetBlocks.at(1))); jumped = true; break;
 					case IROpcode::Call: { std::vector<Value>ca; for (auto v : inst.args)ca.push_back(regs.at(static_cast<std::uint32_t>(v))); if (inst.callee == "print" || inst.callee == "println") { if (!ca.empty())std::cout << asInt(ca.front()); if (inst.callee == "println")std::cout << '\n'; set(scalar(0)); } else { auto it = functions_.find(inst.callee); if (it == functions_.end())throw std::runtime_error("PCIR oracle unresolved call: " + inst.callee); set(execute(*it->second, ca)); }break; }
 					case IROpcode::TextToString: { auto src = get(0); if (!src.object || src.object->typeName != "text")throw std::runtime_error("PCIR oracle text.to_string on non-text"); auto v = object("string"); v.object->text = src.object->text; set(v); break; }
@@ -6592,6 +7066,7 @@ namespace pcn {
 					case IROpcode::StringClear: { auto src = get(0); if (!src.object || src.object->typeName != "string")throw std::runtime_error("PCIR oracle string.clear on non-string"); src.object->text.clear(); set(scalar(0)); break; }
 					case IROpcode::MakeAggregate: { auto v = object(inst.typeName); v.object->names = inst.argumentTypes; for (std::size_t i = 0; i < inst.args.size(); ++i)v.object->fields.push_back(get(i)); set(v); break; }
 					case IROpcode::ExtractField: { auto o = get(0); if (!o.object)throw std::runtime_error("PCIR oracle member access on scalar"); auto it = std::find(o.object->names.begin(), o.object->names.end(), inst.literalText); if (it == o.object->names.end())throw std::runtime_error("PCIR oracle unknown aggregate field: " + inst.literalText); set(o.object->fields[static_cast<std::size_t>(it - o.object->names.begin())]); break; }
+					case IROpcode::ArrayIndex: { auto a = get(0); auto k = asInt(get(1)); if (!a.object || k < 0 || static_cast<std::size_t>(k) >= a.object->fields.size())throw std::runtime_error("Paracine trap: array index out of bounds"); set(a.object->fields[static_cast<std::size_t>(k)]); break; }
 					case IROpcode::ResultOk:case IROpcode::ResultErr: { auto v = object(inst.valueType.name); v.object->tag = inst.op == IROpcode::ResultErr ? 1 : 0; if (!inst.args.empty())v.object->fields.push_back(get(0)); set(v); break; }
 					case IROpcode::ResultIsErr: { auto v = get(0); if (!v.object)throw std::runtime_error("PCIR oracle result.is_err on non-result"); set(scalar(v.object->tag != 0)); break; }
 					case IROpcode::ResultTry: { auto v = get(0); if (!v.object)throw std::runtime_error("PCIR oracle try on non-result"); if (v.object->tag != 0)return v; if (v.object->fields.empty())throw std::runtime_error("PCIR oracle result missing payload"); set(v.object->fields.front()); break; }
@@ -6610,9 +7085,9 @@ namespace pcn {
 
 	// --- PMIR: target-aware Windows x86-64 rich-value machine representation ---
 	enum class PMIROpcode {
-		ConstInt, ConstBool, ConstNull, ConstText, Copy, Add, Sub, Mul, Div, Mod, BitAnd, BitOr, BitXor,
+		ConstInt, ConstFloat, ConstBool, ConstNull, ConstText, Copy, Add, Sub, Mul, Div, Mod, BitAnd, BitOr, BitXor,
 		Shl, Shr, Neg, BitNot, Not, Eq, Ne, Lt, Le, Gt, Ge, And, Or, Branch, BranchIf, Call, CallClosure,
-		TextToString, StringToText, StringClear, StringDispose, StringMove, ByteCount, TextEquals, MakeAggregate, ExtractField, ResultOk, ResultErr, ResultIsErr, ResultTry, OptionSome, OptionNone, MakeClosure, Return, Nop
+		TextToString, StringToText, StringClear, StringDispose, StringMove, ByteCount, TextEquals, MakeAggregate, ExtractField, ArrayIndex, ResultOk, ResultErr, ResultIsErr, ResultTry, OptionSome, OptionNone, MakeClosure, Return, Nop
 	};
 
 	struct PMIRInstruction {
@@ -6665,6 +7140,67 @@ namespace pcn {
 
 	class PMIRLowerer {
 	public:
+		// Lower every PCIR phi on its incoming edge, not at the destination.
+		// The first pass snapshots all sources to fresh virtual registers so even
+		// mutually dependent phi assignments retain simultaneous SSA semantics.
+		static IRFunction lowerPhiEdges(const IRFunction& source) {
+			IRFunction out = source;
+			std::unordered_map<std::uint32_t, const IRBasicBlock*> targets;
+			std::uint32_t nextBlock = 1;
+			for (const auto& block : source.blocks) {
+				targets.emplace(static_cast<std::uint32_t>(block.id), &block);
+				nextBlock = std::max(nextBlock, static_cast<std::uint32_t>(block.id) + 1);
+			}
+			std::vector<IRBasicBlock> synthetic;
+			for (auto& block : out.blocks) {
+				if (block.instructions.empty()) continue;
+				auto& terminal = block.instructions.back();
+				if (terminal.op != IROpcode::Branch && terminal.op != IROpcode::BranchIf) continue;
+				std::map<std::uint32_t, BlockID> redirects;
+				for (auto& target : terminal.targetBlocks) {
+					const auto original = target;
+					const auto tid = static_cast<std::uint32_t>(original);
+					const auto found = targets.find(tid);
+					if (found == targets.end() || found->second->phiNodes.empty()) continue;
+					if (auto it = redirects.find(tid); it != redirects.end()) { target = it->second; continue; }
+					IRBasicBlock edge;
+					edge.id = static_cast<BlockID>(nextBlock++);
+					edge.labelName = "bb_phi_edge_" + std::to_string(static_cast<std::uint32_t>(block.id)) + "_" + std::to_string(tid);
+					std::vector<std::pair<VReg, VReg>> snapshots;
+					for (const auto& phi : found->second->phiNodes) {
+						if (phi.op != IROpcode::Phi || phi.dest == VReg::None)
+							throw std::runtime_error("PMIR invalid phi node on edge: " + edge.labelName);
+						VReg incoming = VReg::None;
+						for (const auto& [pred, value] : phi.phiInputs) {
+							if (pred == block.id) {
+								if (incoming != VReg::None) throw std::runtime_error("PMIR duplicate phi predecessor");
+								incoming = value;
+							}
+						}
+						if (incoming == VReg::None) throw std::runtime_error("PMIR missing phi incoming value on " + edge.labelName);
+						IRInstruction capture; capture.op = IROpcode::Copy;
+						capture.dest = static_cast<VReg>(++out.totalVregs);
+						capture.valueType = phi.valueType; capture.args = { incoming };
+						edge.instructions.push_back(capture);
+						snapshots.emplace_back(phi.dest, capture.dest);
+					}
+					std::size_t index = 0;
+					for (const auto& phi : found->second->phiNodes) {
+						IRInstruction assign; assign.op = IROpcode::Copy;
+						assign.dest = snapshots[index].first;
+						assign.args = { snapshots[index].second }; assign.valueType = phi.valueType;
+						edge.instructions.push_back(std::move(assign)); ++index;
+					}
+					IRInstruction jump; jump.op = IROpcode::Branch; jump.targetBlocks = { original };
+					jump.valueType = makeIRVoidType(); edge.instructions.push_back(std::move(jump));
+					redirects.emplace(tid, edge.id); target = edge.id;
+					synthetic.push_back(std::move(edge));
+				}
+			}
+			for (auto& block : out.blocks) block.phiNodes.clear();
+			out.blocks.insert(out.blocks.end(), std::make_move_iterator(synthetic.begin()), std::make_move_iterator(synthetic.end()));
+			return out;
+		}
 		PMIRProgram lower(const IRProgram& ir) const {
 			PMIRProgram out; out.skm = ir.skm; out.nominalTypes = ir.nominalTypes;
 			RichABIResolver abi(ir);
@@ -6676,7 +7212,7 @@ namespace pcn {
 		static std::uint32_t align16(std::uint32_t v) { return alignUp32(v, 16); }
 		static PMIROpcode map(IROpcode op) {
 			switch (op) {
-			case IROpcode::ConstInt:return PMIROpcode::ConstInt; case IROpcode::ConstText:return PMIROpcode::ConstText; case IROpcode::ConstBool:return PMIROpcode::ConstBool; case IROpcode::ConstNull:return PMIROpcode::ConstNull;
+			case IROpcode::ConstInt:return PMIROpcode::ConstInt; case IROpcode::ConstFloat:return PMIROpcode::ConstFloat; case IROpcode::ConstText:return PMIROpcode::ConstText; case IROpcode::ConstBool:return PMIROpcode::ConstBool; case IROpcode::ConstNull:return PMIROpcode::ConstNull;
 			case IROpcode::Copy:return PMIROpcode::Copy; case IROpcode::Add:return PMIROpcode::Add; case IROpcode::Sub:return PMIROpcode::Sub; case IROpcode::Mul:return PMIROpcode::Mul;
 			case IROpcode::Div:return PMIROpcode::Div; case IROpcode::Mod:return PMIROpcode::Mod; case IROpcode::BitAnd:return PMIROpcode::BitAnd; case IROpcode::BitOr:return PMIROpcode::BitOr;
 			case IROpcode::BitXor:return PMIROpcode::BitXor; case IROpcode::Shl:return PMIROpcode::Shl; case IROpcode::Shr:return PMIROpcode::Shr; case IROpcode::Neg:return PMIROpcode::Neg;
@@ -6684,7 +7220,7 @@ namespace pcn {
 			case IROpcode::Lt:return PMIROpcode::Lt; case IROpcode::Le:return PMIROpcode::Le; case IROpcode::Gt:return PMIROpcode::Gt; case IROpcode::Ge:return PMIROpcode::Ge;
 			case IROpcode::And:return PMIROpcode::And; case IROpcode::Or:return PMIROpcode::Or; case IROpcode::Branch:return PMIROpcode::Branch; case IROpcode::BranchIf:return PMIROpcode::BranchIf;
 			case IROpcode::Call:return PMIROpcode::Call; case IROpcode::CallClosure:return PMIROpcode::CallClosure; case IROpcode::TextToString:return PMIROpcode::TextToString; case IROpcode::StringToText:return PMIROpcode::StringToText; case IROpcode::StringClear:return PMIROpcode::StringClear; case IROpcode::StringDispose:return PMIROpcode::StringDispose; case IROpcode::StringMove:return PMIROpcode::StringMove; case IROpcode::ByteCount:return PMIROpcode::ByteCount; case IROpcode::TextEquals:return PMIROpcode::TextEquals; case IROpcode::MakeAggregate:return PMIROpcode::MakeAggregate;
-			case IROpcode::ExtractField:return PMIROpcode::ExtractField; case IROpcode::ResultOk:return PMIROpcode::ResultOk; case IROpcode::ResultErr:return PMIROpcode::ResultErr;
+			case IROpcode::ExtractField:return PMIROpcode::ExtractField; case IROpcode::ArrayIndex:return PMIROpcode::ArrayIndex; case IROpcode::ResultOk:return PMIROpcode::ResultOk; case IROpcode::ResultErr:return PMIROpcode::ResultErr;
 			case IROpcode::ResultIsErr:return PMIROpcode::ResultIsErr; case IROpcode::ResultTry:return PMIROpcode::ResultTry; case IROpcode::OptionSome:return PMIROpcode::OptionSome; case IROpcode::OptionNone:return PMIROpcode::OptionNone;
 			case IROpcode::MakeClosure:return PMIROpcode::MakeClosure; case IROpcode::Return:return PMIROpcode::Return;
 			case IROpcode::Nop:return PMIROpcode::Nop;
@@ -6697,7 +7233,9 @@ namespace pcn {
 			for (const auto& b : fn.blocks) { for (const auto& p : b.phiNodes)if (p.dest != VReg::None)types[static_cast<std::uint32_t>(p.dest)] = p.valueType; for (const auto& i : b.instructions)if (i.dest != VReg::None)types[static_cast<std::uint32_t>(i.dest)] = i.valueType; }
 			return types;
 		}
-		PMIRFunction lowerFunction(const IRFunction& fn, const RichABIResolver& abi) const {
+		PMIRFunction lowerFunction(const IRFunction& original, const RichABIResolver& abi) const {
+			const IRFunction normalized = lowerPhiEdges(original);
+			const IRFunction& fn = normalized;
 			PMIRFunction out; out.name = fn.name; out.returnType = fn.returnType; out.returnValueType = fn.valueType; out.richReturn = abi.isRich(fn.valueType); out.totalSlots = fn.totalVregs;
 			out.parameterTypes = fn.parameterTypes; out.parameterModes = fn.parameterModes; out.parameterValueTypes = fn.parameterValueTypes;
 			for (auto v : fn.parameterVregs)out.parameterSlots.push_back(static_cast<std::uint32_t>(v));
@@ -6737,10 +7275,16 @@ namespace pcn {
 			out.frameSize = align16(cursor + out.outgoingArea);
 			for (const auto& b : fn.blocks) {
 				PMIRBlock pb; pb.id = static_cast<std::uint32_t>(b.id); pb.label = b.labelName;
-				for (const auto& phi : b.phiNodes)if (!phi.phiInputs.empty()) { PMIRInstruction p; p.op = PMIROpcode::Copy; p.destSlot = static_cast<std::uint32_t>(phi.dest); p.srcSlots = { static_cast<std::uint32_t>(phi.phiInputs.front().second) }; p.valueType = phi.valueType; pb.instructions.push_back(std::move(p)); }
+				if (!b.phiNodes.empty()) throw std::runtime_error("PMIR internal error: unlowered SSA phi");
 				for (const auto& i : b.instructions) {
 					PMIRInstruction p; p.op = map(i.op); p.destSlot = static_cast<std::uint32_t>(i.dest); p.callee = i.callee; p.typeName = i.typeName; p.literalText = i.literalText; p.returnType = i.returnType; p.valueType = i.valueType; p.argumentTypes = i.argumentTypes; p.argumentValueTypes = i.argumentValueTypes; p.immediate = i.immediate; p.hasImmediate = i.hasImmediate;
-					if (i.op == IROpcode::ConstInt) { p.immediate = std::stoll(i.literalText); p.hasImmediate = true; }if (i.op == IROpcode::ConstBool) { p.immediate = i.immediate ? 1 : 0; p.hasImmediate = true; }if (i.op == IROpcode::ConstNull) { p.immediate = 0; p.hasImmediate = true; }
+					if (i.op == IROpcode::ConstInt) { p.immediate = std::stoll(i.literalText); p.hasImmediate = true; }
+					if (i.op == IROpcode::ConstFloat) {
+						if (i.valueType.kind == IRValueKind::Float32) { const float x = std::stof(i.literalText); std::uint32_t bits; std::memcpy(&bits, &x, 4); p.immediate = static_cast<std::int64_t>(bits); }
+						else if (i.valueType.kind == IRValueKind::Float64) { const double x = std::stod(i.literalText); std::uint64_t bits; std::memcpy(&bits, &x, 8); p.immediate = static_cast<std::int64_t>(bits); }
+						else throw std::runtime_error("floating literal needs concrete float/double type");
+						p.hasImmediate = true;
+					}if (i.op == IROpcode::ConstBool) { p.immediate = i.immediate ? 1 : 0; p.hasImmediate = true; }if (i.op == IROpcode::ConstNull) { p.immediate = 0; p.hasImmediate = true; }
 					for (auto v : i.args)p.srcSlots.push_back(static_cast<std::uint32_t>(v)); for (auto t : i.targetBlocks)p.targets.push_back(static_cast<std::uint32_t>(t)); pb.instructions.push_back(std::move(p));
 				}
 				out.blocks.push_back(std::move(pb));
@@ -6764,8 +7308,8 @@ namespace pcn {
 
 	static std::string pmirOpcodeName(PMIROpcode op) {
 		switch (op) {
-		case PMIROpcode::ConstInt:return"mov.imm"; case PMIROpcode::ConstBool:return"mov.bool"; case PMIROpcode::ConstNull:return"mov.null"; case PMIROpcode::ConstText:return"text.literal"; case PMIROpcode::Copy:return"copy";
-		case PMIROpcode::Add:return"add"; case PMIROpcode::Sub:return"sub"; case PMIROpcode::Mul:return"imul"; case PMIROpcode::Div:return"idiv.defined"; case PMIROpcode::Mod:return"imod.defined"; case PMIROpcode::BitAnd:return"and"; case PMIROpcode::BitOr:return"or"; case PMIROpcode::BitXor:return"xor"; case PMIROpcode::Shl:return"shl"; case PMIROpcode::Shr:return"sar"; case PMIROpcode::Neg:return"neg"; case PMIROpcode::BitNot:return"not"; case PMIROpcode::Not:return"logical.not"; case PMIROpcode::Eq:return"cmp.eq"; case PMIROpcode::Ne:return"cmp.ne"; case PMIROpcode::Lt:return"cmp.lt"; case PMIROpcode::Le:return"cmp.le"; case PMIROpcode::Gt:return"cmp.gt"; case PMIROpcode::Ge:return"cmp.ge"; case PMIROpcode::And:return"logical.and"; case PMIROpcode::Or:return"logical.or"; case PMIROpcode::Branch:return"jmp"; case PMIROpcode::BranchIf:return"br.if"; case PMIROpcode::Call:return"call"; case PMIROpcode::CallClosure:return"call.closure"; case PMIROpcode::TextToString:return"text.to_string"; case PMIROpcode::StringToText:return"string.to_text"; case PMIROpcode::StringClear:return"string.clear"; case PMIROpcode::StringDispose:return"string.dispose"; case PMIROpcode::StringMove:return"string.move"; case PMIROpcode::ByteCount:return"text.count"; case PMIROpcode::TextEquals:return"text.equals"; case PMIROpcode::MakeAggregate:return"aggregate.make"; case PMIROpcode::ExtractField:return"aggregate.field"; case PMIROpcode::ResultOk:return"result.ok"; case PMIROpcode::ResultErr:return"result.err"; case PMIROpcode::ResultIsErr:return"result.is_err"; case PMIROpcode::ResultTry:return"result.try"; case PMIROpcode::OptionSome:return"option.some"; case PMIROpcode::OptionNone:return"option.none"; case PMIROpcode::MakeClosure:return"closure.make"; case PMIROpcode::Return:return"ret"; case PMIROpcode::Nop:return"nop";
+		case PMIROpcode::ConstInt:return"mov.imm"; case PMIROpcode::ConstFloat:return"mov.fp.bits"; case PMIROpcode::ConstBool:return"mov.bool"; case PMIROpcode::ConstNull:return"mov.null"; case PMIROpcode::ConstText:return"text.literal"; case PMIROpcode::Copy:return"copy";
+		case PMIROpcode::Add:return"add"; case PMIROpcode::Sub:return"sub"; case PMIROpcode::Mul:return"imul"; case PMIROpcode::Div:return"idiv.defined"; case PMIROpcode::Mod:return"imod.defined"; case PMIROpcode::BitAnd:return"and"; case PMIROpcode::BitOr:return"or"; case PMIROpcode::BitXor:return"xor"; case PMIROpcode::Shl:return"shl"; case PMIROpcode::Shr:return"sar"; case PMIROpcode::Neg:return"neg"; case PMIROpcode::BitNot:return"not"; case PMIROpcode::Not:return"logical.not"; case PMIROpcode::Eq:return"cmp.eq"; case PMIROpcode::Ne:return"cmp.ne"; case PMIROpcode::Lt:return"cmp.lt"; case PMIROpcode::Le:return"cmp.le"; case PMIROpcode::Gt:return"cmp.gt"; case PMIROpcode::Ge:return"cmp.ge"; case PMIROpcode::And:return"logical.and"; case PMIROpcode::Or:return"logical.or"; case PMIROpcode::Branch:return"jmp"; case PMIROpcode::BranchIf:return"br.if"; case PMIROpcode::Call:return"call"; case PMIROpcode::CallClosure:return"call.closure"; case PMIROpcode::TextToString:return"text.to_string"; case PMIROpcode::StringToText:return"string.to_text"; case PMIROpcode::StringClear:return"string.clear"; case PMIROpcode::StringDispose:return"string.dispose"; case PMIROpcode::StringMove:return"string.move"; case PMIROpcode::ByteCount:return"text.count"; case PMIROpcode::TextEquals:return"text.equals"; case PMIROpcode::MakeAggregate:return"aggregate.make"; case PMIROpcode::ExtractField:return"aggregate.field"; case PMIROpcode::ArrayIndex:return"array.index.checked"; case PMIROpcode::ResultOk:return"result.ok"; case PMIROpcode::ResultErr:return"result.err"; case PMIROpcode::ResultIsErr:return"result.is_err"; case PMIROpcode::ResultTry:return"result.try"; case PMIROpcode::OptionSome:return"option.some"; case PMIROpcode::OptionNone:return"option.none"; case PMIROpcode::MakeClosure:return"closure.make"; case PMIROpcode::Return:return"ret"; case PMIROpcode::Nop:return"nop";
 		}return"?";
 	}
 
@@ -6823,6 +7367,54 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 								  static std::size_t emitLocalJcc(std::vector<std::uint8_t>& b, std::uint8_t cc) { b.push_back(0x0F); b.push_back(cc); auto p = b.size(); put32(b, 0); return p; }static std::size_t emitLocalJmp(std::vector<std::uint8_t>& b) { b.push_back(0xE9); auto p = b.size(); put32(b, 0); return p; }static void patchLocal(std::vector<std::uint8_t>& b, std::size_t p, std::size_t target) { patch32(b, p, static_cast<std::int32_t>(static_cast<std::int64_t>(target) - static_cast<std::int64_t>(p + 4))); }
 								  static void emitJmp(std::vector<std::uint8_t>& b, std::uint32_t target, std::vector<BranchFix>& fs) { b.push_back(0xE9); std::size_t p = b.size(); put32(b, 0); fs.push_back({ p,target }); }static void emitJcc(std::vector<std::uint8_t>& b, std::uint8_t cc, std::uint32_t target, std::vector<BranchFix>& fs) { b.push_back(0x0F); b.push_back(cc); std::size_t p = b.size(); put32(b, 0); fs.push_back({ p,target }); }
 
+								  static bool fpType(IRValueKind kind) { return kind == IRValueKind::Float32 || kind == IRValueKind::Float64; }
+								  // Microsoft x64 scalar IEEE-754 lanes: XMM0..XMM3 correspond to the
+								  // first four positional ABI argument slots, XMM0 is the return lane.
+								  // Every virtual slot is eight bytes; float32 occupies the low four.
+								  static void xmmRbp(std::vector<std::uint8_t>& b, int xmm, std::int32_t disp, bool store, bool single) {
+									  b.push_back(single ? 0xF3 : 0xF2);
+									  b.insert(b.end(), { 0x0F,static_cast<std::uint8_t>(store ? 0x11 : 0x10),static_cast<std::uint8_t>(0x85 | ((xmm & 7) << 3)) });
+									  put32(b, disp);
+								  }
+								  static void xmmRbpOp(std::vector<std::uint8_t>& b, int xmm, std::int32_t disp, std::uint8_t op, bool single) {
+									  b.push_back(single ? 0xF3 : 0xF2); b.insert(b.end(), { 0x0F,op,static_cast<std::uint8_t>(0x85 | ((xmm & 7) << 3)) }); put32(b, disp);
+								  }
+								  static void xmmSlotLoad(std::vector<std::uint8_t>& b, const PMIRFunction& fn, std::uint32_t slot, int xmm = 0) {
+									  auto& info = fn.slots.at(slot); xmmRbp(b, xmm, negDisp(info.cellOffset), false, info.type.kind == IRValueKind::Float32);
+								  }
+								  static void xmmSlotStore(std::vector<std::uint8_t>& b, const PMIRFunction& fn, std::uint32_t slot, int xmm = 0) {
+									  auto& info = fn.slots.at(slot); xmmRbp(b, xmm, negDisp(info.cellOffset), true, info.type.kind == IRValueKind::Float32);
+								  }
+								  static void xmmCompare(std::vector<std::uint8_t>& b, bool single) {
+									  if (!single)b.push_back(0x66); b.insert(b.end(), { 0x0F,0x2E,0xC1 });
+								  }
+								  static void floatOp(const PMIRFunction& fn, const PMIRInstruction& i, std::vector<std::uint8_t>& b) {
+									  const bool single = fn.slots.at(i.srcSlots.at(0)).type.kind == IRValueKind::Float32;
+									  xmmSlotLoad(b, fn, i.srcSlots[0]);
+									  if (i.op == PMIROpcode::Eq || i.op == PMIROpcode::Ne || i.op == PMIROpcode::Lt ||
+										  i.op == PMIROpcode::Le || i.op == PMIROpcode::Gt || i.op == PMIROpcode::Ge) {
+										  xmmSlotLoad(b, fn, i.srcSlots[1], 1); xmmCompare(b, single);
+										  // UCOMIS[D] returns PF=1 on unordered comparisons: explicit NaN logic.
+										  const std::uint8_t cc = i.op == PMIROpcode::Eq ? 0x94 : i.op == PMIROpcode::Ne ? 0x95 :
+											  i.op == PMIROpcode::Lt ? 0x92 : i.op == PMIROpcode::Le ? 0x96 :
+											  i.op == PMIROpcode::Gt ? 0x97 : 0x93;
+										  b.insert(b.end(), { 0x0F,cc,0xC0 }); // setcc al
+										  if (i.op == PMIROpcode::Eq || i.op == PMIROpcode::Lt || i.op == PMIROpcode::Le) {
+											  b.insert(b.end(), { 0x0F,0x9B,0xC1,0x20,0xC8 }); // setnp cl; and al,cl
+										  }
+										  else if (i.op == PMIROpcode::Ne) {
+											  b.insert(b.end(), { 0x0F,0x9A,0xC1,0x08,0xC8 }); // setp cl; or al,cl
+										  }
+										  b.insert(b.end(), { 0x0F,0xB6,0xC0 });
+										  storeSlot(b, 0, fn, i.destSlot); return;
+									  }
+									  const std::uint8_t op = i.op == PMIROpcode::Add ? 0x58 : i.op == PMIROpcode::Sub ? 0x5C :
+										  i.op == PMIROpcode::Mul ? 0x59 : i.op == PMIROpcode::Div ? 0x5E : 0;
+									  if (!op)throw std::runtime_error("unsupported x64 floating-point operation");
+									  xmmRbpOp(b, 0, negDisp(fn.slots.at(i.srcSlots[1]).cellOffset), op, single);
+									  xmmSlotStore(b, fn, i.destSlot);
+								  }
+
 								  static void loadIncoming(std::vector<std::uint8_t>& b, std::size_t abiIndex) { const int regs[4] = { 1,2,8,9 }; if (abiIndex < 4)movReg(b, 0, regs[abiIndex]); else loadRbp(b, 0, static_cast<std::int32_t>(48 + (abiIndex - 4) * 8)); }
 								  static void placeArgFromRax(std::vector<std::uint8_t>& b, std::size_t abiIndex) { const int regs[4] = { 1,2,8,9 }; if (abiIndex < 4)movReg(b, regs[abiIndex], 0); else storeRspRax(b, static_cast<std::int32_t>(32 + (abiIndex - 4) * 8)); }
 								  static void initRichDest(std::vector<std::uint8_t>& b, const PMIRFunction& fn, std::uint32_t slot) { leaObject(b, 0, fn, slot); storeSlot(b, 0, fn, slot); }
@@ -6833,7 +7425,11 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 								  EncodedFunction encodeFunction(const PMIRFunction& fn, const RichABIResolver& abi)const {
 									  EncodedFunction out; auto& b = out.bytes; std::unordered_map<std::uint32_t, std::size_t>blockOffsets; std::vector<BranchFix>branches; auto record = [&](std::size_t st, const std::string& t) {out.listing.push_back({ st,slice(b,st,b.size()),t }); }; std::size_t s = b.size(); b.push_back(0x55); b.insert(b.end(), { 0x48,0x89,0xE5 }); b.insert(b.end(), { 0x48,0x81,0xEC }); put32(b, static_cast<std::int32_t>(fn.frameSize)); record(s, "push rbp; mov rbp,rsp; sub rsp," + std::to_string(fn.frameSize));
 									  std::size_t abiBase = 0; if (fn.richReturn) { s = b.size(); storeRbp(b, 1, negDisp(fn.sretCellOffset)); record(s, "spill hidden sret"); abiBase = 1; }
-									  for (std::size_t i = 0; i < fn.parameterSlots.size(); ++i) { s = b.size(); const auto slot = fn.parameterSlots[i]; loadIncoming(b, abiBase + i); const auto& si = fn.slots.at(slot); if (si.rich) {/* Rich Paracine parameters are ABI-indirect values. Keep the caller object pointer so shared/var/own modes preserve the semantic object identity for the duration of the call; a later explicit rebind materializes into the slot's local object storage. */storeSlot(b, 0, fn, slot); } else storeSlot(b, 0, fn, slot); record(s, "legalize parameter -> s" + std::to_string(slot) + (si.rich ? " (indirect rich)" : "")); }
+									  for (std::size_t i = 0; i < fn.parameterSlots.size(); ++i) {
+										  s = b.size(); const auto slot = fn.parameterSlots[i]; loadIncoming(b, abiBase + i); const auto& si = fn.slots.at(slot); if (si.rich) {/* Rich parameters remain indirect. */storeSlot(b, 0, fn, slot); }
+										  else if (fpType(si.type.kind) && abiBase + i < 4) { xmmSlotStore(b, fn, slot, static_cast<int>(abiBase + i)); }
+										  else storeSlot(b, 0, fn, slot); record(s, "legalize parameter -> s" + std::to_string(slot) + (si.rich ? " (indirect rich)" : ""));
+									  }
 									  for (const auto& block : fn.blocks) { blockOffsets[block.id] = b.size(); for (const auto& ins : block.instructions) { s = b.size(); encodeInstruction(fn, ins, abi, b, branches, out.calls, out.literals, out.imports); record(s, pmirOpcodeName(ins.op)); } }
 									  if (fn.blocks.empty() || b.empty() || b.back() != 0xC3) { s = b.size(); b.insert(b.end(), { 0x31,0xC0 }); epilogue(b); record(s, "implicit return 0"); }
 									  for (const auto& f : branches) { auto it = blockOffsets.find(f.target); if (it == blockOffsets.end())throw std::runtime_error("x64 encoder invalid branch target"); std::int64_t rel = static_cast<std::int64_t>(it->second) - static_cast<std::int64_t>(f.dispPos + 4); patch32(b, f.dispPos, static_cast<std::int32_t>(rel)); }return out;
@@ -6842,131 +7438,195 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 								  static void emitDirectCall(std::vector<std::uint8_t>& b, const std::string& callee, std::vector<EncodedFunction::Call>& calls) { b.push_back(0xE8); auto p = b.size(); put32(b, 0); calls.push_back({ p,callee }); }
 								  static void emitImportedCall(std::vector<std::uint8_t>& b, const std::string& symbol, std::vector<EncodedFunction::Import>& imports) { b.push_back(0xFF); b.push_back(0x15); auto p = b.size(); put32(b, 0); imports.push_back({ p,symbol }); }
 								  void encodeCall(const PMIRFunction& fn, const PMIRInstruction& i, const RichABIResolver& abi, std::vector<std::uint8_t>& b, std::vector<EncodedFunction::Call>& calls)const {
-									  std::size_t ai = 0; const bool richRet = abi.isRich(i.valueType); if (richRet) { initRichDest(b, fn, i.destSlot); loadSlot(b, 0, fn, i.destSlot); placeArgFromRax(b, ai++); }for (std::size_t n = 0; n < i.srcSlots.size(); ++n) { loadSlot(b, 0, fn, i.srcSlots[n]); placeArgFromRax(b, ai++); }emitDirectCall(b, i.callee, calls); if (i.destSlot && !richRet)storeSlot(b, 0, fn, i.destSlot);
+									  std::size_t ai = 0; const bool richRet = abi.isRich(i.valueType); if (richRet) { initRichDest(b, fn, i.destSlot); loadSlot(b, 0, fn, i.destSlot); placeArgFromRax(b, ai++); }for (std::size_t n = 0; n < i.srcSlots.size(); ++n) {
+										  const auto kind = fn.slots.at(i.srcSlots[n]).type.kind;
+										  if (fpType(kind) && ai < 4) { xmmSlotLoad(b, fn, i.srcSlots[n], static_cast<int>(ai)); ++ai; }
+										  else { loadSlot(b, 0, fn, i.srcSlots[n]); placeArgFromRax(b, ai++); }
+									  }
+									  emitDirectCall(b, i.callee, calls);
+									  if (i.destSlot && !richRet) { if (fpType(i.valueType.kind))xmmSlotStore(b, fn, i.destSlot); else storeSlot(b, 0, fn, i.destSlot); }
 								  }
 								  void encodeClosureCall(const PMIRFunction& fn, const PMIRInstruction& i, const RichABIResolver& abi, std::vector<std::uint8_t>& b, std::vector<EncodedFunction::Call>& calls)const {
-									  if (i.srcSlots.empty())throw std::runtime_error("closure call missing closure value"); const auto closureType = fn.slots.at(i.srcSlots[0]).type; auto cl = abi.layout(closureType); if (cl.kind != ABIRepresentationKind::Closure)throw std::runtime_error("call.closure source is not a concrete closure type"); loadSlot(b, 10, fn, i.srcSlots[0]); std::size_t ai = 0; const bool richRet = abi.isRich(i.valueType); if (richRet) { initRichDest(b, fn, i.destSlot); loadSlot(b, 0, fn, i.destSlot); placeArgFromRax(b, ai++); }for (const auto& f : cl.fields) { auto fl = abi.layout(f.typeName); if (fl.rich) { movReg(b, 0, 10); if (f.offset) { movImm(b, 11, f.offset); b.insert(b.end(), { 0x4C,0x01,0xD8 }); } } else loadMem(b, 0, 10, static_cast<std::int32_t>(f.offset), std::max<std::size_t>(fl.size, 1), fl.signedScalar); placeArgFromRax(b, ai++); }for (std::size_t n = 1; n < i.srcSlots.size(); ++n) { loadSlot(b, 0, fn, i.srcSlots[n]); placeArgFromRax(b, ai++); }emitDirectCall(b, cl.closureCallee, calls); if (i.destSlot && !richRet)storeSlot(b, 0, fn, i.destSlot);
+									  if (i.srcSlots.empty())throw std::runtime_error("closure call missing closure value"); const auto closureType = fn.slots.at(i.srcSlots[0]).type; auto cl = abi.layout(closureType); if (cl.kind != ABIRepresentationKind::Closure)throw std::runtime_error("call.closure source is not a concrete closure type"); loadSlot(b, 10, fn, i.srcSlots[0]); std::size_t ai = 0; const bool richRet = abi.isRich(i.valueType); if (richRet) { initRichDest(b, fn, i.destSlot); loadSlot(b, 0, fn, i.destSlot); placeArgFromRax(b, ai++); }for (const auto& f : cl.fields) {
+										  auto fl = abi.layout(f.typeName);
+										  if ((f.typeName == "float" || f.typeName == "double") && ai < 4) {
+											  b.push_back(f.typeName == "float" ? 0xF3 : 0xF2);
+											  rex(b, false, static_cast<int>(ai), 10); b.insert(b.end(), { 0x0F,0x10,
+												 static_cast<std::uint8_t>(0x80 | ((ai & 7) << 3) | (10 & 7)) }); put32(b, static_cast<std::int32_t>(f.offset));
+											  ++ai; continue;
+										  }
+										  if (fl.rich) { movReg(b, 0, 10); if (f.offset) { movImm(b, 11, f.offset); b.insert(b.end(), { 0x4C,0x01,0xD8 }); } }
+										  else loadMem(b, 0, 10, static_cast<std::int32_t>(f.offset), std::max<std::size_t>(fl.size, 1), fl.signedScalar);
+										  placeArgFromRax(b, ai++);
+									  }for (std::size_t n = 1; n < i.srcSlots.size(); ++n) {
+										  const auto kind = fn.slots.at(i.srcSlots[n]).type.kind;
+										  if (fpType(kind) && ai < 4) { xmmSlotLoad(b, fn, i.srcSlots[n], static_cast<int>(ai)); ++ai; }
+										  else { loadSlot(b, 0, fn, i.srcSlots[n]); placeArgFromRax(b, ai++); }
+									  }
+									  emitDirectCall(b, cl.closureCallee, calls);
+									  if (i.destSlot && !richRet) { if (fpType(i.valueType.kind))xmmSlotStore(b, fn, i.destSlot); else storeSlot(b, 0, fn, i.destSlot); }
 								  }
 
 								  void encodeInstruction(const PMIRFunction& fn, const PMIRInstruction& i, const RichABIResolver& abi, std::vector<std::uint8_t>& b, std::vector<BranchFix>& branches, std::vector<EncodedFunction::Call>& calls, std::vector<EncodedFunction::Literal>& literals, std::vector<EncodedFunction::Import>& imports)const {
 									  auto unaryLoad = [&]() {if (i.srcSlots.empty())throw std::runtime_error("PMIR unary missing source"); loadSlot(b, 0, fn, i.srcSlots[0]); }; auto binaryLoad = [&]() {if (i.srcSlots.size() < 2)throw std::runtime_error("PMIR binary missing source"); loadSlot(b, 0, fn, i.srcSlots[0]); loadSlot(b, 10, fn, i.srcSlots[1]); }; auto save = [&]() {if (i.destSlot)storeSlot(b, 0, fn, i.destSlot); };
+									  if (i.srcSlots.size() >= 2 && fpType(fn.slots.at(i.srcSlots[0]).type.kind)) {
+										  switch (i.op) {
+										  case PMIROpcode::Add:case PMIROpcode::Sub:case PMIROpcode::Mul:case PMIROpcode::Div:
+										  case PMIROpcode::Eq:case PMIROpcode::Ne:case PMIROpcode::Lt:case PMIROpcode::Le:
+										  case PMIROpcode::Gt:case PMIROpcode::Ge:
+											  floatOp(fn, i, b); return;
+										  default:break;
+										  }
+									  }
 									  switch (i.op) {
-									  case PMIROpcode::ConstInt:case PMIROpcode::ConstBool:case PMIROpcode::ConstNull:movImm(b, 0, static_cast<std::uint64_t>(i.immediate)); save(); break;
+									  case PMIROpcode::ConstInt:case PMIROpcode::ConstFloat:case PMIROpcode::ConstBool:case PMIROpcode::ConstNull:movImm(b, 0, static_cast<std::uint64_t>(i.immediate)); save(); break;
 									  case PMIROpcode::ConstText: { initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); b.insert(b.end(), { 0x48,0x8D,0x05 }); auto p = b.size(); put32(b, 0); literals.push_back({ p,i.literalText }); storeMem(b, 11, 0, 0, 8); movImm(b, 0, static_cast<std::uint64_t>(i.literalText.size())); storeMem(b, 11, 8, 0, 8); break; }
 									  case PMIROpcode::Copy: { const auto& dst = fn.slots.at(i.destSlot); if (dst.rich) { initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); loadSlot(b, 10, fn, i.srcSlots.at(0)); copyFixed(b, 10, 11, dst.objectSize); } else { unaryLoad(); save(); }break; }
-									  case PMIROpcode::Add:binaryLoad(); b.insert(b.end(), { 0x4C,0x01,0xD0 }); save(); break; case PMIROpcode::Sub:binaryLoad(); b.insert(b.end(), { 0x4C,0x29,0xD0 }); save(); break; case PMIROpcode::Mul:binaryLoad(); b.insert(b.end(), { 0x49,0x0F,0xAF,0xC2 }); save(); break; case PMIROpcode::BitAnd:binaryLoad(); b.insert(b.end(), { 0x4C,0x21,0xD0 }); save(); break; case PMIROpcode::BitOr:binaryLoad(); b.insert(b.end(), { 0x4C,0x09,0xD0 }); save(); break; case PMIROpcode::BitXor:binaryLoad(); b.insert(b.end(), { 0x4C,0x31,0xD0 }); save(); break; case PMIROpcode::And:binaryLoad(); b.insert(b.end(), { 0x4C,0x21,0xD0 }); normalizeBool(b, 0x95); save(); break; case PMIROpcode::Or:binaryLoad(); b.insert(b.end(), { 0x4C,0x09,0xD0 }); normalizeBool(b, 0x95); save(); break; case PMIROpcode::Shl:loadSlot(b, 0, fn, i.srcSlots.at(0)); loadSlot(b, 1, fn, i.srcSlots.at(1)); b.insert(b.end(), { 0x48,0xD3,0xE0 }); save(); break; case PMIROpcode::Shr:loadSlot(b, 0, fn, i.srcSlots.at(0)); loadSlot(b, 1, fn, i.srcSlots.at(1)); b.insert(b.end(), { 0x48,0xD3,0xF8 }); save(); break; case PMIROpcode::Neg:unaryLoad(); b.insert(b.end(), { 0x48,0xF7,0xD8 }); save(); break; case PMIROpcode::BitNot:unaryLoad(); b.insert(b.end(), { 0x48,0xF7,0xD0 }); save(); break; case PMIROpcode::Not:unaryLoad(); normalizeBool(b, 0x94); save(); break;
-									  case PMIROpcode::Eq:case PMIROpcode::Ne:case PMIROpcode::Lt:case PMIROpcode::Le:case PMIROpcode::Gt:case PMIROpcode::Ge: { binaryLoad(); b.insert(b.end(), { 0x4C,0x39,0xD0 }); std::uint8_t cc = 0x94; if (i.op == PMIROpcode::Ne)cc = 0x95; else if (i.op == PMIROpcode::Lt)cc = 0x9C; else if (i.op == PMIROpcode::Le)cc = 0x9E; else if (i.op == PMIROpcode::Gt)cc = 0x9F; else if (i.op == PMIROpcode::Ge)cc = 0x9D; b.insert(b.end(), { 0x0F,cc,0xC0,0x48,0x0F,0xB6,0xC0 }); save(); break; }
-									  case PMIROpcode::Div:case PMIROpcode::Mod: { binaryLoad(); b.insert(b.end(), { 0x49,0x83,0xFA,0x00 }); auto jz = emitLocalJcc(b, 0x84); b.insert(b.end(), { 0x49,0x83,0xFA,0xFF }); auto jne = emitLocalJcc(b, 0x85); movImm(b, 11, 0x8000000000000000ull); b.insert(b.end(), { 0x4C,0x39,0xD8 }); auto jne2 = emitLocalJcc(b, 0x85); if (i.op == PMIROpcode::Mod)b.insert(b.end(), { 0x31,0xC0 }); auto done = emitLocalJmp(b); auto normal = b.size(); patchLocal(b, jne, normal); patchLocal(b, jne2, normal); b.insert(b.end(), { 0x48,0x99,0x49,0xF7,0xFA }); if (i.op == PMIROpcode::Mod)b.insert(b.end(), { 0x48,0x89,0xD0 }); auto after = emitLocalJmp(b); auto trap = b.size(); patchLocal(b, jz, trap); b.insert(b.end(), { 0x0F,0x0B }); auto finish = b.size(); patchLocal(b, done, finish); patchLocal(b, after, finish); save(); break; }
-									  case PMIROpcode::Branch:emitJmp(b, i.targets.at(0), branches); break; case PMIROpcode::BranchIf:loadSlot(b, 0, fn, i.srcSlots.at(0)); b.insert(b.end(), { 0x48,0x85,0xC0 }); emitJcc(b, 0x85, i.targets.at(0), branches); emitJmp(b, i.targets.at(1), branches); break;
-									  case PMIROpcode::Call:encodeCall(fn, i, abi, b, calls); break; case PMIROpcode::CallClosure:encodeClosureCall(fn, i, abi, b, calls); break;
-									  case PMIROpcode::TextEquals: {
-										  if (i.srcSlots.size() != 2)throw std::runtime_error("text.equals requires two operands");
-										  loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 8, 10, 8, 8, false);
-										  loadSlot(b, 11, fn, i.srcSlots[1]); loadMem(b, 9, 11, 8, 8, false);
-										  b.insert(b.end(), { 0x4D,0x39,0xC8 }); // cmp r8,r9
-										  auto unequal = emitLocalJcc(b, 0x85);
-										  loadMem(b, 10, 10, 0, 8, false); loadMem(b, 11, 11, 0, 8, false);
-										  b.insert(b.end(), { 0x4D,0x85,0xC0 }); // test r8,r8
-										  auto equalEmpty = emitLocalJcc(b, 0x84);
-										  const auto loop = b.size();
-										  loadMem(b, 0, 10, 0, 1, false); loadMem(b, 1, 11, 0, 1, false);
-										  b.insert(b.end(), { 0x38,0xC8 }); // cmp al,cl
-										  auto unequalByte = emitLocalJcc(b, 0x85);
-										  b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC3,0x49,0xFF,0xC8 });
-										  auto repeat = emitLocalJcc(b, 0x85); patchLocal(b, repeat, loop);
-										  const auto equal = b.size(); patchLocal(b, equalEmpty, equal);
-										  movImm(b, 0, 1); auto end = emitLocalJmp(b);
-										  const auto notEqual = b.size(); patchLocal(b, unequal, notEqual); patchLocal(b, unequalByte, notEqual);
-										  movImm(b, 0, 0); patchLocal(b, end, b.size()); storeSlot(b, 0, fn, i.destSlot); break;
+									  case PMIROpcode::Add:binaryLoad(); b.insert(b.end(), { 0x4C,0x01,0xD0 }); save(); break; case PMIROpcode::Sub:binaryLoad(); b.insert(b.end(), { 0x4C,0x29,0xD0 }); save(); break; case PMIROpcode::Mul:binaryLoad(); b.insert(b.end(), { 0x49,0x0F,0xAF,0xC2 }); save(); break; case PMIROpcode::BitAnd:binaryLoad(); b.insert(b.end(), { 0x4C,0x21,0xD0 }); save(); break; case PMIROpcode::BitOr:binaryLoad(); b.insert(b.end(), { 0x4C,0x09,0xD0 }); save(); break; case PMIROpcode::BitXor:binaryLoad(); b.insert(b.end(), { 0x4C,0x31,0xD0 }); save(); break; case PMIROpcode::And:binaryLoad(); b.insert(b.end(), { 0x4C,0x21,0xD0 }); normalizeBool(b, 0x95); save(); break; case PMIROpcode::Or:binaryLoad(); b.insert(b.end(), { 0x4C,0x09,0xD0 }); normalizeBool(b, 0x95); save(); break; case PMIROpcode::Shl:loadSlot(b, 0, fn, i.srcSlots.at(0)); loadSlot(b, 1, fn, i.srcSlots.at(1)); b.insert(b.end(), { 0x48,0xD3,0xE0 }); save(); break; case PMIROpcode::Shr:loadSlot(b, 0, fn, i.srcSlots.at(0)); loadSlot(b, 1, fn, i.srcSlots.at(1)); b.insert(b.end(), { 0x48,0xD3,0xF8 }); save(); break; case PMIROpcode::Neg:unaryLoad(); if (fpType(i.valueType.kind)) {
+										  movImm(b, 10, i.valueType.kind == IRValueKind::Float32 ? 0x80000000ull : 0x8000000000000000ull);
+										  b.insert(b.end(), { 0x4C,0x31,0xD0 });
 									  }
-									  case PMIROpcode::ByteCount: { if (i.srcSlots.size() != 1)throw std::runtime_error("byte count missing source"); loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 0, 10, 8, 8, false); storeSlot(b, 0, fn, i.destSlot); break; }
-									  case PMIROpcode::StringToText: { if (i.srcSlots.empty())throw std::runtime_error("string.to_text missing source"); initRichDest(b, fn, i.destSlot); loadSlot(b, 10, fn, i.srcSlots[0]); loadSlot(b, 11, fn, i.destSlot); copyFixed(b, 10, 11, 16); break; }
-									  case PMIROpcode::StringClear: { if (i.srcSlots.empty())throw std::runtime_error("string.clear missing source"); loadSlot(b, 11, fn, i.srcSlots[0]); movImm(b, 0, 0); storeMem(b, 11, 8, 0, 8); break; }
-									  case PMIROpcode::StringMove: {
-										  if (i.srcSlots.size() != 1 || !i.destSlot || i.srcSlots[0] == i.destSlot)
-											  throw std::runtime_error("invalid consuming string move");
-										  loadSlot(b, 10, fn, i.srcSlots[0]);
-										  initRichDest(b, fn, i.destSlot);
-										  loadSlot(b, 11, fn, i.destSlot);
-										  copyFixed(b, 10, 11, 24);
-										  loadSlot(b, 10, fn, i.srcSlots[0]);
-										  zeroFixed(b, 10, 24);
-										  break;
-									  }
-									  case PMIROpcode::StringDispose: {
-										  if (i.srcSlots.size() != 1)throw std::runtime_error("string.dispose missing ownership source");
-										  loadSlot(b, 10, fn, i.srcSlots[0]);
-										  loadMem(b, 0, 10, 0, 8, false); b.insert(b.end(), { 0x48,0x85,0xC0 });
-										  auto noPointer = emitLocalJcc(b, 0x84);
-										  emitImportedCall(b, "GetProcessHeap", imports);
-										  movReg(b, 1, 0); // heap
-										  movImm(b, 2, 0); // flags
-										  loadSlot(b, 10, fn, i.srcSlots[0]);
-										  loadMem(b, 8, 10, 0, 8, false); // buffer address
-										  emitImportedCall(b, "HeapFree", imports);
-										  b.insert(b.end(), { 0x48,0x85,0xC0 });
-										  auto freed = emitLocalJcc(b, 0x85); b.insert(b.end(), { 0x0F,0x0B });
-										  patchLocal(b, freed, b.size()); patchLocal(b, noPointer, b.size());
-										  loadSlot(b, 11, fn, i.srcSlots[0]); zeroFixed(b, 11, 24);
-										  break;
-									  }
-									  case PMIROpcode::TextToString: {
-										  if (i.srcSlots.size() != 1)throw std::runtime_error("text.to_string requires one text input");
-										  // Owned string ABI {ptr,len,capacity}. The actual storage is obtained
-										  // from the Windows process heap and never aliases the source literal.
-										  initRichDest(b, fn, i.destSlot);
-										  loadSlot(b, 10, fn, i.srcSlots[0]);
-										  loadMem(b, 0, 10, 8, 8, false); // count
-										  // Distinct overflow guard for len+1; 0xffff... is unrepresentable.
-										  b.insert(b.end(), { 0x48,0x83,0xF8,0xFF });
-										  auto notOverflow = emitLocalJcc(b, 0x85);
-										  b.insert(b.end(), { 0x0F,0x0B });
-										  patchLocal(b, notOverflow, b.size());
-										  // GetProcessHeap() -> RAX
-										  emitImportedCall(b, "GetProcessHeap", imports);
-										  movReg(b, 1, 0); // RCX=heap
-										  movImm(b, 2, 8); // RDX=HEAP_ZERO_MEMORY
-										  loadSlot(b, 10, fn, i.srcSlots[0]);
-										  loadMem(b, 8, 10, 8, 8, false); // R8=byte count
-										  b.insert(b.end(), { 0x49,0xFF,0xC0 }); // inc r8; includes terminator
-										  emitImportedCall(b, "HeapAlloc", imports);
-										  b.insert(b.end(), { 0x48,0x85,0xC0 });
-										  auto allocated = emitLocalJcc(b, 0x85);
-										  b.insert(b.end(), { 0x0F,0x0B }); // terminal OOM trap
-										  patchLocal(b, allocated, b.size());
-										  movReg(b, 8, 0); // retain the allocated buffer pointer in volatile R8
-										  loadSlot(b, 11, fn, i.destSlot); // object header address
-										  storeMem(b, 11, 0, 0, 8); // ptr
-										  loadSlot(b, 10, fn, i.srcSlots[0]);
-										  loadMem(b, 9, 10, 8, 8, false); // r9 length (loop counter)
-										  storeMem(b, 11, 8, 9, 8); // count
-										  storeMem(b, 11, 16, 9, 8); // capacity: count bytes (+1 allocated for NUL)
-										  loadMem(b, 10, 10, 0, 8, false); // source pointer
-										  movReg(b, 11, 8); // destination byte buffer, not the object header
-										  b.insert(b.end(), { 0x4D,0x85,0xC9 }); // test r9,r9
-										  auto done = emitLocalJcc(b, 0x84);
-										  auto loop = b.size();
-										  loadMem(b, 0, 10, 0, 1, false);
-										  storeMem(b, 11, 0, 0, 1);
-										  b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC3,0x49,0xFF,0xC9 }); // inc r10; inc r11; dec r9
-										  auto again = emitLocalJcc(b, 0x85);
-										  patchLocal(b, again, loop);
-										  patchLocal(b, done, b.size());
-										  break;
-									  }
-									  case PMIROpcode::MakeAggregate: { auto lay = abi.layout(i.valueType); initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); for (std::size_t n = 0; n < i.srcSlots.size(); ++n) { const std::string field = n < i.argumentTypes.size() ? i.argumentTypes[n] : std::to_string(n); auto f = findField(lay, field); auto fl = abi.layout(f.typeName); storeValueInto(b, fn, i.srcSlots[n], 11, f.offset, fl); }break; }
-									  case PMIROpcode::ExtractField: { if (i.srcSlots.empty())throw std::runtime_error("aggregate.field missing source"); auto owner = abi.layout(i.typeName.empty() ? fn.slots.at(i.srcSlots[0]).type.name : i.typeName); auto f = findField(owner, i.literalText); auto fl = abi.layout(f.typeName); loadSlot(b, 10, fn, i.srcSlots[0]); loadValueFrom(b, fn, i.destSlot, 10, f.offset, fl); break; }
-									  case PMIROpcode::ResultOk:case PMIROpcode::ResultErr: { auto lay = abi.layout(i.valueType); initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); movImm(b, 0, i.op == PMIROpcode::ResultErr ? 1 : 0); storeMem(b, 11, static_cast<std::int32_t>(lay.tagOffset), 0, 1); if (!i.srcSlots.empty()) { const auto pt = abi.layout(i.op == PMIROpcode::ResultErr ? lay.errType : lay.okType); storeValueInto(b, fn, i.srcSlots[0], 11, lay.payloadOffset, pt); }break; }
-									  case PMIROpcode::ResultIsErr: { if (i.srcSlots.empty())throw std::runtime_error("result.is_err missing source"); auto lay = abi.layout(i.typeName.empty() ? fn.slots.at(i.srcSlots[0]).type.name : i.typeName); loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 0, 10, static_cast<std::int32_t>(lay.tagOffset), 1, false); storeSlot(b, 0, fn, i.destSlot); break; }
-									  case PMIROpcode::ResultTry: { if (i.srcSlots.empty())throw std::runtime_error("result.try missing source"); auto srcLay = abi.layout(i.typeName.empty() ? fn.slots.at(i.srcSlots[0]).type.name : i.typeName); loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 0, 10, static_cast<std::int32_t>(srcLay.tagOffset), 1, false); b.insert(b.end(), { 0x48,0x85,0xC0 }); auto ok = emitLocalJcc(b, 0x84); if (!fn.richReturn)throw std::runtime_error("result.try error propagation requires rich result return ABI"); auto dstLay = abi.layout(fn.returnValueType); loadRbp(b, 11, negDisp(fn.sretCellOffset)); movImm(b, 0, 1); storeMem(b, 11, static_cast<std::int32_t>(dstLay.tagOffset), 0, 1); auto errLay = abi.layout(srcLay.errType); movReg(b, 0, 10); if (srcLay.payloadOffset) { movImm(b, 9, srcLay.payloadOffset); b.insert(b.end(), { 0x4C,0x01,0xC8 }); }movReg(b, 10, 0); movReg(b, 0, 11); if (dstLay.payloadOffset) { movImm(b, 9, dstLay.payloadOffset); b.insert(b.end(), { 0x4C,0x01,0xC8 }); }movReg(b, 11, 0); copyFixed(b, 10, 11, errLay.size); loadRbp(b, 0, negDisp(fn.sretCellOffset)); epilogue(b); auto okAt = b.size(); patchLocal(b, ok, okAt); loadSlot(b, 10, fn, i.srcSlots[0]); auto okLay = abi.layout(srcLay.okType); loadValueFrom(b, fn, i.destSlot, 10, srcLay.payloadOffset, okLay); break; }
-									  case PMIROpcode::OptionSome:case PMIROpcode::OptionNone: { auto lay = abi.layout(i.valueType); if (lay.kind == ABIRepresentationKind::OptionBoolNiche) { movImm(b, 0, i.op == PMIROpcode::OptionNone ? 2 : 0); if (i.op == PMIROpcode::OptionSome && !i.srcSlots.empty())loadSlot(b, 0, fn, i.srcSlots[0]); storeSlot(b, 0, fn, i.destSlot); break; }if (lay.kind == ABIRepresentationKind::OptionCharNiche) { if (i.op == PMIROpcode::OptionNone)movImm(b, 0, 0x00110000u); else loadSlot(b, 0, fn, i.srcSlots.at(0)); storeSlot(b, 0, fn, i.destSlot); break; }initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); if (lay.kind == ABIRepresentationKind::OptionPointerNiche) { if (i.op == PMIROpcode::OptionNone)zeroFixed(b, 11, lay.size); else { auto vl = abi.layout(lay.valueType); storeValueInto(b, fn, i.srcSlots.at(0), 11, 0, vl); }break; }movImm(b, 0, i.op == PMIROpcode::OptionSome ? 1 : 0); storeMem(b, 11, 0, 0, 1); if (i.op == PMIROpcode::OptionSome) { auto vl = abi.layout(lay.valueType); storeValueInto(b, fn, i.srcSlots.at(0), 11, lay.payloadOffset, vl); }break; }
-									  case PMIROpcode::MakeClosure: { auto lay = abi.layout(i.valueType); initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); for (std::size_t n = 0; n < i.srcSlots.size() && n < lay.fields.size(); ++n) { auto fl = abi.layout(lay.fields[n].typeName); storeValueInto(b, fn, i.srcSlots[n], 11, lay.fields[n].offset, fl); }break; }
-									  case PMIROpcode::Return: { if (fn.richReturn) { if (i.srcSlots.empty())throw std::runtime_error("rich return missing source"); auto lay = abi.layout(fn.returnValueType); loadSlot(b, 10, fn, i.srcSlots[0]); loadRbp(b, 11, negDisp(fn.sretCellOffset)); copyFixed(b, 10, 11, lay.size); movReg(b, 0, 11); epilogue(b); } else { if (i.srcSlots.empty())b.insert(b.end(), { 0x31,0xC0 }); else loadSlot(b, 0, fn, i.srcSlots[0]); epilogue(b); }break; }
-									  case PMIROpcode::Nop:b.push_back(0x90); break;
+														  else b.insert(b.end(), { 0x48,0xF7,0xD8 }); save(); break; case PMIROpcode::BitNot:unaryLoad(); b.insert(b.end(), { 0x48,0xF7,0xD0 }); save(); break; case PMIROpcode::Not:unaryLoad(); normalizeBool(b, 0x94); save(); break;
+														  case PMIROpcode::Eq:case PMIROpcode::Ne:case PMIROpcode::Lt:case PMIROpcode::Le:case PMIROpcode::Gt:case PMIROpcode::Ge: { binaryLoad(); b.insert(b.end(), { 0x4C,0x39,0xD0 }); std::uint8_t cc = 0x94; if (i.op == PMIROpcode::Ne)cc = 0x95; else if (i.op == PMIROpcode::Lt)cc = 0x9C; else if (i.op == PMIROpcode::Le)cc = 0x9E; else if (i.op == PMIROpcode::Gt)cc = 0x9F; else if (i.op == PMIROpcode::Ge)cc = 0x9D; b.insert(b.end(), { 0x0F,cc,0xC0,0x48,0x0F,0xB6,0xC0 }); save(); break; }
+														  case PMIROpcode::Div:case PMIROpcode::Mod: { binaryLoad(); b.insert(b.end(), { 0x49,0x83,0xFA,0x00 }); auto jz = emitLocalJcc(b, 0x84); b.insert(b.end(), { 0x49,0x83,0xFA,0xFF }); auto jne = emitLocalJcc(b, 0x85); movImm(b, 11, 0x8000000000000000ull); b.insert(b.end(), { 0x4C,0x39,0xD8 }); auto jne2 = emitLocalJcc(b, 0x85); if (i.op == PMIROpcode::Mod)b.insert(b.end(), { 0x31,0xC0 }); auto done = emitLocalJmp(b); auto normal = b.size(); patchLocal(b, jne, normal); patchLocal(b, jne2, normal); b.insert(b.end(), { 0x48,0x99,0x49,0xF7,0xFA }); if (i.op == PMIROpcode::Mod)b.insert(b.end(), { 0x48,0x89,0xD0 }); auto after = emitLocalJmp(b); auto trap = b.size(); patchLocal(b, jz, trap); b.insert(b.end(), { 0x0F,0x0B }); auto finish = b.size(); patchLocal(b, done, finish); patchLocal(b, after, finish); save(); break; }
+														  case PMIROpcode::Branch:emitJmp(b, i.targets.at(0), branches); break; case PMIROpcode::BranchIf:loadSlot(b, 0, fn, i.srcSlots.at(0)); b.insert(b.end(), { 0x48,0x85,0xC0 }); emitJcc(b, 0x85, i.targets.at(0), branches); emitJmp(b, i.targets.at(1), branches); break;
+														  case PMIROpcode::Call:encodeCall(fn, i, abi, b, calls); break; case PMIROpcode::CallClosure:encodeClosureCall(fn, i, abi, b, calls); break;
+														  case PMIROpcode::TextEquals: {
+															  if (i.srcSlots.size() != 2)throw std::runtime_error("text.equals requires two operands");
+															  loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 8, 10, 8, 8, false);
+															  loadSlot(b, 11, fn, i.srcSlots[1]); loadMem(b, 9, 11, 8, 8, false);
+															  b.insert(b.end(), { 0x4D,0x39,0xC8 }); // cmp r8,r9
+															  auto unequal = emitLocalJcc(b, 0x85);
+															  loadMem(b, 10, 10, 0, 8, false); loadMem(b, 11, 11, 0, 8, false);
+															  b.insert(b.end(), { 0x4D,0x85,0xC0 }); // test r8,r8
+															  auto equalEmpty = emitLocalJcc(b, 0x84);
+															  const auto loop = b.size();
+															  loadMem(b, 0, 10, 0, 1, false); loadMem(b, 1, 11, 0, 1, false);
+															  b.insert(b.end(), { 0x38,0xC8 }); // cmp al,cl
+															  auto unequalByte = emitLocalJcc(b, 0x85);
+															  b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC3,0x49,0xFF,0xC8 });
+															  auto repeat = emitLocalJcc(b, 0x85); patchLocal(b, repeat, loop);
+															  const auto equal = b.size(); patchLocal(b, equalEmpty, equal);
+															  movImm(b, 0, 1); auto end = emitLocalJmp(b);
+															  const auto notEqual = b.size(); patchLocal(b, unequal, notEqual); patchLocal(b, unequalByte, notEqual);
+															  movImm(b, 0, 0); patchLocal(b, end, b.size()); storeSlot(b, 0, fn, i.destSlot); break;
+														  }
+														  case PMIROpcode::ByteCount: { if (i.srcSlots.size() != 1)throw std::runtime_error("byte count missing source"); loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 0, 10, 8, 8, false); storeSlot(b, 0, fn, i.destSlot); break; }
+														  case PMIROpcode::StringToText: { if (i.srcSlots.empty())throw std::runtime_error("string.to_text missing source"); initRichDest(b, fn, i.destSlot); loadSlot(b, 10, fn, i.srcSlots[0]); loadSlot(b, 11, fn, i.destSlot); copyFixed(b, 10, 11, 16); break; }
+														  case PMIROpcode::StringClear: { if (i.srcSlots.empty())throw std::runtime_error("string.clear missing source"); loadSlot(b, 11, fn, i.srcSlots[0]); movImm(b, 0, 0); storeMem(b, 11, 8, 0, 8); break; }
+														  case PMIROpcode::StringMove: {
+															  if (i.srcSlots.size() != 1 || !i.destSlot || i.srcSlots[0] == i.destSlot)
+																  throw std::runtime_error("invalid consuming string move");
+															  loadSlot(b, 10, fn, i.srcSlots[0]);
+															  initRichDest(b, fn, i.destSlot);
+															  loadSlot(b, 11, fn, i.destSlot);
+															  copyFixed(b, 10, 11, 24);
+															  loadSlot(b, 10, fn, i.srcSlots[0]);
+															  zeroFixed(b, 10, 24);
+															  break;
+														  }
+														  case PMIROpcode::StringDispose: {
+															  if (i.srcSlots.size() != 1)throw std::runtime_error("string.dispose missing ownership source");
+															  loadSlot(b, 10, fn, i.srcSlots[0]);
+															  loadMem(b, 0, 10, 0, 8, false); b.insert(b.end(), { 0x48,0x85,0xC0 });
+															  auto noPointer = emitLocalJcc(b, 0x84);
+															  emitImportedCall(b, "GetProcessHeap", imports);
+															  movReg(b, 1, 0); // heap
+															  movImm(b, 2, 0); // flags
+															  loadSlot(b, 10, fn, i.srcSlots[0]);
+															  loadMem(b, 8, 10, 0, 8, false); // buffer address
+															  emitImportedCall(b, "HeapFree", imports);
+															  b.insert(b.end(), { 0x48,0x85,0xC0 });
+															  auto freed = emitLocalJcc(b, 0x85); b.insert(b.end(), { 0x0F,0x0B });
+															  patchLocal(b, freed, b.size()); patchLocal(b, noPointer, b.size());
+															  loadSlot(b, 11, fn, i.srcSlots[0]); zeroFixed(b, 11, 24);
+															  break;
+														  }
+														  case PMIROpcode::TextToString: {
+															  if (i.srcSlots.size() != 1)throw std::runtime_error("text.to_string requires one text input");
+															  // Owned string ABI {ptr,len,capacity}. The actual storage is obtained
+															  // from the Windows process heap and never aliases the source literal.
+															  initRichDest(b, fn, i.destSlot);
+															  loadSlot(b, 10, fn, i.srcSlots[0]);
+															  loadMem(b, 0, 10, 8, 8, false); // count
+															  // Distinct overflow guard for len+1; 0xffff... is unrepresentable.
+															  b.insert(b.end(), { 0x48,0x83,0xF8,0xFF });
+															  auto notOverflow = emitLocalJcc(b, 0x85);
+															  b.insert(b.end(), { 0x0F,0x0B });
+															  patchLocal(b, notOverflow, b.size());
+															  // GetProcessHeap() -> RAX
+															  emitImportedCall(b, "GetProcessHeap", imports);
+															  movReg(b, 1, 0); // RCX=heap
+															  movImm(b, 2, 8); // RDX=HEAP_ZERO_MEMORY
+															  loadSlot(b, 10, fn, i.srcSlots[0]);
+															  loadMem(b, 8, 10, 8, 8, false); // R8=byte count
+															  b.insert(b.end(), { 0x49,0xFF,0xC0 }); // inc r8; includes terminator
+															  emitImportedCall(b, "HeapAlloc", imports);
+															  b.insert(b.end(), { 0x48,0x85,0xC0 });
+															  auto allocated = emitLocalJcc(b, 0x85);
+															  b.insert(b.end(), { 0x0F,0x0B }); // terminal OOM trap
+															  patchLocal(b, allocated, b.size());
+															  movReg(b, 8, 0); // retain the allocated buffer pointer in volatile R8
+															  loadSlot(b, 11, fn, i.destSlot); // object header address
+															  storeMem(b, 11, 0, 0, 8); // ptr
+															  loadSlot(b, 10, fn, i.srcSlots[0]);
+															  loadMem(b, 9, 10, 8, 8, false); // r9 length (loop counter)
+															  storeMem(b, 11, 8, 9, 8); // count
+															  storeMem(b, 11, 16, 9, 8); // capacity: count bytes (+1 allocated for NUL)
+															  loadMem(b, 10, 10, 0, 8, false); // source pointer
+															  movReg(b, 11, 8); // destination byte buffer, not the object header
+															  b.insert(b.end(), { 0x4D,0x85,0xC9 }); // test r9,r9
+															  auto done = emitLocalJcc(b, 0x84);
+															  auto loop = b.size();
+															  loadMem(b, 0, 10, 0, 1, false);
+															  storeMem(b, 11, 0, 0, 1);
+															  b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC3,0x49,0xFF,0xC9 }); // inc r10; inc r11; dec r9
+															  auto again = emitLocalJcc(b, 0x85);
+															  patchLocal(b, again, loop);
+															  patchLocal(b, done, b.size());
+															  break;
+														  }
+														  case PMIROpcode::MakeAggregate: { auto lay = abi.layout(i.valueType); initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); for (std::size_t n = 0; n < i.srcSlots.size(); ++n) { const std::string field = n < i.argumentTypes.size() ? i.argumentTypes[n] : std::to_string(n); auto f = findField(lay, field); auto fl = abi.layout(f.typeName); storeValueInto(b, fn, i.srcSlots[n], 11, f.offset, fl); }break; }
+														  case PMIROpcode::ExtractField: { if (i.srcSlots.empty())throw std::runtime_error("aggregate.field missing source"); auto owner = abi.layout(i.typeName.empty() ? fn.slots.at(i.srcSlots[0]).type.name : i.typeName); auto f = findField(owner, i.literalText); auto fl = abi.layout(f.typeName); loadSlot(b, 10, fn, i.srcSlots[0]); loadValueFrom(b, fn, i.destSlot, 10, f.offset, fl); break; }
+														  case PMIROpcode::ArrayIndex: {
+															  if (i.srcSlots.size() != 2)throw std::runtime_error("PMIR array index requires array and index");
+															  std::string elem; std::size_t count = 0;
+															  if (!typeIsArray(i.typeName, &elem, &count))throw std::runtime_error("PMIR malformed array type");
+															  const auto layout = abi.layout(elem);
+															  if (layout.size == 0 || layout.size > std::numeric_limits<std::int32_t>::max())throw std::runtime_error("PMIR unsupported array element stride");
+															  loadSlot(b, 9, fn, i.srcSlots[1]); // r9 = index
+															  movImm(b, 8, static_cast<std::uint64_t>(count)); // r8 = bound
+															  b.insert(b.end(), { 0x4D,0x39,0xC1 }); // cmp r9,r8 (unsigned)
+															  auto valid = emitLocalJcc(b, 0x82); // JB: index < bound
+															  b.insert(b.end(), { 0x0F,0x0B }); // UD2 on out-of-bounds
+															  patchLocal(b, valid, b.size());
+															  if (layout.size != 1) { b.insert(b.end(), { 0x4D,0x69,0xC9 }); put32(b, static_cast<std::int32_t>(layout.size)); } // imul r9,r9,stride
+															  loadSlot(b, 10, fn, i.srcSlots[0]);
+															  b.insert(b.end(), { 0x4D,0x01,0xCA }); // add r10,r9
+															  loadValueFrom(b, fn, i.destSlot, 10, 0, layout);
+															  break;
+														  }
+														  case PMIROpcode::ResultOk:case PMIROpcode::ResultErr: { auto lay = abi.layout(i.valueType); initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); movImm(b, 0, i.op == PMIROpcode::ResultErr ? 1 : 0); storeMem(b, 11, static_cast<std::int32_t>(lay.tagOffset), 0, 1); if (!i.srcSlots.empty()) { const auto pt = abi.layout(i.op == PMIROpcode::ResultErr ? lay.errType : lay.okType); storeValueInto(b, fn, i.srcSlots[0], 11, lay.payloadOffset, pt); }break; }
+														  case PMIROpcode::ResultIsErr: { if (i.srcSlots.empty())throw std::runtime_error("result.is_err missing source"); auto lay = abi.layout(i.typeName.empty() ? fn.slots.at(i.srcSlots[0]).type.name : i.typeName); loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 0, 10, static_cast<std::int32_t>(lay.tagOffset), 1, false); storeSlot(b, 0, fn, i.destSlot); break; }
+														  case PMIROpcode::ResultTry: { if (i.srcSlots.empty())throw std::runtime_error("result.try missing source"); auto srcLay = abi.layout(i.typeName.empty() ? fn.slots.at(i.srcSlots[0]).type.name : i.typeName); loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 0, 10, static_cast<std::int32_t>(srcLay.tagOffset), 1, false); b.insert(b.end(), { 0x48,0x85,0xC0 }); auto ok = emitLocalJcc(b, 0x84); if (!fn.richReturn)throw std::runtime_error("result.try error propagation requires rich result return ABI"); auto dstLay = abi.layout(fn.returnValueType); loadRbp(b, 11, negDisp(fn.sretCellOffset)); movImm(b, 0, 1); storeMem(b, 11, static_cast<std::int32_t>(dstLay.tagOffset), 0, 1); auto errLay = abi.layout(srcLay.errType); movReg(b, 0, 10); if (srcLay.payloadOffset) { movImm(b, 9, srcLay.payloadOffset); b.insert(b.end(), { 0x4C,0x01,0xC8 }); }movReg(b, 10, 0); movReg(b, 0, 11); if (dstLay.payloadOffset) { movImm(b, 9, dstLay.payloadOffset); b.insert(b.end(), { 0x4C,0x01,0xC8 }); }movReg(b, 11, 0); copyFixed(b, 10, 11, errLay.size); loadRbp(b, 0, negDisp(fn.sretCellOffset)); epilogue(b); auto okAt = b.size(); patchLocal(b, ok, okAt); loadSlot(b, 10, fn, i.srcSlots[0]); auto okLay = abi.layout(srcLay.okType); loadValueFrom(b, fn, i.destSlot, 10, srcLay.payloadOffset, okLay); break; }
+														  case PMIROpcode::OptionSome:case PMIROpcode::OptionNone: { auto lay = abi.layout(i.valueType); if (lay.kind == ABIRepresentationKind::OptionBoolNiche) { movImm(b, 0, i.op == PMIROpcode::OptionNone ? 2 : 0); if (i.op == PMIROpcode::OptionSome && !i.srcSlots.empty())loadSlot(b, 0, fn, i.srcSlots[0]); storeSlot(b, 0, fn, i.destSlot); break; }if (lay.kind == ABIRepresentationKind::OptionCharNiche) { if (i.op == PMIROpcode::OptionNone)movImm(b, 0, 0x00110000u); else loadSlot(b, 0, fn, i.srcSlots.at(0)); storeSlot(b, 0, fn, i.destSlot); break; }initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); if (lay.kind == ABIRepresentationKind::OptionPointerNiche) { if (i.op == PMIROpcode::OptionNone)zeroFixed(b, 11, lay.size); else { auto vl = abi.layout(lay.valueType); storeValueInto(b, fn, i.srcSlots.at(0), 11, 0, vl); }break; }movImm(b, 0, i.op == PMIROpcode::OptionSome ? 1 : 0); storeMem(b, 11, 0, 0, 1); if (i.op == PMIROpcode::OptionSome) { auto vl = abi.layout(lay.valueType); storeValueInto(b, fn, i.srcSlots.at(0), 11, lay.payloadOffset, vl); }break; }
+														  case PMIROpcode::MakeClosure: { auto lay = abi.layout(i.valueType); initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); for (std::size_t n = 0; n < i.srcSlots.size() && n < lay.fields.size(); ++n) { auto fl = abi.layout(lay.fields[n].typeName); storeValueInto(b, fn, i.srcSlots[n], 11, lay.fields[n].offset, fl); }break; }
+														  case PMIROpcode::Return: {
+															  if (fn.richReturn) { if (i.srcSlots.empty())throw std::runtime_error("rich return missing source"); auto lay = abi.layout(fn.returnValueType); loadSlot(b, 10, fn, i.srcSlots[0]); loadRbp(b, 11, negDisp(fn.sretCellOffset)); copyFixed(b, 10, 11, lay.size); movReg(b, 0, 11); epilogue(b); }
+															  else {
+																  if (i.srcSlots.empty())b.insert(b.end(), { 0x31,0xC0 }); else if (fpType(fn.returnValueType.kind))xmmSlotLoad(b, fn, i.srcSlots[0]);
+																  else loadSlot(b, 0, fn, i.srcSlots[0]); epilogue(b);
+															  }break;
+														  }
+														  case PMIROpcode::Nop:b.push_back(0x90); break;
 									  }
 								  }
 
-								  void selectEntry(const PMIRProgram& program, const std::string& requested, MachineProgram& out)const { auto pick = [&](const std::string& name)->const PMIRFunction* {for (const auto& f : program.functions)if (f.name == name && f.parameterSlots.empty() && !f.richReturn)return&f; return nullptr; }; const PMIRFunction* fn = nullptr; if (!requested.empty())fn = pick(requested); else { for (const char* n : { "main","answer","start" })if ((fn = pick(n)))break; if (!fn)for (const auto& f : program.functions)if (f.parameterSlots.empty() && !f.richReturn) { fn = &f; break; } }if (!fn)throw std::runtime_error("native linker: no zero-argument scalar entry routine"); out.entryName = fn->name; out.entryOffset = out.functionOffsets.at(fn->name); }
+								  void selectEntry(const PMIRProgram& program, const std::string& requested, MachineProgram& out)const {
+									  auto pick = [&](const std::string& name)->const PMIRFunction* {for (const auto& f : program.functions)if (f.name == name && f.parameterSlots.empty() && !f.richReturn)return&f; return nullptr; }; const PMIRFunction* fn = nullptr; if (!requested.empty())fn = pick(requested); else { for (const char* n : { "main","answer","start" })if ((fn = pick(n)))break; if (!fn)for (const auto& f : program.functions)if (f.parameterSlots.empty() && !f.richReturn) { fn = &f; break; } }if (!fn)throw std::runtime_error("native linker: no zero-argument scalar entry routine");
+									  if (fn->returnValueType.kind == IRValueKind::Float32 || fn->returnValueType.kind == IRValueKind::Float64)
+										  throw std::runtime_error("native executable entry must return an integer process status, not an IEEE-754 value"); out.entryName = fn->name; out.entryOffset = out.functionOffsets.at(fn->name);
+								  }
 							  };
 
 							  std::string machineListingToString(const MachineProgram& program) { std::ostringstream oss; oss << "entry " << program.entryName << " +0x" << std::hex << program.entryOffset << std::dec << "\n"; for (const auto& line : program.listing) { oss << std::hex << std::setw(8) << std::setfill('0') << line.offset << "  "; for (auto x : line.bytes)oss << std::setw(2) << static_cast<unsigned>(x) << ' '; oss << std::dec << std::setfill(' ') << "  " << line.text << "\n"; }return oss.str(); }
@@ -6987,11 +7647,11 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 											  if (!b.phiNodes.empty())throw std::runtime_error("C++20 backend requires edge-accurate phi lowering");
 											  for (const auto& i : b.instructions) {
 												  switch (i.op) {
-												  case IROpcode::ConstText:case IROpcode::CallClosure:
+												  case IROpcode::ConstFloat:case IROpcode::ConstText:case IROpcode::CallClosure:
 												  case IROpcode::TextToString:case IROpcode::StringToText:case IROpcode::StringClear:case IROpcode::StringDispose:case IROpcode::StringMove:case IROpcode::ByteCount:case IROpcode::TextEquals:
 												  case IROpcode::ResultOk:case IROpcode::ResultErr:case IROpcode::ResultIsErr:case IROpcode::ResultTry:
 												  case IROpcode::OptionSome:case IROpcode::OptionNone:
-												  case IROpcode::MakeAggregate:case IROpcode::ExtractField:case IROpcode::MakeClosure:
+												  case IROpcode::MakeAggregate:case IROpcode::ExtractField:case IROpcode::ArrayIndex:case IROpcode::MakeClosure:
 													  throw std::runtime_error("C++20 backend cannot lower rich opcode " + std::to_string(static_cast<int>(i.op)));
 												  case IROpcode::Call:
 													  if (i.callee == "print" || i.callee == "println")throw std::runtime_error("C++20 backend cannot lower I/O builtin " + i.callee);
@@ -7098,6 +7758,8 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 
 								  void emitInstruction(std::ostringstream& oss, const IRInstruction& inst) const {
 									  switch (inst.op) {
+									  case IROpcode::ConstFloat: throw std::runtime_error("C++20 backend does not support IEEE-754 PCIR yet");
+									  case IROpcode::ArrayIndex:throw std::runtime_error("C++20 backend cannot lower native checked array indexing");
 									  case IROpcode::ConstInt: oss << "    v" << reg(inst.dest) << " = " << sanitizedIntegerLiteral(inst) << ";\n"; break;
 									  case IROpcode::ConstText: oss << "    /* text literal retained in PCIR metadata: " << escapedComment(inst.literalText) << " */\n"; break;
 									  case IROpcode::ConstBool: oss << "    v" << reg(inst.dest) << " = " << (inst.hasImmediate && inst.immediate ? 1 : 0) << ";\n"; break;
@@ -7789,7 +8451,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 
 							  std::string opcodeName(IROpcode op) {
 								  switch (op) {
-								  case IROpcode::ConstInt: return "const.int"; case IROpcode::ConstText: return "const.text";
+								  case IROpcode::ConstInt: return "const.int"; case IROpcode::ConstFloat:return "const.float"; case IROpcode::ConstText: return "const.text";
 								  case IROpcode::ConstBool: return "const.bool"; case IROpcode::ConstNull: return "const.null";
 								  case IROpcode::Copy: return "copy"; case IROpcode::Add: return "add"; case IROpcode::Sub: return "sub";
 								  case IROpcode::Mul: return "mul"; case IROpcode::Div: return "div"; case IROpcode::Mod: return "mod";
@@ -7801,7 +8463,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 								  case IROpcode::Or: return "or"; case IROpcode::Phi: return "phi"; case IROpcode::Branch: return "br";
 								  case IROpcode::BranchIf: return "br.if"; case IROpcode::Call: return "call"; case IROpcode::CallClosure: return "call.closure";
 								  case IROpcode::TextToString: return "text.to_string"; case IROpcode::StringToText: return "string.to_text"; case IROpcode::StringClear: return "string.clear"; case IROpcode::StringDispose: return "string.dispose"; case IROpcode::StringMove:return "string.move"; case IROpcode::ByteCount: return "text.count"; case IROpcode::TextEquals: return "text.equals";
-								  case IROpcode::MakeAggregate: return "aggregate.make"; case IROpcode::ExtractField: return "aggregate.field";
+								  case IROpcode::MakeAggregate: return "aggregate.make"; case IROpcode::ExtractField: return "aggregate.field"; case IROpcode::ArrayIndex:return "array.index";
 								  case IROpcode::ResultOk: return "result.ok"; case IROpcode::ResultErr: return "result.err"; case IROpcode::ResultIsErr: return "result.is_err"; case IROpcode::ResultTry: return "result.try";
 								  case IROpcode::OptionSome: return "option.some"; case IROpcode::OptionNone: return "option.none"; case IROpcode::MakeClosure: return "closure.make";
 								  case IROpcode::Return: return "ret"; case IROpcode::Nop: return "nop";
@@ -7897,6 +8559,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 								  auto tokens = lexer.tokenize();
 								  Parser parser(std::move(tokens));
 								  out.program = parser.parse();
+								  TopLevelConstantResolver{}.resolveProgram(out.program);
 
 								  SemanticAnalyzer semantic;
 								  out.analysis = semantic.analyze(out.program);
