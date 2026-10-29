@@ -11,6 +11,7 @@
 #include <set>
 #include <chrono>
 #include <cstdlib>
+#include <cerrno>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -25,6 +26,9 @@
 #include <vector>
 #if defined(__linux__) && defined(__x86_64__)
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
+#include <signal.h>
 #include <unistd.h>
 #endif
 #ifdef _WIN32
@@ -303,7 +307,37 @@ namespace pcn {
 				}
 			}
 			if (out.empty() || out.back() != '\n') out.push_back('\n');
+			validateUTF8(out);
 			return out;
+		}
+
+		// Strict UTF-8 decoding: reject overlong forms, surrogates and non-scalars.
+		// This validates input encoding; full NFC normalization remains a separate requirement.
+		static void validateUTF8(const std::string& source) {
+			const auto fail = [](std::size_t offset) -> void {
+				throw std::runtime_error("E0113 malformed UTF-8 source at byte " +
+					std::to_string(offset + 1));
+				};
+			for (std::size_t i = 0; i < source.size();) {
+				const auto lead = static_cast<unsigned char>(source[i]);
+				if (lead <= 0x7F) { ++i; continue; }
+				std::size_t extra = 0;
+				if (lead >= 0xC2 && lead <= 0xDF) extra = 1;
+				else if (lead >= 0xE0 && lead <= 0xEF) extra = 2;
+				else if (lead >= 0xF0 && lead <= 0xF4) extra = 3;
+				else fail(i);
+				if (extra > source.size() - i - 1) fail(i);
+				for (std::size_t j = 1; j <= extra; ++j) {
+					const auto c = static_cast<unsigned char>(source[i + j]);
+					if ((c & 0xC0) != 0x80) fail(i + j);
+				}
+				const auto next = static_cast<unsigned char>(source[i + 1]);
+				if ((lead == 0xE0 && next < 0xA0) ||
+					(lead == 0xED && next > 0x9F) ||
+					(lead == 0xF0 && next < 0x90) ||
+					(lead == 0xF4 && next > 0x8F)) fail(i);
+				i += extra + 1;
+			}
 		}
 
 		std::runtime_error lexicalError(const std::string& code, const std::string& message, SourceLocation loc) const {
@@ -1091,10 +1125,15 @@ namespace pcn {
 		TextToString,
 		StringToText,
 		StringClear,
+		StringDispose,
+		StringMove,
+		ByteCount,
+		TextEquals,
 		MakeAggregate,
 		ExtractField,
 		ResultOk,
 		ResultErr,
+		ResultIsErr,
 		ResultTry,
 		OptionSome,
 		OptionNone,
@@ -3310,9 +3349,18 @@ namespace pcn {
 				}
 				return makeTextType();
 			}
-			if (objectType.kind == SemanticTypeKind::String && member.member == "clear") {
+			if ((objectType.kind == SemanticTypeKind::Text || objectType.kind == SemanticTypeKind::String) && member.member == "count") {
+				if (!call.arguments.empty())report(call.location, "text/string.count() takes no arguments");
+				return { SemanticTypeKind::Number,"size" };
+			}
+			if (objectType.kind == SemanticTypeKind::Text && member.member == "equals") {
+				if (call.arguments.size() != 1 || analyzeExpr(call.arguments[0]).kind != SemanticTypeKind::Text)
+					report(call.location, "text.equals requires one text argument");
+				return makeBoolType();
+			}
+			if (objectType.kind == SemanticTypeKind::String && (member.member == "clear" || member.member == "dispose")) {
 				if (!call.arguments.empty()) {
-					report(call.location, "string.clear() takes no arguments");
+					report(call.location, "string mutation method takes no arguments");
 				}
 				// Borrow/mutation authority is enforced by SAGE, not duplicated here.
 				return makeVoidType();
@@ -3940,7 +3988,7 @@ namespace pcn {
 			}return nullptr;
 		}
 		std::string inferCallType(const CallExpr& c) {
-			if (auto* m = c.callee ? std::get_if<MemberExpr>(&c.callee->node) : nullptr) { auto o = inferExprType(m->object); if (o == "text" && m->member == "to_string")return "string"; if (o == "string" && m->member == "to_text")return "text"; if (o == "string" && m->member == "clear")return "void"; }
+			if (auto* m = c.callee ? std::get_if<MemberExpr>(&c.callee->node) : nullptr) { auto o = inferExprType(m->object); if (o == "text" && m->member == "to_string")return "string"; if (o == "string" && m->member == "to_text")return "text"; if ((o == "text" || o == "string") && m->member == "count")return "size"; if (o == "text" && m->member == "equals")return "bool"; if (o == "string" && (m->member == "clear" || m->member == "dispose"))return "void"; }
 			auto* v = c.callee ? std::get_if<VariableExpr>(&c.callee->node) : nullptr; if (v && (v->name == "ok" || v->name == "err" || v->name == "some") && c.arguments.size() == 1)return "__" + v->name + "<" + inferExprType(c.arguments[0]) + ">"; if (v && v->name == "none")return "__none"; std::map<std::string, std::string>s; if (auto* r = resolveCall(c, &s))return substituteGenericType(r->returnType, s); return "unknown";
 		}
 
@@ -3993,7 +4041,7 @@ namespace pcn {
 			if (auto* m = call.callee ? std::get_if<MemberExpr>(&call.callee->node) : nullptr) {
 				const std::string objectType = inferExprType(m->object);
 				walkExpr(m->object, inClosure);
-				if (auto* v = m->object ? std::get_if<VariableExpr>(&m->object->node) : nullptr) { if (auto* ls = lookup(v->name)) { static const std::unordered_set<std::string> mutators = { "clear" }; if (objectType == "string" && mutators.contains(m->member))addBorrow(*ls, v->name, BorrowKind::Exclusive, point_, point_, 0, false, call.location); else if (objectType == "string" && m->member == "to_text")addBorrow(*ls, v->name, BorrowKind::Shared, point_, point_, 0, false, call.location); } }
+				if (auto* v = m->object ? std::get_if<VariableExpr>(&m->object->node) : nullptr) { if (auto* ls = lookup(v->name)) { static const std::unordered_set<std::string> mutators = { "clear", "dispose" }; if (objectType == "string" && mutators.contains(m->member))addBorrow(*ls, v->name, BorrowKind::Exclusive, point_, point_, 0, false, call.location); else if (objectType == "string" && m->member == "to_text")addBorrow(*ls, v->name, BorrowKind::Shared, point_, point_, 0, false, call.location); } }
 				result_->skm.calls.push_back({ currentRoutine_,objectType + "." + m->member,call.location });
 				for (const auto& a : call.arguments)walkExpr(a, inClosure);
 				return;
@@ -4348,6 +4396,13 @@ namespace pcn {
 			if (std::holds_alternative<NumberExpr>(e->node)) return "int";
 			if (std::holds_alternative<BoolExpr>(e->node)) return "bool";
 			if (std::holds_alternative<StringExpr>(e->node)) return "text";
+			if (const auto* call = std::get_if<CallExpr>(&e->node)) {
+				if (const auto* member = call->callee ? std::get_if<MemberExpr>(&call->callee->node) : nullptr) {
+					const auto sourceType = inferBorrowType(member->object, state);
+					if (sourceType == "text" && member->member == "to_string")return "string";
+					if (sourceType == "string" && member->member == "to_text")return "text";
+				}
+			}
 			return {};
 		}
 
@@ -4379,12 +4434,20 @@ namespace pcn {
 					if (const auto* member = node.callee ? std::get_if<MemberExpr>(&node.callee->node) : nullptr) {
 						analyzeBorrowExpr(member->object, state);
 						const std::string objectType = inferBorrowType(member->object, state);
-						static const std::unordered_set<std::string> mutators = { "clear" };
+						static const std::unordered_set<std::string> mutators = { "clear", "dispose" };
 						if (objectType == "string" && mutators.contains(member->member)) {
 							const auto* variable = member->object ? std::get_if<VariableExpr>(&member->object->node) : nullptr;
 							auto* sym = variable ? lookup(state, variable->name) : nullptr;
-							if (!sym || !(sym->isMutable || sym->mode == "var" || sym->mode == "own"))
+							if (member->member == "dispose") {
+								// Destruction consumes ownership. A `var` parameter is
+								// only an exclusive borrow, never an ownership transfer.
+								if (!sym || (sym->isParameter && sym->mode != "own"))
+									report(node.location, "E0422 string disposal requires an owned local or own parameter");
+								else sym->ownership = OwnershipState::Moved;
+							}
+							else if (!sym || !(sym->isMutable || sym->mode == "var" || sym->mode == "own")) {
 								report(node.location, "E0417 cannot mutate string through a shared or immutable place; use var or own authority");
+							}
 						}
 						for (const auto& argument : node.arguments) analyzeBorrowExpr(argument, state);
 						return;
@@ -4451,15 +4514,27 @@ namespace pcn {
 					using T = std::decay_t<decltype(node)>;
 					if constexpr (std::is_same_v<T, LetStmt>) {
 						analyzeBorrowExpr(node.initializer, state);
+						if (node.initializer) if (const auto* source = std::get_if<VariableExpr>(&node.initializer->node)) {
+							if (auto* original = lookup(state, source->name))
+								if (original->typeName == "string") original->ownership = OwnershipState::Moved;
+						}
 						state.scopes.back()[node.name] = BorrowSymbol{ node.typeName.empty() ? inferBorrowType(node.initializer, state) : node.typeName, false, false, "shared", OwnershipState::Available };
 					}
 					else if constexpr (std::is_same_v<T, VarStmt>) {
 						analyzeBorrowExpr(node.initializer, state);
+						if (node.initializer) if (const auto* source = std::get_if<VariableExpr>(&node.initializer->node)) {
+							if (auto* original = lookup(state, source->name))
+								if (original->typeName == "string") original->ownership = OwnershipState::Moved;
+						}
 						state.scopes.back()[node.name] = BorrowSymbol{ node.typeName.empty() ? inferBorrowType(node.initializer, state) : node.typeName, true, false, "shared", OwnershipState::Available };
 					}
 					else if constexpr (std::is_same_v<T, AssignStmt>) {
 						analyzeBorrowExpr(node.value, state);
-						if (auto* s = lookup(state, node.name)) s->ownership = OwnershipState::Available;
+						if (node.value) if (const auto* v = std::get_if<VariableExpr>(&node.value->node)) {
+							if (v->name != node.name) if (auto* prior = lookup(state, v->name))
+								if (prior->typeName == "string") prior->ownership = OwnershipState::Moved;
+						}
+						if (auto* dst = lookup(state, node.name)) dst->ownership = OwnershipState::Available;
 					}
 					else if constexpr (std::is_same_v<T, ExprStmt>) analyzeBorrowExpr(node.expression, state);
 					else if constexpr (std::is_same_v<T, ReturnStmt>) { if (node.hasValue) analyzeBorrowExpr(node.value, state); }
@@ -4938,6 +5013,12 @@ namespace pcn {
 			loopContinueTargets_.clear();
 			loopScopeDepths_.clear();
 			deferScopes_.clear();
+			textViewOwners_.clear();
+			ownedScopes_.clear();
+			rootOwnedParams_.clear();
+			for (std::size_t i = 0; i < routine.parameters.size(); ++i)
+				if (routine.parameters[i].mode == "own" && routine.parameters[i].typeName == "string")
+					rootOwnedParams_.push_back(function.parameterVregs[i]);
 
 			for (std::size_t i = 0; i < routine.parameters.size(); ++i) {
 				locals_[routine.parameters[i].name] = function.parameterVregs[i];
@@ -5000,6 +5081,7 @@ namespace pcn {
 		IRValueType irValueTypeFromName(const std::string& name) const {
 			if (name == "void") return makeIRVoidType();
 			if (name == "bool") return makeIRBoolType();
+			if (name == "float" || name == "double") throw std::runtime_error("native codegen for floating-point values requires real XMM/IEEE-754 lowering; integer reinterpretation is forbidden");
 			if (isNumericTypeName(name)) return makeIRIntType();
 			if (name == "text") return makeIRTextType();
 			if (name == "string") return makeIRStringType();
@@ -5014,23 +5096,57 @@ namespace pcn {
 
 		// Deferred expressions run in reverse registration order at every scope exit.
 		// The IR is emitted at each concrete exit, never at the defer declaration.
-		void emitPendingDefers(std::size_t outerDepth) {
+		void verifyBorrowDoesNotEscape(VReg value, const IRValueType& type) const {
+			if (type.kind != IRValueKind::Text) return;
+			const auto it = textViewOwners_.find(static_cast<std::uint32_t>(value));
+			if (it == textViewOwners_.end()) return;
+			for (const auto& scope : ownedScopes_)
+				if (std::find(scope.begin(), scope.end(), it->second) != scope.end())
+					throw std::runtime_error("E0425 cannot return text borrowing local or owned string: backing storage is destroyed at scope exit");
+		}
+		void emitOwnedDrop(VReg source) {
+			IRInstruction drop;
+			drop.op = IROpcode::StringDispose;
+			drop.args = { source };
+			drop.typeName = "string";
+			drop.valueType = makeIRVoidType();
+			emit(std::move(drop));
+		}
+		void emitOwnedMove(VReg source, VReg destination, bool trackLifetime = false) {
+			if (source == destination) return;
+			if (trackLifetime && !ownedScopes_.empty()) ownedScopes_.back().push_back(destination);
+			IRInstruction move;
+			move.op = IROpcode::StringMove;
+			move.args = { source };
+			move.dest = destination;
+			move.valueType = makeIRStringType();
+			move.typeName = "string";
+			emit(std::move(move));
+		}
+		void emitPendingDefers(std::size_t outerDepth, VReg escaping = VReg::None) {
 			for (std::size_t scope = deferScopes_.size(); scope > outerDepth; --scope) {
 				const auto& expressions = deferScopes_[scope - 1];
-				for (auto it = expressions.rbegin(); it != expressions.rend(); ++it) {
+				for (auto it = expressions.rbegin(); it != expressions.rend(); ++it)
 					(void)lowerExpr(*it);
-				}
+				// Each owning allocation has exactly one live owner after a move.
+				// Explicit disposal zeroes the pointer; a second scoped drop is harmless.
+				// Drop in reverse construction order, after user-registered defers.
+				const auto owned = ownedScopes_[scope - 1];
+				for (auto it = owned.rbegin(); it != owned.rend(); ++it) if (*it != escaping) emitOwnedDrop(*it);
 			}
 		}
 
 		void lowerStatementList(const std::vector<StmtPtr>& statements) {
 			deferScopes_.emplace_back();
+			ownedScopes_.emplace_back();
+			if (ownedScopes_.size() == 1) ownedScopes_.back().insert(ownedScopes_.back().end(), rootOwnedParams_.begin(), rootOwnedParams_.end());
 			for (const auto& statement : statements) {
 				if (currentTerminated_) break;
 				lowerStatement(statement);
 			}
 			if (!currentTerminated_) emitPendingDefers(deferScopes_.size() - 1);
 			deferScopes_.pop_back();
+			ownedScopes_.pop_back();
 		}
 
 		void lowerStatement(const StmtPtr& statement) {
@@ -5109,6 +5225,12 @@ namespace pcn {
 				}
 			}
 			auto value = node.initializer ? lowerExpr(node.initializer) : makeNullValue();
+			if (lastValueType_.kind == IRValueKind::String && node.initializer &&
+				std::holds_alternative<VariableExpr>(node.initializer->node)) {
+				const VReg dest = allocateVReg();
+				emitOwnedMove(value, dest, true);
+				value = dest;
+			}
 			locals_[node.name] = value;
 			localValueTypes_[node.name] = lastValueType_;
 			lastValue_ = value;
@@ -5117,6 +5239,12 @@ namespace pcn {
 
 		void lowerVar(const VarStmt& node) {
 			auto value = node.initializer ? lowerExpr(node.initializer) : makeNullValue();
+			if (lastValueType_.kind == IRValueKind::String && node.initializer &&
+				std::holds_alternative<VariableExpr>(node.initializer->node)) {
+				const VReg dest = allocateVReg();
+				emitOwnedMove(value, dest, true);
+				value = dest;
+			}
 			locals_[node.name] = value;
 			localValueTypes_[node.name] = lastValueType_;
 			lastValue_ = value;
@@ -5132,11 +5260,25 @@ namespace pcn {
 				lastValue_ = value;
 				return;
 			}
+			if (lastValueType_.kind == IRValueKind::String &&
+				localValueTypes_[node.name].kind == IRValueKind::String) {
+				if (value != it->second) {
+					emitOwnedDrop(it->second); // release replaced owner first
+					emitOwnedMove(value, it->second); // existing binding retains its scope
+				}
+				lastValue_ = it->second;
+				return;
+			}
 			IRInstruction copy;
 			copy.op = IROpcode::Copy;
 			copy.dest = it->second;
 			copy.args.push_back(value);
 			copy.valueType = lastValueType_;
+			if (lastValueType_.kind == IRValueKind::Text) {
+				const auto owner = textViewOwners_.find(static_cast<std::uint32_t>(value));
+				if (owner != textViewOwners_.end()) textViewOwners_[static_cast<std::uint32_t>(it->second)] = owner->second;
+				else textViewOwners_.erase(static_cast<std::uint32_t>(it->second));
+			}
 			emit(std::move(copy));
 			localValueTypes_[node.name] = lastValueType_;
 			lastValue_ = it->second;
@@ -5148,30 +5290,46 @@ namespace pcn {
 			if (node.hasValue) {
 				auto value = lowerExpr(node.value);
 				inst.valueType = lastValueType_;
+				verifyBorrowDoesNotEscape(value, inst.valueType);
 				// Snapshot before running cleanup, so later mutations cannot change the result.
-				IRInstruction save; save.op = IROpcode::Copy;
-				save.dest = allocateVReg(); save.args = { value }; save.valueType = lastValueType_;
-				value = save.dest; emit(std::move(save));
+				if (lastValueType_.kind == IRValueKind::String) {
+					const VReg dest = allocateVReg();
+					emitOwnedMove(value, dest);
+					value = dest;
+				}
+				else {
+					IRInstruction save; save.op = IROpcode::Copy;
+					save.dest = allocateVReg(); save.args = { value }; save.valueType = lastValueType_;
+					value = save.dest; emit(std::move(save));
+				}
 				inst.args.push_back(value);
 			}
 			else {
 				inst.valueType = makeIRVoidType();
 			}
-			emitPendingDefers(0);
+			emitPendingDefers(0, inst.valueType.kind == IRValueKind::String ? inst.args.front() : VReg::None);
 			emit(std::move(inst));
 			currentTerminated_ = true;
 		}
 
 		void lowerGive(const GiveStmt& node) {
 			auto value = lowerExpr(node.value);
+			verifyBorrowDoesNotEscape(value, lastValueType_);
 			if (currentReturnType_.rfind("result<", 0) == 0 && lastValueType_.kind != IRValueKind::Result) value = emitTagged(IROpcode::ResultOk, value, { IRValueKind::Result, currentReturnType_ });
 			else if (currentReturnType_.rfind("option<", 0) == 0 && lastValueType_.kind != IRValueKind::Option) value = emitTagged(IROpcode::OptionSome, value, { IRValueKind::Option, currentReturnType_ });
 			// Preserve the returned object/value before deferred cleanup runs.
-			IRInstruction save; save.op = IROpcode::Copy;
-			save.dest = allocateVReg(); save.args = { value }; save.valueType = irValueTypeFromName(currentReturnType_);
-			value = save.dest; emit(std::move(save));
+			if (currentReturnType_ == "string") {
+				const VReg dest = allocateVReg();
+				emitOwnedMove(value, dest);
+				value = dest;
+			}
+			else {
+				IRInstruction save; save.op = IROpcode::Copy;
+				save.dest = allocateVReg(); save.args = { value }; save.valueType = irValueTypeFromName(currentReturnType_);
+				value = save.dest; emit(std::move(save));
+			}
 			IRInstruction inst; inst.op = IROpcode::Return; inst.args.push_back(value); inst.valueType = irValueTypeFromName(currentReturnType_);
-			emitPendingDefers(0);
+			emitPendingDefers(0, inst.valueType.kind == IRValueKind::String ? inst.args.front() : VReg::None);
 			emit(std::move(inst)); currentTerminated_ = true;
 		}
 
@@ -5422,6 +5580,8 @@ namespace pcn {
 			VReg value = std::visit([&](const auto& node) -> VReg {
 				using T = std::decay_t<decltype(node)>;
 				if constexpr (std::is_same_v<T, NumberExpr>) {
+					if (node.value.find('.') != std::string::npos)
+						throw std::runtime_error("floating-point literal requires IEEE-754 native lowering; integer codegen is forbidden");
 					lastValueType_ = makeIRIntType();
 					return emitConst(IROpcode::ConstInt, node.value);
 				}
@@ -5477,6 +5637,36 @@ namespace pcn {
 					std::string okType, errType;
 					IRValueType resultType = makeIRUnknownType();
 					if (typeIsResult(sourceType.name, &okType, &errType)) resultType = irValueTypeFromName(okType);
+					// `try` propagates an error as a return.  Deferred scope cleanup must
+					// execute on that edge, but never on the successful edge.
+					const bool hasDefers = std::any_of(deferScopes_.begin(), deferScopes_.end(),
+						[](const auto& scope) { return !scope.empty(); }) ||
+						std::any_of(ownedScopes_.begin(), ownedScopes_.end(),
+							[](const auto& scope) { return !scope.empty(); });
+					if (hasDefers) {
+						IRInstruction flag; flag.op = IROpcode::ResultIsErr;
+						flag.dest = allocateVReg(); flag.args = { source };
+						flag.valueType = makeIRBoolType(); flag.typeName = sourceType.name;
+						const VReg isErr = flag.dest; emit(std::move(flag));
+						const BlockID errorBlock = createBlock("try.error.cleanup");
+						const BlockID successBlock = createBlock("try.success");
+						IRInstruction branch; branch.op = IROpcode::BranchIf;
+						branch.args = { isErr }; branch.targetBlocks = { errorBlock, successBlock };
+						emit(std::move(branch)); currentTerminated_ = true;
+						currentBlock_ = errorBlock; currentTerminated_ = false;
+						emitPendingDefers(0);
+						// This intrinsic copies the Err payload to the enclosing result's
+						// ABI and returns.  The terminal instruction below also makes
+						// the CFG explicitly total for independent IR verification.
+						IRInstruction propagate; propagate.op = IROpcode::ResultTry;
+						propagate.dest = allocateVReg(); propagate.args = { source };
+						propagate.valueType = resultType; propagate.typeName = sourceType.name;
+						propagate.returnType = currentReturnType_; emit(std::move(propagate));
+						IRInstruction terminal; terminal.op = IROpcode::Return;
+						terminal.args = { source }; terminal.valueType = irValueTypeFromName(currentReturnType_);
+						emit(std::move(terminal)); currentTerminated_ = true;
+						currentBlock_ = successBlock; currentTerminated_ = false;
+					}
 					IRInstruction inst; inst.op = IROpcode::ResultTry; inst.dest = allocateVReg(); inst.args.push_back(source); inst.valueType = resultType; inst.typeName = sourceType.name; inst.returnType = currentReturnType_; emit(inst); lastValueType_ = inst.valueType; return inst.dest;
 				}
 				else if constexpr (std::is_same_v<T, ConstructExpr>) {
@@ -5546,6 +5736,8 @@ namespace pcn {
 						auto objectType = lowerExprType(m->object);
 						if (objectType.kind == IRValueKind::Text && m->member == "to_string")return makeIRStringType();
 						if (objectType.kind == IRValueKind::String && m->member == "to_text")return makeIRTextType();
+						if ((objectType.kind == IRValueKind::Text || objectType.kind == IRValueKind::String) && m->member == "count")return makeIRIntType();
+						if (objectType.kind == IRValueKind::Text && m->member == "equals")return makeIRBoolType();
 						if (objectType.kind == IRValueKind::String && m->member == "clear")return makeIRVoidType();
 					}
 					if (const auto* v = node.callee ? std::get_if<VariableExpr>(&node.callee->node) : nullptr) {
@@ -5665,11 +5857,21 @@ namespace pcn {
 				}
 				if (objectType.kind == IRValueKind::String && member->member == "to_text") {
 					if (!node.arguments.empty()) throw std::runtime_error("PCIR string.to_text takes no arguments");
-					auto dest = allocateVReg(); inst.op = IROpcode::StringToText; inst.dest = dest; inst.args.push_back(lowerExpr(member->object)); inst.valueType = makeIRTextType(); inst.typeName = "string"; emit(inst); lastValueType_ = inst.valueType; return dest;
+					auto dest = allocateVReg(); inst.op = IROpcode::StringToText; inst.dest = dest; inst.args.push_back(lowerExpr(member->object)); inst.valueType = makeIRTextType(); inst.typeName = "string"; textViewOwners_[static_cast<std::uint32_t>(dest)] = inst.args[0]; emit(inst); lastValueType_ = inst.valueType; return dest;
 				}
-				if (objectType.kind == IRValueKind::String && member->member == "clear") {
+				if ((objectType.kind == IRValueKind::Text || objectType.kind == IRValueKind::String) && member->member == "count") {
+					if (!node.arguments.empty())throw std::runtime_error("text/string.count takes no arguments");
+					auto dest = allocateVReg(); inst.op = IROpcode::ByteCount; inst.dest = dest; inst.args.push_back(lowerExpr(member->object)); inst.valueType = makeIRIntType(); emit(inst); lastValueType_ = inst.valueType; return dest;
+				}
+				if (objectType.kind == IRValueKind::Text && member->member == "equals") {
+					if (node.arguments.size() != 1)throw std::runtime_error("text.equals requires one argument");
+					auto dest = allocateVReg(); inst.op = IROpcode::TextEquals; inst.dest = dest;
+					inst.args.push_back(lowerExpr(member->object)); inst.args.push_back(lowerExpr(node.arguments[0]));
+					inst.valueType = makeIRBoolType(); emit(inst); lastValueType_ = inst.valueType; return dest;
+				}
+				if (objectType.kind == IRValueKind::String && (member->member == "clear" || member->member == "dispose")) {
 					if (!node.arguments.empty()) throw std::runtime_error("PCIR string.clear takes no arguments");
-					auto dest = allocateVReg(); inst.op = IROpcode::StringClear; inst.dest = dest; inst.args.push_back(lowerExpr(member->object)); inst.valueType = makeIRVoidType(); inst.typeName = "string"; emit(inst); lastValueType_ = inst.valueType; return dest;
+					auto dest = allocateVReg(); inst.op = (member->member == "dispose" ? IROpcode::StringDispose : IROpcode::StringClear); inst.dest = dest; inst.args.push_back(lowerExpr(member->object)); inst.valueType = makeIRVoidType(); inst.typeName = "string"; emit(inst); lastValueType_ = inst.valueType; return dest;
 				}
 				throw std::runtime_error("PCIR lowering for member routine '" + objectType.name + "." + member->member + "' is not implemented in this bootstrap; semantic authority/effects were still checked by SAGE");
 			}
@@ -5823,6 +6025,9 @@ namespace pcn {
 		}
 
 		void emit(IRInstruction inst) {
+			if (inst.dest != VReg::None && inst.valueType.kind == IRValueKind::String &&
+				(inst.op == IROpcode::TextToString || inst.op == IROpcode::Call) &&
+				!ownedScopes_.empty()) ownedScopes_.back().push_back(inst.dest);
 			ensureActiveBlock();
 			inst.blockLabel = currentBlock().labelName;
 			currentBlock().instructions.push_back(std::move(inst));
@@ -5873,6 +6078,9 @@ namespace pcn {
 		std::vector<BlockID> loopContinueTargets_;
 		std::vector<std::size_t> loopScopeDepths_;
 		std::vector<std::vector<ExprPtr>> deferScopes_;
+		std::vector<std::vector<VReg>> ownedScopes_;
+		std::vector<VReg> rootOwnedParams_;
+		std::unordered_map<std::uint32_t, VReg> textViewOwners_;
 	};
 
 	IRProgram lowerProgramToIR(const Program& program, const SemanticAnalysisResult* analysis = nullptr) {
@@ -5939,6 +6147,12 @@ namespace pcn {
 					if (terminated) errors.push_back(fn.name + ": instruction appears after terminator in " + block.labelName);
 					if (isTerminator(inst.op)) terminated = true;
 					if (isTerminator(inst.op) && i + 1 != block.instructions.size()) errors.push_back(fn.name + ": terminator is not final instruction in " + block.labelName);
+					if (inst.op == IROpcode::StringMove &&
+						(inst.args.size() != 1 || inst.dest == VReg::None || inst.valueType.kind != IRValueKind::String ||
+							inst.args.front() == inst.dest))
+						errors.push_back(fn.name + ": consuming string move has invalid source/destination");
+					if (inst.op == IROpcode::StringDispose && inst.args.size() != 1)
+						errors.push_back(fn.name + ": owned-string drop requires one operand");
 					if (inst.op == IROpcode::Branch && inst.targetBlocks.size() != 1) errors.push_back(fn.name + ": branch requires one target");
 					if (inst.op == IROpcode::BranchIf && (inst.targetBlocks.size() != 2 || inst.args.size() != 1)) errors.push_back(fn.name + ": conditional branch shape invalid");
 				}
@@ -5984,7 +6198,7 @@ namespace pcn {
 			case IROpcode::Add: case IROpcode::Sub: case IROpcode::Mul: case IROpcode::BitAnd: case IROpcode::BitOr:
 			case IROpcode::BitXor: case IROpcode::Shl: case IROpcode::Shr: case IROpcode::Neg: case IROpcode::BitNot:
 			case IROpcode::Not: case IROpcode::Eq: case IROpcode::Ne: case IROpcode::Lt: case IROpcode::Le:
-			case IROpcode::Gt: case IROpcode::Ge: case IROpcode::And: case IROpcode::Or: case IROpcode::StringToText:
+			case IROpcode::Gt: case IROpcode::Ge: case IROpcode::And: case IROpcode::Or: case IROpcode::StringToText:case IROpcode::ByteCount:case IROpcode::TextEquals:
 			case IROpcode::MakeAggregate: case IROpcode::ExtractField: case IROpcode::ResultOk: case IROpcode::ResultErr:
 			case IROpcode::OptionSome: case IROpcode::OptionNone: case IROpcode::MakeClosure: return true;
 			default: return false;
@@ -6371,10 +6585,15 @@ namespace pcn {
 					case IROpcode::Call: { std::vector<Value>ca; for (auto v : inst.args)ca.push_back(regs.at(static_cast<std::uint32_t>(v))); if (inst.callee == "print" || inst.callee == "println") { if (!ca.empty())std::cout << asInt(ca.front()); if (inst.callee == "println")std::cout << '\n'; set(scalar(0)); } else { auto it = functions_.find(inst.callee); if (it == functions_.end())throw std::runtime_error("PCIR oracle unresolved call: " + inst.callee); set(execute(*it->second, ca)); }break; }
 					case IROpcode::TextToString: { auto src = get(0); if (!src.object || src.object->typeName != "text")throw std::runtime_error("PCIR oracle text.to_string on non-text"); auto v = object("string"); v.object->text = src.object->text; set(v); break; }
 					case IROpcode::StringToText: { auto src = get(0); if (!src.object || src.object->typeName != "string")throw std::runtime_error("PCIR oracle string.to_text on non-string"); auto v = object("text"); v.object->text = src.object->text; set(v); break; }
+					case IROpcode::TextEquals: { auto x = get(0), y = get(1); if (!x.object || !y.object || x.object->typeName != "text" || y.object->typeName != "text")throw std::runtime_error("PCIR text.equals requires two text values"); set(scalar(x.object->text == y.object->text)); break; }
+					case IROpcode::ByteCount: { auto src = get(0); if (!src.object)throw std::runtime_error("PCIR byte_count requires text/string"); set(scalar(static_cast<std::int64_t>(src.object->text.size()))); break; }
+					case IROpcode::StringMove: { auto src = get(0); if (!src.object || src.object->typeName != "string")throw std::runtime_error("PCIR oracle string.move on non-string"); auto v = object("string"); v.object->text = std::move(src.object->text); set(v); break; }
+					case IROpcode::StringDispose: { auto src = get(0); if (!src.object || src.object->typeName != "string")throw std::runtime_error("PCIR oracle string.dispose on non-string"); src.object->text.clear(); set(scalar(0)); break; }
 					case IROpcode::StringClear: { auto src = get(0); if (!src.object || src.object->typeName != "string")throw std::runtime_error("PCIR oracle string.clear on non-string"); src.object->text.clear(); set(scalar(0)); break; }
 					case IROpcode::MakeAggregate: { auto v = object(inst.typeName); v.object->names = inst.argumentTypes; for (std::size_t i = 0; i < inst.args.size(); ++i)v.object->fields.push_back(get(i)); set(v); break; }
 					case IROpcode::ExtractField: { auto o = get(0); if (!o.object)throw std::runtime_error("PCIR oracle member access on scalar"); auto it = std::find(o.object->names.begin(), o.object->names.end(), inst.literalText); if (it == o.object->names.end())throw std::runtime_error("PCIR oracle unknown aggregate field: " + inst.literalText); set(o.object->fields[static_cast<std::size_t>(it - o.object->names.begin())]); break; }
 					case IROpcode::ResultOk:case IROpcode::ResultErr: { auto v = object(inst.valueType.name); v.object->tag = inst.op == IROpcode::ResultErr ? 1 : 0; if (!inst.args.empty())v.object->fields.push_back(get(0)); set(v); break; }
+					case IROpcode::ResultIsErr: { auto v = get(0); if (!v.object)throw std::runtime_error("PCIR oracle result.is_err on non-result"); set(scalar(v.object->tag != 0)); break; }
 					case IROpcode::ResultTry: { auto v = get(0); if (!v.object)throw std::runtime_error("PCIR oracle try on non-result"); if (v.object->tag != 0)return v; if (v.object->fields.empty())throw std::runtime_error("PCIR oracle result missing payload"); set(v.object->fields.front()); break; }
 					case IROpcode::OptionSome:case IROpcode::OptionNone: { auto v = object(inst.valueType.name); v.object->tag = inst.op == IROpcode::OptionSome ? 1 : 0; if (inst.op == IROpcode::OptionSome && !inst.args.empty())v.object->fields.push_back(get(0)); set(v); break; }
 					case IROpcode::MakeClosure: { auto v = object(inst.valueType.name); v.object->closureCallee = inst.callee; for (std::size_t i = 0; i < inst.args.size(); ++i)v.object->fields.push_back(get(i)); set(v); break; }
@@ -6393,7 +6612,7 @@ namespace pcn {
 	enum class PMIROpcode {
 		ConstInt, ConstBool, ConstNull, ConstText, Copy, Add, Sub, Mul, Div, Mod, BitAnd, BitOr, BitXor,
 		Shl, Shr, Neg, BitNot, Not, Eq, Ne, Lt, Le, Gt, Ge, And, Or, Branch, BranchIf, Call, CallClosure,
-		TextToString, StringToText, StringClear, MakeAggregate, ExtractField, ResultOk, ResultErr, ResultTry, OptionSome, OptionNone, MakeClosure, Return, Nop
+		TextToString, StringToText, StringClear, StringDispose, StringMove, ByteCount, TextEquals, MakeAggregate, ExtractField, ResultOk, ResultErr, ResultIsErr, ResultTry, OptionSome, OptionNone, MakeClosure, Return, Nop
 	};
 
 	struct PMIRInstruction {
@@ -6464,9 +6683,9 @@ namespace pcn {
 			case IROpcode::BitNot:return PMIROpcode::BitNot; case IROpcode::Not:return PMIROpcode::Not; case IROpcode::Eq:return PMIROpcode::Eq; case IROpcode::Ne:return PMIROpcode::Ne;
 			case IROpcode::Lt:return PMIROpcode::Lt; case IROpcode::Le:return PMIROpcode::Le; case IROpcode::Gt:return PMIROpcode::Gt; case IROpcode::Ge:return PMIROpcode::Ge;
 			case IROpcode::And:return PMIROpcode::And; case IROpcode::Or:return PMIROpcode::Or; case IROpcode::Branch:return PMIROpcode::Branch; case IROpcode::BranchIf:return PMIROpcode::BranchIf;
-			case IROpcode::Call:return PMIROpcode::Call; case IROpcode::CallClosure:return PMIROpcode::CallClosure; case IROpcode::TextToString:return PMIROpcode::TextToString; case IROpcode::StringToText:return PMIROpcode::StringToText; case IROpcode::StringClear:return PMIROpcode::StringClear; case IROpcode::MakeAggregate:return PMIROpcode::MakeAggregate;
+			case IROpcode::Call:return PMIROpcode::Call; case IROpcode::CallClosure:return PMIROpcode::CallClosure; case IROpcode::TextToString:return PMIROpcode::TextToString; case IROpcode::StringToText:return PMIROpcode::StringToText; case IROpcode::StringClear:return PMIROpcode::StringClear; case IROpcode::StringDispose:return PMIROpcode::StringDispose; case IROpcode::StringMove:return PMIROpcode::StringMove; case IROpcode::ByteCount:return PMIROpcode::ByteCount; case IROpcode::TextEquals:return PMIROpcode::TextEquals; case IROpcode::MakeAggregate:return PMIROpcode::MakeAggregate;
 			case IROpcode::ExtractField:return PMIROpcode::ExtractField; case IROpcode::ResultOk:return PMIROpcode::ResultOk; case IROpcode::ResultErr:return PMIROpcode::ResultErr;
-			case IROpcode::ResultTry:return PMIROpcode::ResultTry; case IROpcode::OptionSome:return PMIROpcode::OptionSome; case IROpcode::OptionNone:return PMIROpcode::OptionNone;
+			case IROpcode::ResultIsErr:return PMIROpcode::ResultIsErr; case IROpcode::ResultTry:return PMIROpcode::ResultTry; case IROpcode::OptionSome:return PMIROpcode::OptionSome; case IROpcode::OptionNone:return PMIROpcode::OptionNone;
 			case IROpcode::MakeClosure:return PMIROpcode::MakeClosure; case IROpcode::Return:return PMIROpcode::Return;
 			case IROpcode::Nop:return PMIROpcode::Nop;
 			default:throw std::runtime_error("PMIR cannot legalize PCIR opcode " + std::to_string(static_cast<int>(op)));
@@ -6483,6 +6702,29 @@ namespace pcn {
 			out.parameterTypes = fn.parameterTypes; out.parameterModes = fn.parameterModes; out.parameterValueTypes = fn.parameterValueTypes;
 			for (auto v : fn.parameterVregs)out.parameterSlots.push_back(static_cast<std::uint32_t>(v));
 			const auto vregTypes = collectVregTypes(fn);
+			// Current automatic drop glue handles direct string owners. A nested owner
+			// requires recursive, tag-aware drop flags. Refuse unsafe shallow copies.
+			std::function<bool(const std::string&, std::set<std::string>&)> containsOwner =
+				[&](const std::string& type, std::set<std::string>& seen)->bool {
+				if (type == "string") return true;
+				if (type.empty() || type == "text" || !seen.insert(type).second) return false;
+				const auto lay = abi.layout(type);
+				if (lay.kind == ABIRepresentationKind::Result) return containsOwner(lay.okType, seen) || containsOwner(lay.errType, seen);
+				if (lay.kind == ABIRepresentationKind::OptionTagged || lay.kind == ABIRepresentationKind::OptionPointerNiche)
+					return containsOwner(lay.valueType, seen);
+				for (const auto& field : lay.fields) {
+					if (field.typeName == "string")return true;
+					if (field.typeName != type && containsOwner(field.typeName, seen))return true;
+				}
+				return false;
+				};
+			for (const auto& ty : vregTypes) {
+				if (ty.kind != IRValueKind::Aggregate && ty.kind != IRValueKind::Result &&
+					ty.kind != IRValueKind::Option && ty.kind != IRValueKind::Closure)continue;
+				std::set<std::string> visited;
+				if (containsOwner(ty.name, visited))
+					throw std::runtime_error("E0426 nested owned string in '" + ty.name + "' requires recursive aggregate drop/move legalization; refusing unsafe shallow copy");
+			}
 			std::size_t maxAbiArgs = 0;
 			for (const auto& b : fn.blocks)for (const auto& i : b.instructions) {
 				if (i.op == IROpcode::Call) { std::size_t n = i.args.size() + (abi.isRich(i.valueType) ? 1 : 0); maxAbiArgs = std::max(maxAbiArgs, n); }
@@ -6523,7 +6765,7 @@ namespace pcn {
 	static std::string pmirOpcodeName(PMIROpcode op) {
 		switch (op) {
 		case PMIROpcode::ConstInt:return"mov.imm"; case PMIROpcode::ConstBool:return"mov.bool"; case PMIROpcode::ConstNull:return"mov.null"; case PMIROpcode::ConstText:return"text.literal"; case PMIROpcode::Copy:return"copy";
-		case PMIROpcode::Add:return"add"; case PMIROpcode::Sub:return"sub"; case PMIROpcode::Mul:return"imul"; case PMIROpcode::Div:return"idiv.defined"; case PMIROpcode::Mod:return"imod.defined"; case PMIROpcode::BitAnd:return"and"; case PMIROpcode::BitOr:return"or"; case PMIROpcode::BitXor:return"xor"; case PMIROpcode::Shl:return"shl"; case PMIROpcode::Shr:return"sar"; case PMIROpcode::Neg:return"neg"; case PMIROpcode::BitNot:return"not"; case PMIROpcode::Not:return"logical.not"; case PMIROpcode::Eq:return"cmp.eq"; case PMIROpcode::Ne:return"cmp.ne"; case PMIROpcode::Lt:return"cmp.lt"; case PMIROpcode::Le:return"cmp.le"; case PMIROpcode::Gt:return"cmp.gt"; case PMIROpcode::Ge:return"cmp.ge"; case PMIROpcode::And:return"logical.and"; case PMIROpcode::Or:return"logical.or"; case PMIROpcode::Branch:return"jmp"; case PMIROpcode::BranchIf:return"br.if"; case PMIROpcode::Call:return"call"; case PMIROpcode::CallClosure:return"call.closure"; case PMIROpcode::TextToString:return"text.to_string"; case PMIROpcode::StringToText:return"string.to_text"; case PMIROpcode::StringClear:return"string.clear"; case PMIROpcode::MakeAggregate:return"aggregate.make"; case PMIROpcode::ExtractField:return"aggregate.field"; case PMIROpcode::ResultOk:return"result.ok"; case PMIROpcode::ResultErr:return"result.err"; case PMIROpcode::ResultTry:return"result.try"; case PMIROpcode::OptionSome:return"option.some"; case PMIROpcode::OptionNone:return"option.none"; case PMIROpcode::MakeClosure:return"closure.make"; case PMIROpcode::Return:return"ret"; case PMIROpcode::Nop:return"nop";
+		case PMIROpcode::Add:return"add"; case PMIROpcode::Sub:return"sub"; case PMIROpcode::Mul:return"imul"; case PMIROpcode::Div:return"idiv.defined"; case PMIROpcode::Mod:return"imod.defined"; case PMIROpcode::BitAnd:return"and"; case PMIROpcode::BitOr:return"or"; case PMIROpcode::BitXor:return"xor"; case PMIROpcode::Shl:return"shl"; case PMIROpcode::Shr:return"sar"; case PMIROpcode::Neg:return"neg"; case PMIROpcode::BitNot:return"not"; case PMIROpcode::Not:return"logical.not"; case PMIROpcode::Eq:return"cmp.eq"; case PMIROpcode::Ne:return"cmp.ne"; case PMIROpcode::Lt:return"cmp.lt"; case PMIROpcode::Le:return"cmp.le"; case PMIROpcode::Gt:return"cmp.gt"; case PMIROpcode::Ge:return"cmp.ge"; case PMIROpcode::And:return"logical.and"; case PMIROpcode::Or:return"logical.or"; case PMIROpcode::Branch:return"jmp"; case PMIROpcode::BranchIf:return"br.if"; case PMIROpcode::Call:return"call"; case PMIROpcode::CallClosure:return"call.closure"; case PMIROpcode::TextToString:return"text.to_string"; case PMIROpcode::StringToText:return"string.to_text"; case PMIROpcode::StringClear:return"string.clear"; case PMIROpcode::StringDispose:return"string.dispose"; case PMIROpcode::StringMove:return"string.move"; case PMIROpcode::ByteCount:return"text.count"; case PMIROpcode::TextEquals:return"text.equals"; case PMIROpcode::MakeAggregate:return"aggregate.make"; case PMIROpcode::ExtractField:return"aggregate.field"; case PMIROpcode::ResultOk:return"result.ok"; case PMIROpcode::ResultErr:return"result.err"; case PMIROpcode::ResultIsErr:return"result.is_err"; case PMIROpcode::ResultTry:return"result.try"; case PMIROpcode::OptionSome:return"option.some"; case PMIROpcode::OptionNone:return"option.none"; case PMIROpcode::MakeClosure:return"closure.make"; case PMIROpcode::Return:return"ret"; case PMIROpcode::Nop:return"nop";
 		}return"?";
 	}
 
@@ -6531,7 +6773,7 @@ namespace pcn {
 
 	// --- Integrated x86-64 encoder with rich-value legalization ----------------
 	struct MachineListingLine { std::size_t offset = 0; std::vector<std::uint8_t>bytes; std::string text; };
-	struct MachineProgram { std::vector<std::uint8_t>text; std::unordered_map<std::string, std::uint32_t>functionOffsets; std::unordered_map<std::string, std::uint32_t>functionSizes; std::vector<MachineListingLine>listing; std::uint32_t entryOffset = 0; std::string entryName; };
+	struct MachineProgram { struct ImportCall { std::size_t dispPos; std::string symbol; }; std::vector<ImportCall> imports; std::vector<std::uint8_t>text; std::unordered_map<std::string, std::uint32_t>functionOffsets; std::unordered_map<std::string, std::uint32_t>functionSizes; std::vector<MachineListingLine>listing; std::uint32_t entryOffset = 0; std::string entryName; };
 
 class MachineVerifier { public:std::vector<std::string>verify(const MachineProgram& machine)const { std::vector<std::string>errors; if (machine.text.empty())errors.push_back("machine text section is empty"); if (!machine.entryName.empty()) { auto it = machine.functionOffsets.find(machine.entryName); if (it == machine.functionOffsets.end() || it->second != machine.entryOffset)errors.push_back("entry point does not match selected function"); }std::vector<std::pair<std::uint32_t, std::uint32_t>>ranges; for (const auto& [name, off] : machine.functionOffsets) { auto sz = machine.functionSizes.find(name); if (sz == machine.functionSizes.end()) { errors.push_back("missing machine function size: " + name); continue; }if (static_cast<std::uint64_t>(off) + sz->second > machine.text.size())errors.push_back("machine function outside .text: " + name); ranges.emplace_back(off, off + sz->second); }std::sort(ranges.begin(), ranges.end()); for (std::size_t i = 1; i < ranges.size(); ++i)if (ranges[i].first < ranges[i - 1].second)errors.push_back("machine function ranges overlap"); for (const auto& line : machine.listing) { if (line.offset + line.bytes.size() > machine.text.size()) { errors.push_back("machine listing outside .text"); continue; }if (!std::equal(line.bytes.begin(), line.bytes.end(), machine.text.begin() + static_cast<std::ptrdiff_t>(line.offset)))errors.push_back("decoded listing does not match final encoded bytes"); }return errors; } };
 
@@ -6539,13 +6781,13 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 							  public:
 								  MachineProgram encode(const PMIRProgram& program, const std::string& requestedEntry = {})const {
 									  MachineProgram out; RichABIResolver abi(program.skm, program.nominalTypes); struct CallFix { std::size_t dispPos; std::string callee; }; struct LitFix { std::size_t dispPos; std::string literal; }; std::vector<CallFix>calls; std::vector<LitFix>lits;
-									  for (const auto& fn : program.functions) { while (out.text.size() % 16)out.text.push_back(0x90); const std::size_t base = out.text.size(); out.functionOffsets[fn.name] = static_cast<std::uint32_t>(base); auto enc = encodeFunction(fn, abi); for (auto& line : enc.listing) { line.offset += base; out.listing.push_back(std::move(line)); }for (const auto& c : enc.calls)calls.push_back({ base + c.dispPos,c.callee }); for (const auto& l : enc.literals)lits.push_back({ base + l.dispPos,l.literal }); out.text.insert(out.text.end(), enc.bytes.begin(), enc.bytes.end()); out.functionSizes[fn.name] = static_cast<std::uint32_t>(enc.bytes.size()); }
+									  for (const auto& fn : program.functions) { while (out.text.size() % 16)out.text.push_back(0x90); const std::size_t base = out.text.size(); out.functionOffsets[fn.name] = static_cast<std::uint32_t>(base); auto enc = encodeFunction(fn, abi); for (auto& line : enc.listing) { line.offset += base; out.listing.push_back(std::move(line)); }for (const auto& c : enc.calls)calls.push_back({ base + c.dispPos,c.callee }); for (const auto& l : enc.literals)lits.push_back({ base + l.dispPos,l.literal }); for (const auto& imp : enc.imports)out.imports.push_back({ base + imp.dispPos,imp.symbol }); out.text.insert(out.text.end(), enc.bytes.begin(), enc.bytes.end()); out.functionSizes[fn.name] = static_cast<std::uint32_t>(enc.bytes.size()); }
 									  for (const auto& fix : calls) { auto it = out.functionOffsets.find(fix.callee); if (it == out.functionOffsets.end())throw std::runtime_error("native linker unresolved routine: " + fix.callee); std::int64_t rel = static_cast<std::int64_t>(it->second) - static_cast<std::int64_t>(fix.dispPos + 4); if (rel<std::numeric_limits<std::int32_t>::min() || rel>std::numeric_limits<std::int32_t>::max())throw std::runtime_error("native call relocation out of rel32 range"); patch32(out.text, fix.dispPos, static_cast<std::int32_t>(rel)); }
 									  std::unordered_map<std::string, std::uint32_t>pool; for (const auto& fix : lits) { auto it = pool.find(fix.literal); std::uint32_t off = 0; if (it == pool.end()) { off = static_cast<std::uint32_t>(out.text.size()); pool.emplace(fix.literal, off); out.text.insert(out.text.end(), fix.literal.begin(), fix.literal.end()); out.text.push_back(0); } else off = it->second; std::int64_t rel = static_cast<std::int64_t>(off) - static_cast<std::int64_t>(fix.dispPos + 4); patch32(out.text, fix.dispPos, static_cast<std::int32_t>(rel)); }
 									  selectEntry(program, requestedEntry, out); for (auto& line : out.listing) { const std::size_t n = line.bytes.size(); if (line.offset + n <= out.text.size())line.bytes.assign(out.text.begin() + static_cast<std::ptrdiff_t>(line.offset), out.text.begin() + static_cast<std::ptrdiff_t>(line.offset + n)); }return out;
 								  }
 							  private:
-								  struct EncodedFunction { std::vector<std::uint8_t>bytes; std::vector<MachineListingLine>listing; struct Call { std::size_t dispPos; std::string callee; }; struct Literal { std::size_t dispPos; std::string literal; }; std::vector<Call>calls; std::vector<Literal>literals; };
+								  struct EncodedFunction { std::vector<std::uint8_t>bytes; std::vector<MachineListingLine>listing; struct Call { std::size_t dispPos; std::string callee; }; struct Literal { std::size_t dispPos; std::string literal; }; struct Import { std::size_t dispPos; std::string symbol; }; std::vector<Call>calls; std::vector<Literal>literals; std::vector<Import>imports; };
 								  struct BranchFix { std::size_t dispPos; std::uint32_t target; };
 								  static void put32(std::vector<std::uint8_t>& b, std::int32_t v) { for (int i = 0; i < 4; ++i)b.push_back(static_cast<std::uint8_t>((static_cast<std::uint32_t>(v) >> (i * 8)) & 0xff)); }
 								  static void put64(std::vector<std::uint8_t>& b, std::uint64_t v) { for (int i = 0; i < 8; ++i)b.push_back(static_cast<std::uint8_t>((v >> (i * 8)) & 0xff)); }
@@ -6592,12 +6834,13 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 									  EncodedFunction out; auto& b = out.bytes; std::unordered_map<std::uint32_t, std::size_t>blockOffsets; std::vector<BranchFix>branches; auto record = [&](std::size_t st, const std::string& t) {out.listing.push_back({ st,slice(b,st,b.size()),t }); }; std::size_t s = b.size(); b.push_back(0x55); b.insert(b.end(), { 0x48,0x89,0xE5 }); b.insert(b.end(), { 0x48,0x81,0xEC }); put32(b, static_cast<std::int32_t>(fn.frameSize)); record(s, "push rbp; mov rbp,rsp; sub rsp," + std::to_string(fn.frameSize));
 									  std::size_t abiBase = 0; if (fn.richReturn) { s = b.size(); storeRbp(b, 1, negDisp(fn.sretCellOffset)); record(s, "spill hidden sret"); abiBase = 1; }
 									  for (std::size_t i = 0; i < fn.parameterSlots.size(); ++i) { s = b.size(); const auto slot = fn.parameterSlots[i]; loadIncoming(b, abiBase + i); const auto& si = fn.slots.at(slot); if (si.rich) {/* Rich Paracine parameters are ABI-indirect values. Keep the caller object pointer so shared/var/own modes preserve the semantic object identity for the duration of the call; a later explicit rebind materializes into the slot's local object storage. */storeSlot(b, 0, fn, slot); } else storeSlot(b, 0, fn, slot); record(s, "legalize parameter -> s" + std::to_string(slot) + (si.rich ? " (indirect rich)" : "")); }
-									  for (const auto& block : fn.blocks) { blockOffsets[block.id] = b.size(); for (const auto& ins : block.instructions) { s = b.size(); encodeInstruction(fn, ins, abi, b, branches, out.calls, out.literals); record(s, pmirOpcodeName(ins.op)); } }
+									  for (const auto& block : fn.blocks) { blockOffsets[block.id] = b.size(); for (const auto& ins : block.instructions) { s = b.size(); encodeInstruction(fn, ins, abi, b, branches, out.calls, out.literals, out.imports); record(s, pmirOpcodeName(ins.op)); } }
 									  if (fn.blocks.empty() || b.empty() || b.back() != 0xC3) { s = b.size(); b.insert(b.end(), { 0x31,0xC0 }); epilogue(b); record(s, "implicit return 0"); }
 									  for (const auto& f : branches) { auto it = blockOffsets.find(f.target); if (it == blockOffsets.end())throw std::runtime_error("x64 encoder invalid branch target"); std::int64_t rel = static_cast<std::int64_t>(it->second) - static_cast<std::int64_t>(f.dispPos + 4); patch32(b, f.dispPos, static_cast<std::int32_t>(rel)); }return out;
 								  }
 
 								  static void emitDirectCall(std::vector<std::uint8_t>& b, const std::string& callee, std::vector<EncodedFunction::Call>& calls) { b.push_back(0xE8); auto p = b.size(); put32(b, 0); calls.push_back({ p,callee }); }
+								  static void emitImportedCall(std::vector<std::uint8_t>& b, const std::string& symbol, std::vector<EncodedFunction::Import>& imports) { b.push_back(0xFF); b.push_back(0x15); auto p = b.size(); put32(b, 0); imports.push_back({ p,symbol }); }
 								  void encodeCall(const PMIRFunction& fn, const PMIRInstruction& i, const RichABIResolver& abi, std::vector<std::uint8_t>& b, std::vector<EncodedFunction::Call>& calls)const {
 									  std::size_t ai = 0; const bool richRet = abi.isRich(i.valueType); if (richRet) { initRichDest(b, fn, i.destSlot); loadSlot(b, 0, fn, i.destSlot); placeArgFromRax(b, ai++); }for (std::size_t n = 0; n < i.srcSlots.size(); ++n) { loadSlot(b, 0, fn, i.srcSlots[n]); placeArgFromRax(b, ai++); }emitDirectCall(b, i.callee, calls); if (i.destSlot && !richRet)storeSlot(b, 0, fn, i.destSlot);
 								  }
@@ -6605,7 +6848,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 									  if (i.srcSlots.empty())throw std::runtime_error("closure call missing closure value"); const auto closureType = fn.slots.at(i.srcSlots[0]).type; auto cl = abi.layout(closureType); if (cl.kind != ABIRepresentationKind::Closure)throw std::runtime_error("call.closure source is not a concrete closure type"); loadSlot(b, 10, fn, i.srcSlots[0]); std::size_t ai = 0; const bool richRet = abi.isRich(i.valueType); if (richRet) { initRichDest(b, fn, i.destSlot); loadSlot(b, 0, fn, i.destSlot); placeArgFromRax(b, ai++); }for (const auto& f : cl.fields) { auto fl = abi.layout(f.typeName); if (fl.rich) { movReg(b, 0, 10); if (f.offset) { movImm(b, 11, f.offset); b.insert(b.end(), { 0x4C,0x01,0xD8 }); } } else loadMem(b, 0, 10, static_cast<std::int32_t>(f.offset), std::max<std::size_t>(fl.size, 1), fl.signedScalar); placeArgFromRax(b, ai++); }for (std::size_t n = 1; n < i.srcSlots.size(); ++n) { loadSlot(b, 0, fn, i.srcSlots[n]); placeArgFromRax(b, ai++); }emitDirectCall(b, cl.closureCallee, calls); if (i.destSlot && !richRet)storeSlot(b, 0, fn, i.destSlot);
 								  }
 
-								  void encodeInstruction(const PMIRFunction& fn, const PMIRInstruction& i, const RichABIResolver& abi, std::vector<std::uint8_t>& b, std::vector<BranchFix>& branches, std::vector<EncodedFunction::Call>& calls, std::vector<EncodedFunction::Literal>& literals)const {
+								  void encodeInstruction(const PMIRFunction& fn, const PMIRInstruction& i, const RichABIResolver& abi, std::vector<std::uint8_t>& b, std::vector<BranchFix>& branches, std::vector<EncodedFunction::Call>& calls, std::vector<EncodedFunction::Literal>& literals, std::vector<EncodedFunction::Import>& imports)const {
 									  auto unaryLoad = [&]() {if (i.srcSlots.empty())throw std::runtime_error("PMIR unary missing source"); loadSlot(b, 0, fn, i.srcSlots[0]); }; auto binaryLoad = [&]() {if (i.srcSlots.size() < 2)throw std::runtime_error("PMIR binary missing source"); loadSlot(b, 0, fn, i.srcSlots[0]); loadSlot(b, 10, fn, i.srcSlots[1]); }; auto save = [&]() {if (i.destSlot)storeSlot(b, 0, fn, i.destSlot); };
 									  switch (i.op) {
 									  case PMIROpcode::ConstInt:case PMIROpcode::ConstBool:case PMIROpcode::ConstNull:movImm(b, 0, static_cast<std::uint64_t>(i.immediate)); save(); break;
@@ -6616,12 +6859,105 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 									  case PMIROpcode::Div:case PMIROpcode::Mod: { binaryLoad(); b.insert(b.end(), { 0x49,0x83,0xFA,0x00 }); auto jz = emitLocalJcc(b, 0x84); b.insert(b.end(), { 0x49,0x83,0xFA,0xFF }); auto jne = emitLocalJcc(b, 0x85); movImm(b, 11, 0x8000000000000000ull); b.insert(b.end(), { 0x4C,0x39,0xD8 }); auto jne2 = emitLocalJcc(b, 0x85); if (i.op == PMIROpcode::Mod)b.insert(b.end(), { 0x31,0xC0 }); auto done = emitLocalJmp(b); auto normal = b.size(); patchLocal(b, jne, normal); patchLocal(b, jne2, normal); b.insert(b.end(), { 0x48,0x99,0x49,0xF7,0xFA }); if (i.op == PMIROpcode::Mod)b.insert(b.end(), { 0x48,0x89,0xD0 }); auto after = emitLocalJmp(b); auto trap = b.size(); patchLocal(b, jz, trap); b.insert(b.end(), { 0x0F,0x0B }); auto finish = b.size(); patchLocal(b, done, finish); patchLocal(b, after, finish); save(); break; }
 									  case PMIROpcode::Branch:emitJmp(b, i.targets.at(0), branches); break; case PMIROpcode::BranchIf:loadSlot(b, 0, fn, i.srcSlots.at(0)); b.insert(b.end(), { 0x48,0x85,0xC0 }); emitJcc(b, 0x85, i.targets.at(0), branches); emitJmp(b, i.targets.at(1), branches); break;
 									  case PMIROpcode::Call:encodeCall(fn, i, abi, b, calls); break; case PMIROpcode::CallClosure:encodeClosureCall(fn, i, abi, b, calls); break;
+									  case PMIROpcode::TextEquals: {
+										  if (i.srcSlots.size() != 2)throw std::runtime_error("text.equals requires two operands");
+										  loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 8, 10, 8, 8, false);
+										  loadSlot(b, 11, fn, i.srcSlots[1]); loadMem(b, 9, 11, 8, 8, false);
+										  b.insert(b.end(), { 0x4D,0x39,0xC8 }); // cmp r8,r9
+										  auto unequal = emitLocalJcc(b, 0x85);
+										  loadMem(b, 10, 10, 0, 8, false); loadMem(b, 11, 11, 0, 8, false);
+										  b.insert(b.end(), { 0x4D,0x85,0xC0 }); // test r8,r8
+										  auto equalEmpty = emitLocalJcc(b, 0x84);
+										  const auto loop = b.size();
+										  loadMem(b, 0, 10, 0, 1, false); loadMem(b, 1, 11, 0, 1, false);
+										  b.insert(b.end(), { 0x38,0xC8 }); // cmp al,cl
+										  auto unequalByte = emitLocalJcc(b, 0x85);
+										  b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC3,0x49,0xFF,0xC8 });
+										  auto repeat = emitLocalJcc(b, 0x85); patchLocal(b, repeat, loop);
+										  const auto equal = b.size(); patchLocal(b, equalEmpty, equal);
+										  movImm(b, 0, 1); auto end = emitLocalJmp(b);
+										  const auto notEqual = b.size(); patchLocal(b, unequal, notEqual); patchLocal(b, unequalByte, notEqual);
+										  movImm(b, 0, 0); patchLocal(b, end, b.size()); storeSlot(b, 0, fn, i.destSlot); break;
+									  }
+									  case PMIROpcode::ByteCount: { if (i.srcSlots.size() != 1)throw std::runtime_error("byte count missing source"); loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 0, 10, 8, 8, false); storeSlot(b, 0, fn, i.destSlot); break; }
 									  case PMIROpcode::StringToText: { if (i.srcSlots.empty())throw std::runtime_error("string.to_text missing source"); initRichDest(b, fn, i.destSlot); loadSlot(b, 10, fn, i.srcSlots[0]); loadSlot(b, 11, fn, i.destSlot); copyFixed(b, 10, 11, 16); break; }
 									  case PMIROpcode::StringClear: { if (i.srcSlots.empty())throw std::runtime_error("string.clear missing source"); loadSlot(b, 11, fn, i.srcSlots[0]); movImm(b, 0, 0); storeMem(b, 11, 8, 0, 8); break; }
-									  case PMIROpcode::TextToString:throw std::runtime_error("native text.to_string requires the std.text.string allocation runtime; SAGE/PCIR preserve the alloc effect but this standalone PE backend has no allocator import yet");
+									  case PMIROpcode::StringMove: {
+										  if (i.srcSlots.size() != 1 || !i.destSlot || i.srcSlots[0] == i.destSlot)
+											  throw std::runtime_error("invalid consuming string move");
+										  loadSlot(b, 10, fn, i.srcSlots[0]);
+										  initRichDest(b, fn, i.destSlot);
+										  loadSlot(b, 11, fn, i.destSlot);
+										  copyFixed(b, 10, 11, 24);
+										  loadSlot(b, 10, fn, i.srcSlots[0]);
+										  zeroFixed(b, 10, 24);
+										  break;
+									  }
+									  case PMIROpcode::StringDispose: {
+										  if (i.srcSlots.size() != 1)throw std::runtime_error("string.dispose missing ownership source");
+										  loadSlot(b, 10, fn, i.srcSlots[0]);
+										  loadMem(b, 0, 10, 0, 8, false); b.insert(b.end(), { 0x48,0x85,0xC0 });
+										  auto noPointer = emitLocalJcc(b, 0x84);
+										  emitImportedCall(b, "GetProcessHeap", imports);
+										  movReg(b, 1, 0); // heap
+										  movImm(b, 2, 0); // flags
+										  loadSlot(b, 10, fn, i.srcSlots[0]);
+										  loadMem(b, 8, 10, 0, 8, false); // buffer address
+										  emitImportedCall(b, "HeapFree", imports);
+										  b.insert(b.end(), { 0x48,0x85,0xC0 });
+										  auto freed = emitLocalJcc(b, 0x85); b.insert(b.end(), { 0x0F,0x0B });
+										  patchLocal(b, freed, b.size()); patchLocal(b, noPointer, b.size());
+										  loadSlot(b, 11, fn, i.srcSlots[0]); zeroFixed(b, 11, 24);
+										  break;
+									  }
+									  case PMIROpcode::TextToString: {
+										  if (i.srcSlots.size() != 1)throw std::runtime_error("text.to_string requires one text input");
+										  // Owned string ABI {ptr,len,capacity}. The actual storage is obtained
+										  // from the Windows process heap and never aliases the source literal.
+										  initRichDest(b, fn, i.destSlot);
+										  loadSlot(b, 10, fn, i.srcSlots[0]);
+										  loadMem(b, 0, 10, 8, 8, false); // count
+										  // Distinct overflow guard for len+1; 0xffff... is unrepresentable.
+										  b.insert(b.end(), { 0x48,0x83,0xF8,0xFF });
+										  auto notOverflow = emitLocalJcc(b, 0x85);
+										  b.insert(b.end(), { 0x0F,0x0B });
+										  patchLocal(b, notOverflow, b.size());
+										  // GetProcessHeap() -> RAX
+										  emitImportedCall(b, "GetProcessHeap", imports);
+										  movReg(b, 1, 0); // RCX=heap
+										  movImm(b, 2, 8); // RDX=HEAP_ZERO_MEMORY
+										  loadSlot(b, 10, fn, i.srcSlots[0]);
+										  loadMem(b, 8, 10, 8, 8, false); // R8=byte count
+										  b.insert(b.end(), { 0x49,0xFF,0xC0 }); // inc r8; includes terminator
+										  emitImportedCall(b, "HeapAlloc", imports);
+										  b.insert(b.end(), { 0x48,0x85,0xC0 });
+										  auto allocated = emitLocalJcc(b, 0x85);
+										  b.insert(b.end(), { 0x0F,0x0B }); // terminal OOM trap
+										  patchLocal(b, allocated, b.size());
+										  movReg(b, 8, 0); // retain the allocated buffer pointer in volatile R8
+										  loadSlot(b, 11, fn, i.destSlot); // object header address
+										  storeMem(b, 11, 0, 0, 8); // ptr
+										  loadSlot(b, 10, fn, i.srcSlots[0]);
+										  loadMem(b, 9, 10, 8, 8, false); // r9 length (loop counter)
+										  storeMem(b, 11, 8, 9, 8); // count
+										  storeMem(b, 11, 16, 9, 8); // capacity: count bytes (+1 allocated for NUL)
+										  loadMem(b, 10, 10, 0, 8, false); // source pointer
+										  movReg(b, 11, 8); // destination byte buffer, not the object header
+										  b.insert(b.end(), { 0x4D,0x85,0xC9 }); // test r9,r9
+										  auto done = emitLocalJcc(b, 0x84);
+										  auto loop = b.size();
+										  loadMem(b, 0, 10, 0, 1, false);
+										  storeMem(b, 11, 0, 0, 1);
+										  b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC3,0x49,0xFF,0xC9 }); // inc r10; inc r11; dec r9
+										  auto again = emitLocalJcc(b, 0x85);
+										  patchLocal(b, again, loop);
+										  patchLocal(b, done, b.size());
+										  break;
+									  }
 									  case PMIROpcode::MakeAggregate: { auto lay = abi.layout(i.valueType); initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); for (std::size_t n = 0; n < i.srcSlots.size(); ++n) { const std::string field = n < i.argumentTypes.size() ? i.argumentTypes[n] : std::to_string(n); auto f = findField(lay, field); auto fl = abi.layout(f.typeName); storeValueInto(b, fn, i.srcSlots[n], 11, f.offset, fl); }break; }
 									  case PMIROpcode::ExtractField: { if (i.srcSlots.empty())throw std::runtime_error("aggregate.field missing source"); auto owner = abi.layout(i.typeName.empty() ? fn.slots.at(i.srcSlots[0]).type.name : i.typeName); auto f = findField(owner, i.literalText); auto fl = abi.layout(f.typeName); loadSlot(b, 10, fn, i.srcSlots[0]); loadValueFrom(b, fn, i.destSlot, 10, f.offset, fl); break; }
 									  case PMIROpcode::ResultOk:case PMIROpcode::ResultErr: { auto lay = abi.layout(i.valueType); initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); movImm(b, 0, i.op == PMIROpcode::ResultErr ? 1 : 0); storeMem(b, 11, static_cast<std::int32_t>(lay.tagOffset), 0, 1); if (!i.srcSlots.empty()) { const auto pt = abi.layout(i.op == PMIROpcode::ResultErr ? lay.errType : lay.okType); storeValueInto(b, fn, i.srcSlots[0], 11, lay.payloadOffset, pt); }break; }
+									  case PMIROpcode::ResultIsErr: { if (i.srcSlots.empty())throw std::runtime_error("result.is_err missing source"); auto lay = abi.layout(i.typeName.empty() ? fn.slots.at(i.srcSlots[0]).type.name : i.typeName); loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 0, 10, static_cast<std::int32_t>(lay.tagOffset), 1, false); storeSlot(b, 0, fn, i.destSlot); break; }
 									  case PMIROpcode::ResultTry: { if (i.srcSlots.empty())throw std::runtime_error("result.try missing source"); auto srcLay = abi.layout(i.typeName.empty() ? fn.slots.at(i.srcSlots[0]).type.name : i.typeName); loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 0, 10, static_cast<std::int32_t>(srcLay.tagOffset), 1, false); b.insert(b.end(), { 0x48,0x85,0xC0 }); auto ok = emitLocalJcc(b, 0x84); if (!fn.richReturn)throw std::runtime_error("result.try error propagation requires rich result return ABI"); auto dstLay = abi.layout(fn.returnValueType); loadRbp(b, 11, negDisp(fn.sretCellOffset)); movImm(b, 0, 1); storeMem(b, 11, static_cast<std::int32_t>(dstLay.tagOffset), 0, 1); auto errLay = abi.layout(srcLay.errType); movReg(b, 0, 10); if (srcLay.payloadOffset) { movImm(b, 9, srcLay.payloadOffset); b.insert(b.end(), { 0x4C,0x01,0xC8 }); }movReg(b, 10, 0); movReg(b, 0, 11); if (dstLay.payloadOffset) { movImm(b, 9, dstLay.payloadOffset); b.insert(b.end(), { 0x4C,0x01,0xC8 }); }movReg(b, 11, 0); copyFixed(b, 10, 11, errLay.size); loadRbp(b, 0, negDisp(fn.sretCellOffset)); epilogue(b); auto okAt = b.size(); patchLocal(b, ok, okAt); loadSlot(b, 10, fn, i.srcSlots[0]); auto okLay = abi.layout(srcLay.okType); loadValueFrom(b, fn, i.destSlot, 10, srcLay.payloadOffset, okLay); break; }
 									  case PMIROpcode::OptionSome:case PMIROpcode::OptionNone: { auto lay = abi.layout(i.valueType); if (lay.kind == ABIRepresentationKind::OptionBoolNiche) { movImm(b, 0, i.op == PMIROpcode::OptionNone ? 2 : 0); if (i.op == PMIROpcode::OptionSome && !i.srcSlots.empty())loadSlot(b, 0, fn, i.srcSlots[0]); storeSlot(b, 0, fn, i.destSlot); break; }if (lay.kind == ABIRepresentationKind::OptionCharNiche) { if (i.op == PMIROpcode::OptionNone)movImm(b, 0, 0x00110000u); else loadSlot(b, 0, fn, i.srcSlots.at(0)); storeSlot(b, 0, fn, i.destSlot); break; }initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); if (lay.kind == ABIRepresentationKind::OptionPointerNiche) { if (i.op == PMIROpcode::OptionNone)zeroFixed(b, 11, lay.size); else { auto vl = abi.layout(lay.valueType); storeValueInto(b, fn, i.srcSlots.at(0), 11, 0, vl); }break; }movImm(b, 0, i.op == PMIROpcode::OptionSome ? 1 : 0); storeMem(b, 11, 0, 0, 1); if (i.op == PMIROpcode::OptionSome) { auto vl = abi.layout(lay.valueType); storeValueInto(b, fn, i.srcSlots.at(0), 11, lay.payloadOffset, vl); }break; }
 									  case PMIROpcode::MakeClosure: { auto lay = abi.layout(i.valueType); initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); for (std::size_t n = 0; n < i.srcSlots.size() && n < lay.fields.size(); ++n) { auto fl = abi.layout(lay.fields[n].typeName); storeValueInto(b, fn, i.srcSlots[n], 11, lay.fields[n].offset, fl); }break; }
@@ -6652,8 +6988,8 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 											  for (const auto& i : b.instructions) {
 												  switch (i.op) {
 												  case IROpcode::ConstText:case IROpcode::CallClosure:
-												  case IROpcode::TextToString:case IROpcode::StringToText:case IROpcode::StringClear:
-												  case IROpcode::ResultOk:case IROpcode::ResultErr:case IROpcode::ResultTry:
+												  case IROpcode::TextToString:case IROpcode::StringToText:case IROpcode::StringClear:case IROpcode::StringDispose:case IROpcode::StringMove:case IROpcode::ByteCount:case IROpcode::TextEquals:
+												  case IROpcode::ResultOk:case IROpcode::ResultErr:case IROpcode::ResultIsErr:case IROpcode::ResultTry:
 												  case IROpcode::OptionSome:case IROpcode::OptionNone:
 												  case IROpcode::MakeAggregate:case IROpcode::ExtractField:case IROpcode::MakeClosure:
 													  throw std::runtime_error("C++20 backend cannot lower rich opcode " + std::to_string(static_cast<int>(i.op)));
@@ -6803,9 +7139,13 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 										  oss << "    /* text.to_string: allocates owned UTF-8 storage; rich portable runtime legalization required */\n"; break;
 									  case IROpcode::StringToText:
 										  oss << "    /* string.to_text: zero-copy immutable borrow; rich portable runtime legalization required */\n"; break;
+									  case IROpcode::TextEquals:throw std::runtime_error("C++20 exporter lacks text equality legalization");
+									  case IROpcode::ByteCount:throw std::runtime_error("C++20 exporter lacks rich byte-count legalization");
+									  case IROpcode::StringDispose:case IROpcode::StringMove:
+										  throw std::runtime_error("C++20 exporter lacks string disposal");
 									  case IROpcode::StringClear:
 										  oss << "    /* string.clear: requires exclusive/owned string authority; rich portable runtime legalization required */\n"; break;
-									  case IROpcode::ResultOk: case IROpcode::ResultErr: case IROpcode::ResultTry: case IROpcode::OptionSome: case IROpcode::OptionNone:
+									  case IROpcode::ResultOk: case IROpcode::ResultErr: case IROpcode::ResultIsErr: case IROpcode::ResultTry: case IROpcode::OptionSome: case IROpcode::OptionNone:
 									  case IROpcode::MakeAggregate: case IROpcode::ExtractField: case IROpcode::MakeClosure:
 										  oss << "    /* semantic PCIR op " << static_cast<int>(inst.op) << " requires portable aggregate runtime legalization */\n"; break;
 									  case IROpcode::Return:
@@ -6873,6 +7213,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 								  std::unordered_map<std::string, std::uint32_t> functionSizes;
 								  std::unordered_map<std::string, std::uint32_t> functionFrameSizes;
 								  std::unordered_map<std::string, std::uint32_t> unwindOffsets;
+								  std::vector<MachineProgram::ImportCall> importCalls;
 								  std::uint32_t entryPointOffset = 0;
 								  std::uint32_t entryPointRva = 0;
 								  std::uint32_t entrySectionIndex = 0;
@@ -6974,6 +7315,41 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 							  };
 
 							  class PECOFFGenerator {
+								  // Section-relative layout: 40-byte descriptor table, then ILT/IAT,
+								  // IMAGE_IMPORT_BY_NAME strings, and the DLL name. All RVA fixups are
+								  // resolved only after section layout, keeping PE layout deterministic.
+								  struct ImportLayout {
+									  std::vector<std::string> names;
+									  std::uint32_t ilt = 40, iat = 0, dll = 0;
+									  std::map<std::string, std::uint32_t> hintNames;
+									  std::uint32_t total = 0;
+								  };
+								  static ImportLayout describeImports(const std::vector<MachineProgram::ImportCall>& calls) {
+									  ImportLayout imp;
+									  const std::vector<std::string> canonical = { "GetProcessHeap","HeapAlloc","HeapFree" };
+									  std::set<std::string> used;
+									  for (const auto& c : calls) { if (std::find(canonical.begin(), canonical.end(), c.symbol) == canonical.end())throw std::runtime_error("unsupported Win32 import: " + c.symbol); used.insert(c.symbol); }
+									  for (const auto& c : canonical)if (used.contains(c))imp.names.push_back(c);
+									  imp.iat = imp.ilt + static_cast<std::uint32_t>((imp.names.size() + 1) * 8);
+									  std::uint32_t at = imp.iat + static_cast<std::uint32_t>((imp.names.size() + 1) * 8);
+									  for (const auto& name : imp.names) { if (at & 1)++at; imp.hintNames[name] = at; at += static_cast<std::uint32_t>(2 + name.size() + 1); }
+									  imp.dll = at;
+									  imp.total = at + static_cast<std::uint32_t>(sizeof("KERNEL32.dll"));
+									  return imp;
+								  }
+								  static std::vector<std::uint8_t> importSection(const ImportLayout& imp, std::uint32_t baseRva) {
+									  ByteBuffer out;
+									  if (imp.names.empty())return {};
+									  out.writeU32(baseRva + imp.ilt); out.writeU32(0); out.writeU32(0); out.writeU32(baseRva + imp.dll); out.writeU32(baseRva + imp.iat);
+									  for (int j = 0; j < 20; ++j)out.writeU8(0);
+									  for (const auto& name : imp.names)out.writeU64(baseRva + imp.hintNames.at(name)); out.writeU64(0);
+									  for (const auto& name : imp.names)out.writeU64(baseRva + imp.hintNames.at(name)); out.writeU64(0);
+									  for (const auto& name : imp.names) { out.align(2); out.writeU16(0); out.writeStringZ(name); }
+									  if (out.size() != imp.dll)throw std::runtime_error("internal PE import layout mismatch");
+									  out.writeStringZ("KERNEL32.dll");
+									  if (out.size() != imp.total)throw std::runtime_error("internal PE import size mismatch");
+									  return out.release();
+								  }
 							  public:
 								  std::vector<std::uint8_t> emitObject(const IRProgram& program, const std::string& entry = {}) const {
 									  const auto image = buildImage(program, false, entry);
@@ -6999,6 +7375,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 									  text.characteristics = 0x60000020u;
 									  text.data = machine.text;
 									  text.virtualSize = static_cast<std::uint32_t>(text.data.size());
+									  image.importCalls = machine.imports;
 									  image.functionOffsets = machine.functionOffsets;
 									  image.functionSizes = machine.functionSizes;
 									  image.entryPointOffset = machine.entryOffset;
@@ -7044,7 +7421,13 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 									  }
 									  image.sections.push_back(std::move(rdata));
 									  image.sections.push_back(std::move(data));
-									  image.sections.push_back(std::move(decl));
+									  if (!decl.data.empty())image.sections.push_back(std::move(decl));
+									  if (includeUnwind && !machine.imports.empty()) {
+										  PECOFFSection idata; idata.name = ".idata"; idata.characteristics = 0xC0000040u;
+										  idata.data.resize(describeImports(machine.imports).total, 0);
+										  idata.virtualSize = static_cast<std::uint32_t>(idata.data.size());
+										  image.sections.push_back(std::move(idata));
+									  }
 									  image.entrySectionIndex = 1;
 									  image.entryPointRva = image.sectionAlignment;
 
@@ -7145,6 +7528,24 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 										  patchSectionRawPointer(buffer, sectionInfo[i].headerOffset, rawPointer, static_cast<std::uint32_t>(image.sections[i].data.size()));
 									  }
 
+									  // COFF AMD64_REL32 relocations against undefined __imp_ symbols.
+									  // Section symbols are listed first, then local functions, then imports.
+									  if (!image.importCalls.empty()) {
+										  if (image.importCalls.size() > 65535u)throw std::runtime_error("too many COFF relocations");
+										  buffer.align(4);
+										  const std::uint32_t relocOffset = static_cast<std::uint32_t>(buffer.size());
+										  std::vector<std::string> importNames;
+										  for (const auto& c : image.importCalls) if (std::find(importNames.begin(), importNames.end(), c.symbol) == importNames.end())importNames.push_back(c.symbol);
+										  for (const auto& c : image.importCalls) {
+											  const auto it = std::find(importNames.begin(), importNames.end(), c.symbol);
+											  buffer.writeU32(static_cast<std::uint32_t>(c.dispPos));
+											  buffer.writeU32(static_cast<std::uint32_t>(image.sections.size() + image.functionNames.size() + std::distance(importNames.begin(), it)));
+											  buffer.writeU16(0x0004); // IMAGE_REL_AMD64_REL32
+										  }
+										  // IMAGE_SECTION_HEADER: PointerToRelocations + NumberOfRelocations.
+										  buffer.patchU32(sectionInfo[0].headerOffset + 24, relocOffset);
+										  buffer.patchU16(sectionInfo[0].headerOffset + 32, static_cast<std::uint16_t>(image.importCalls.size()));
+									  }
 									  const std::size_t symbolTableOffset = buffer.size();
 									  std::vector<std::pair<std::string, std::uint32_t>> stringTableEntries;
 									  std::size_t symbolCount = 0;
@@ -7159,6 +7560,12 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 										  ++symbolCount;
 									  }
 
+									  std::vector<std::string> importNames;
+									  for (const auto& c : image.importCalls) if (std::find(importNames.begin(), importNames.end(), c.symbol) == importNames.end())importNames.push_back(c.symbol);
+									  for (const auto& name : importNames) {
+										  writeSymbol(buffer, "__imp_" + name, 0, 0, 2, 0, stringTableEntries);
+										  ++symbolCount;
+									  }
 									  ByteBuffer stringTable;
 									  std::uint32_t stringTableSize = 4;
 									  for (const auto& entry : stringTableEntries) {
@@ -7210,6 +7617,25 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 										  pdataSection->data = pd.release(); pdataSection->virtualSize = static_cast<std::uint32_t>(pdataSection->data.size());
 									  }
 
+									  if (!image.importCalls.empty()) {
+										  auto idata = std::find_if(image.sections.begin(), image.sections.end(), [](const PECOFFSection& s) {return s.name == ".idata"; });
+										  if (idata == image.sections.end())throw std::runtime_error("native imports require .idata");
+										  const ImportLayout imp = describeImports(image.importCalls);
+										  idata->data = importSection(imp, idata->virtualAddress);
+										  std::map<std::string, std::size_t> indices;
+										  for (std::size_t j = 0; j < imp.names.size(); ++j)indices[imp.names[j]] = j;
+										  auto& code = image.sections.front().data;
+										  for (const auto& fix : image.importCalls) {
+											  auto index = indices.find(fix.symbol);
+											  if (index == indices.end())throw std::runtime_error("unresolved imported routine " + fix.symbol);
+											  std::int64_t dest = static_cast<std::int64_t>(idata->virtualAddress + imp.iat + index->second * 8u);
+											  std::int64_t src = static_cast<std::int64_t>(image.sections.front().virtualAddress + fix.dispPos + 4u);
+											  auto rel = dest - src;
+											  if (rel<std::numeric_limits<std::int32_t>::min() || rel>std::numeric_limits<std::int32_t>::max())throw std::runtime_error("import IAT displacement exceeds 32-bit range");
+											  if (fix.dispPos + 4 > code.size())throw std::runtime_error("import call relocation outside .text");
+											  for (int k = 0; k < 4; ++k)code[fix.dispPos + k] = static_cast<std::uint8_t>((static_cast<std::uint32_t>(rel) >> (8 * k)) & 255);
+										  }
+									  }
 									  ByteBuffer buffer;
 									  writeDosHeader(buffer, 0x80);
 									  buffer.align(0x80);
@@ -7333,17 +7759,29 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 									  buffer.writeU32(headersSize);
 									  buffer.writeU32(0);
 									  buffer.writeU16(3);
-									  buffer.writeU16(0x8160);
+									  // Do not advertise ASLR/high-entropy VA while this linker still lacks
+									  // an image base-relocation directory. Keep NX compatibility and
+									  // terminal-server awareness; ASLR is a release-blocking linker task.
+									  buffer.writeU16(0x8100);
 									  buffer.writeU64(0x100000);
 									  buffer.writeU64(0x1000);
 									  buffer.writeU64(0x100000);
 									  buffer.writeU64(0x1000);
 									  buffer.writeU32(0);
 									  buffer.writeU32(16);
-									  std::uint32_t exceptionRva = 0, exceptionSize = 0;
-									  for (const auto& sec : image.sections) if (sec.name == ".pdata") { exceptionRva = sec.virtualAddress; exceptionSize = sec.virtualSize; }
+									  std::uint32_t exceptionRva = 0, exceptionSize = 0, importRva = 0, importSize = 0, iatRva = 0, iatSize = 0;
+									  for (const auto& sec : image.sections) {
+										  if (sec.name == ".pdata") { exceptionRva = sec.virtualAddress; exceptionSize = sec.virtualSize; }
+										  if (sec.name == ".idata") {
+											  importRva = sec.virtualAddress; importSize = 40;
+											  const auto imp = describeImports(image.importCalls);
+											  iatRva = sec.virtualAddress + imp.iat; iatSize = static_cast<std::uint32_t>((imp.names.size() + 1) * 8);
+										  }
+									  }
 									  for (int i = 0; i < 16; ++i) {
-										  if (i == 3) { buffer.writeU32(exceptionRva); buffer.writeU32(exceptionSize); }
+										  if (i == 1) { buffer.writeU32(importRva); buffer.writeU32(importSize); }
+										  else if (i == 3) { buffer.writeU32(exceptionRva); buffer.writeU32(exceptionSize); }
+										  else if (i == 12) { buffer.writeU32(iatRva); buffer.writeU32(iatSize); }
 										  else { buffer.writeU32(0); buffer.writeU32(0); }
 									  }
 								  }
@@ -7362,9 +7800,9 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 								  case IROpcode::Gt: return "gt"; case IROpcode::Ge: return "ge"; case IROpcode::And: return "and";
 								  case IROpcode::Or: return "or"; case IROpcode::Phi: return "phi"; case IROpcode::Branch: return "br";
 								  case IROpcode::BranchIf: return "br.if"; case IROpcode::Call: return "call"; case IROpcode::CallClosure: return "call.closure";
-								  case IROpcode::TextToString: return "text.to_string"; case IROpcode::StringToText: return "string.to_text"; case IROpcode::StringClear: return "string.clear";
+								  case IROpcode::TextToString: return "text.to_string"; case IROpcode::StringToText: return "string.to_text"; case IROpcode::StringClear: return "string.clear"; case IROpcode::StringDispose: return "string.dispose"; case IROpcode::StringMove:return "string.move"; case IROpcode::ByteCount: return "text.count"; case IROpcode::TextEquals: return "text.equals";
 								  case IROpcode::MakeAggregate: return "aggregate.make"; case IROpcode::ExtractField: return "aggregate.field";
-								  case IROpcode::ResultOk: return "result.ok"; case IROpcode::ResultErr: return "result.err"; case IROpcode::ResultTry: return "result.try";
+								  case IROpcode::ResultOk: return "result.ok"; case IROpcode::ResultErr: return "result.err"; case IROpcode::ResultIsErr: return "result.is_err"; case IROpcode::ResultTry: return "result.try";
 								  case IROpcode::OptionSome: return "option.some"; case IROpcode::OptionNone: return "option.none"; case IROpcode::MakeClosure: return "closure.make";
 								  case IROpcode::Return: return "ret"; case IROpcode::Nop: return "nop";
 								  }
@@ -7518,9 +7956,19 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 								  if (!CreateProcessA(nullptr, mutableCommand.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
 									  throw std::runtime_error("failed to launch native executable (Win32 error " + std::to_string(GetLastError()) + ")");
 								  }
-								  WaitForSingleObject(pi.hProcess, INFINITE);
-								  DWORD exitCode = 0; GetExitCodeProcess(pi.hProcess, &exitCode);
+								  const DWORD waitState = WaitForSingleObject(pi.hProcess, 30000);
+								  if (waitState != WAIT_OBJECT_0) {
+									  if (waitState == WAIT_TIMEOUT) (void)TerminateProcess(pi.hProcess, 124);
+									  CloseHandle(pi.hThread);
+									  CloseHandle(pi.hProcess);
+									  throw std::runtime_error(waitState == WAIT_TIMEOUT
+										  ? "native executable exceeded 30-second execution deadline"
+										  : "failed while waiting for native executable");
+								  }
+								  DWORD exitCode = 0;
+								  const BOOL codeOK = GetExitCodeProcess(pi.hProcess, &exitCode);
 								  CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+								  if (!codeOK) throw std::runtime_error("GetExitCodeProcess failed");
 								  return static_cast<int>(exitCode);
 #else
 								  (void)exe;
@@ -7528,17 +7976,37 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 #endif
 							  }
 
-							  // Linux/x86-64 differential execution of the Windows-x64 calling convention.
-							  // This executes emitted machine .text bytes; it is NOT PE loader emulation.
-							  // Only self-contained images (no external Win32 API calls) are executable here.
+							  // Linux/x86-64 differential execution of Windows-x64 machine code.
+							  // The import slots are resolved to ABI-compatible host shims: this tests the
+							  // generated Windows x64 calls but is not an emulation of the Windows loader.
 #if defined(__linux__) && defined(__x86_64__)
+							  static std::unordered_set<void*> pcn_test_live_heap;
+							  static std::size_t pcn_test_heap_allocs = 0, pcn_test_heap_frees = 0;
+							  extern "C" __attribute__((ms_abi)) void* pcn_test_GetProcessHeap() { return reinterpret_cast<void*>(1); }
+							  extern "C" __attribute__((ms_abi)) void* pcn_test_HeapAlloc(void*, std::uint32_t flags, std::size_t count) {
+								  void* ptr = (flags & 8u) ? std::calloc(1, std::max<std::size_t>(count, 1)) : std::malloc(std::max<std::size_t>(count, 1));
+								  if (ptr) { pcn_test_live_heap.insert(ptr); ++pcn_test_heap_allocs; }
+								  return ptr;
+							  }
+							  extern "C" __attribute__((ms_abi)) int pcn_test_HeapFree(void*, std::uint32_t, void* pointer) {
+								  if (!pointer || pcn_test_live_heap.erase(pointer) != 1)return 0;
+								  std::free(pointer); ++pcn_test_heap_frees; return 1;
+							  }
+							  static void* hostImport(const std::string& name) {
+								  if (name == "GetProcessHeap")return reinterpret_cast<void*>(&pcn_test_GetProcessHeap);
+								  if (name == "HeapAlloc")return reinterpret_cast<void*>(&pcn_test_HeapAlloc);
+								  if (name == "HeapFree")return reinterpret_cast<void*>(&pcn_test_HeapFree);
+								  throw std::runtime_error("no host-side Win64 ABI shim for " + name);
+							  }
 							  static std::int64_t executeEmittedMachineText(const MachineProgram& machine) {
 								  if (machine.text.empty() || machine.entryOffset >= machine.text.size())
 									  throw std::runtime_error("cannot execute empty or invalid machine entry");
 								  const long rawPage = sysconf(_SC_PAGESIZE);
 								  if (rawPage <= 0) throw std::runtime_error("cannot determine memory page size");
 								  const std::size_t page = static_cast<std::size_t>(rawPage);
-								  const std::size_t length = ((machine.text.size() + page - 1) / page) * page;
+								  const std::size_t importBase = (machine.text.size() + 7u) & ~std::size_t{ 7 };
+								  const std::size_t used = importBase + machine.imports.size() * sizeof(void*);
+								  const std::size_t length = ((used + page - 1) / page) * page;
 								  void* region = mmap(nullptr, length, PROT_READ | PROT_WRITE,
 									  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 								  if (region == MAP_FAILED) throw std::runtime_error("machine-text mapping failed");
@@ -7547,12 +8015,87 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 									  ~MappingGuard() { if (base != MAP_FAILED) munmap(base, size); }
 								  } guard{ region, length };
 								  std::memcpy(region, machine.text.data(), machine.text.size());
+								  for (std::size_t n = 0; n < machine.imports.size(); ++n) {
+									  const auto& fix = machine.imports[n];
+									  if (fix.dispPos + 4 > machine.text.size())throw std::runtime_error("invalid host imported call relocation");
+									  void* target = hostImport(fix.symbol);
+									  std::memcpy(static_cast<unsigned char*>(region) + importBase + n * 8, &target, sizeof(target));
+									  const std::int64_t rel = static_cast<std::int64_t>(importBase + n * 8) - static_cast<std::int64_t>(fix.dispPos + 4);
+									  const auto disp = static_cast<std::int32_t>(rel);
+									  for (int k = 0; k < 4; ++k)static_cast<unsigned char*>(region)[fix.dispPos + k] = static_cast<unsigned char>((static_cast<std::uint32_t>(disp) >> (8 * k)) & 255);
+								  }
 								  if (mprotect(region, length, PROT_READ | PROT_EXEC) != 0)
 									  throw std::runtime_error("machine-text executable protection failed");
 								  using WinX64Entry = std::int64_t(__attribute__((ms_abi))*)();
 								  auto* address = static_cast<unsigned char*>(region) + machine.entryOffset;
 								  auto entry = reinterpret_cast<WinX64Entry>(address);
-								  return entry();
+								  const auto result = entry();
+								  if (!pcn_test_live_heap.empty() || pcn_test_heap_allocs != pcn_test_heap_frees)
+									  throw std::runtime_error("native differential execution leaked owned Windows heap storage");
+								  return result;
+							  }
+							  // Never execute untrusted generated machine code in the compiler process.
+							  // A signal, recursion overflow, or infinite loop must not kill the compiler.
+							  static std::int64_t executeEmittedMachineTextIsolated(const MachineProgram& machine,
+								  std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+								  int channel[2];
+								  if (pipe(channel) != 0) throw std::runtime_error("native test: pipe failed");
+								  pid_t pid = fork();
+								  if (pid < 0) { close(channel[0]); close(channel[1]); throw std::runtime_error("native test: fork failed"); }
+								  if (pid == 0) {
+									  close(channel[0]);
+									  struct rlimit core = { 0, 0 };
+									  (void)setrlimit(RLIMIT_CORE, &core);
+									  struct rlimit mem = { 512ull * 1024 * 1024, 512ull * 1024 * 1024 };
+									  (void)setrlimit(RLIMIT_AS, &mem);
+									  try {
+										  auto result = executeEmittedMachineText(machine);
+										  const auto* data = reinterpret_cast<const char*>(&result);
+										  std::size_t sent = 0;
+										  while (sent < sizeof(result)) {
+											  const ssize_t n = write(channel[1], data + sent, sizeof(result) - sent);
+											  if (n <= 0) _exit(123);
+											  sent += static_cast<std::size_t>(n);
+										  }
+										  _exit(0);
+									  }
+									  catch (...) { _exit(124); }
+								  }
+								  close(channel[1]);
+								  const auto deadline = std::chrono::steady_clock::now() + timeout;
+								  int status = 0;
+								  for (;;) {
+									  const auto done = waitpid(pid, &status, WNOHANG);
+									  if (done == pid) break;
+									  if (done < 0) { close(channel[0]); throw std::runtime_error("native test: waitpid failed"); }
+									  if (std::chrono::steady_clock::now() >= deadline) {
+										  kill(pid, SIGKILL);
+										  (void)waitpid(pid, &status, 0);
+										  close(channel[0]);
+										  throw std::runtime_error("native test: generated program exceeded execution deadline");
+									  }
+									  usleep(10000);
+								  }
+								  if (WIFSIGNALED(status)) {
+									  close(channel[0]);
+									  throw std::runtime_error("native test: generated machine code terminated by signal " +
+										  std::to_string(WTERMSIG(status)));
+								  }
+								  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+									  close(channel[0]);
+									  throw std::runtime_error("native test: generated machine code did not return successfully");
+								  }
+								  std::int64_t value = 0;
+								  char* data = reinterpret_cast<char*>(&value);
+								  std::size_t got = 0;
+								  while (got < sizeof(value)) {
+									  ssize_t n = read(channel[0], data + got, sizeof(value) - got);
+									  if (n <= 0) break;
+									  got += static_cast<std::size_t>(n);
+								  }
+								  close(channel[0]);
+								  if (got != sizeof(value)) throw std::runtime_error("native test: incomplete result from child");
+								  return value;
 							  }
 #endif
 
@@ -7560,11 +8103,119 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 								  auto p = source; p.replace_extension(extension); return p;
 							  }
 
+
+							  // Optional external COFF link adapter. Native PCIR/PMIR emission remains ours;
+							  // an installed lld-link performs arbitrary third-party COFF/archive resolution.
+							  // This deliberately does not claim to be Paracine's future built-in linker.
+							  static int executeArgv(const std::vector<std::string>& argv) {
+								  if (argv.empty())throw std::runtime_error("external linker command is empty");
+#ifdef _WIN32
+								  auto wide = [](const std::string& s)->std::wstring {
+									  if (s.empty())return {};
+									  const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+									  if (n <= 0)throw std::runtime_error("invalid UTF-8 in linker argument");
+									  std::wstring out(static_cast<std::size_t>(n), L'\0');
+									  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), static_cast<int>(s.size()), out.data(), n) != n)
+										  throw std::runtime_error("linker argument conversion failed");
+									  return out;
+									  };
+								  auto quote = [](const std::wstring& a)->std::wstring {
+									  std::wstring out = L"\""; std::size_t slash = 0;
+									  for (wchar_t ch : a) {
+										  if (ch == L'\\') { ++slash; continue; }
+										  if (ch == L'"') { out.append(slash * 2 + 1, L'\\'); out += ch; slash = 0; continue; }
+										  out.append(slash, L'\\'); slash = 0; out += ch;
+									  }
+									  out.append(slash * 2, L'\\'); out += L'"'; return out;
+									  };
+								  std::wstring cmd;
+								  for (const auto& a : argv) { if (!cmd.empty())cmd += L' '; cmd += quote(wide(a)); }
+								  std::vector<wchar_t> mutableCmd(cmd.begin(), cmd.end()); mutableCmd.push_back(L'\0');
+								  STARTUPINFOW si{}; si.cb = sizeof(si); PROCESS_INFORMATION pi{};
+								  if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
+									  throw std::runtime_error("cannot start external linker (lld-link or configured path): Win32 error " + std::to_string(GetLastError()));
+								  CloseHandle(pi.hThread);
+								  DWORD exitCode = 1;
+								  const DWORD waited = WaitForSingleObject(pi.hProcess, INFINITE);
+								  if (waited == WAIT_OBJECT_0)GetExitCodeProcess(pi.hProcess, &exitCode);
+								  CloseHandle(pi.hProcess);
+								  if (waited != WAIT_OBJECT_0)throw std::runtime_error("external linker process wait failed");
+								  return static_cast<int>(exitCode);
+#else
+								  pid_t pid = fork();
+								  if (pid < 0)throw std::runtime_error("failed to create external linker process");
+								  if (pid == 0) {
+									  std::vector<char*> raw; raw.reserve(argv.size() + 1);
+									  for (const auto& a : argv)raw.push_back(const_cast<char*>(a.c_str())); raw.push_back(nullptr);
+									  execvp(raw.front(), raw.data()); _exit(127);
+								  }
+								  int status = 0;
+								  while (waitpid(pid, &status, 0) < 0) { if (errno == EINTR)continue; throw std::runtime_error("failed waiting for external linker"); }
+								  if (!WIFEXITED(status))throw std::runtime_error("external linker terminated abnormally");
+								  return WEXITSTATUS(status);
+#endif
+							  }
+
+							  static int runExternalCOFFLink(const std::vector<std::string>& args) {
+								  std::string source, output, entry = "main", executable = "lld-link", subsystem = "console";
+								  std::vector<std::string> otherInputs, searchPaths;
+								  bool dll = false;
+								  for (std::size_t i = 1; i < args.size(); ++i) {
+									  const auto& a = args[i];
+									  if ((a == "-o" || a == "--out") && i + 1 < args.size())output = args[++i];
+									  else if (a == "--entry" && i + 1 < args.size())entry = args[++i];
+									  else if (a == "--linker" && i + 1 < args.size())executable = args[++i];
+									  else if (a == "--libpath" && i + 1 < args.size())searchPaths.push_back(args[++i]);
+									  else if (a == "--subsystem" && i + 1 < args.size())subsystem = args[++i];
+									  else if (a == "--dll")dll = true;
+									  else if (a.size() && a[0] == '-')throw std::runtime_error("unsupported link argument: " + a);
+									  else if (std::filesystem::path(a).extension() == ".pcn") {
+										  if (!source.empty())throw std::runtime_error("link currently accepts one .pcn compilation unit; additional input must be COFF .obj/.lib");
+										  source = a;
+									  }
+									  else {
+										  auto ext = std::filesystem::path(a).extension().string();
+										  if (ext != ".obj" && ext != ".lib" && ext != ".res")throw std::runtime_error("external link input must be .pcn, .obj, .lib, or .res: " + a);
+										  if (!std::filesystem::exists(a))throw std::runtime_error("external link input does not exist: " + a);
+										  otherInputs.push_back(a);
+									  }
+								  }
+								  if (source.empty() && otherInputs.empty())throw std::runtime_error("link requires .pcn or COFF objects/libraries");
+								  if (subsystem != "console" && subsystem != "windows")throw std::runtime_error("link subsystem must be console or windows");
+								  if (output.empty()) {
+									  std::filesystem::path sample = source.empty() ? std::filesystem::path(otherInputs.front()) : std::filesystem::path(source);
+									  sample.replace_extension(dll ? ".dll" : ".exe"); output = sample.string();
+								  }
+								  struct Scratch { std::filesystem::path filename; ~Scratch() { std::error_code ec; if (!filename.empty())std::filesystem::remove(filename, ec); } } scratch;
+								  if (!source.empty()) {
+									  auto options = CompilerOptions{};
+									  const auto artifacts = compileAll(readSourceFile(source), options, false);
+									  if (!artifacts.analysis.succeeded()) { printSemanticDiagnostics(artifacts.analysis); return 1; }
+									  const auto obj = PECOFFGenerator{}.emitObject(artifacts.pcir, entry);
+									  scratch.filename = std::filesystem::path(output);
+									  scratch.filename += ".paracine-link-temp.obj";
+									  writeBinaryFile(scratch.filename, obj);
+								  }
+								  std::vector<std::string> invocation = { executable,"/nologo","/machine:x64","/nodefaultlib","/out:" + output };
+								  invocation.push_back("/subsystem:" + subsystem);
+								  if (dll) { invocation.push_back("/dll"); invocation.push_back("/noentry"); }
+								  else invocation.push_back("/entry:" + entry);
+								  for (const auto& dir : searchPaths)invocation.push_back("/libpath:" + dir);
+								  if (!scratch.filename.empty())invocation.push_back(scratch.filename.string());
+								  for (const auto& arg : otherInputs)invocation.push_back(arg);
+								  const int result = executeArgv(invocation);
+								  if (result)throw std::runtime_error("external COFF link failed with exit code " + std::to_string(result));
+								  if (!std::filesystem::exists(output))throw std::runtime_error("external linker succeeded without producing output");
+								  std::cout << "external COFF link succeeded: " << output << "\n";
+								  return 0;
+							  }
+
 							  static void printHelp(std::ostream& os) {
 								  os <<
 									  "PARACINE 2026 native compiler\n\n"
 									  "Usage:\n"
 									  "  paracine build <file.pcn> [-o file.exe] [-O0|-O1|-O2|-O3] [--entry name]\n"
+									  "  paracine link [file.pcn] [third-party.obj/.lib/.res ...] [-o file.exe] [--entry main] [--dll] [--libpath dir] [--linker lld-link]\n"
 									  "  paracine run <file.pcn> [-O0|-O1|-O2|-O3] [--entry name]\n"
 									  "  paracine check <file.pcn>\n"
 									  "  paracine sage <file.pcn> [-o file.skm]\n"
@@ -7589,6 +8240,7 @@ int main(int argc, char** argv) {
 	if (argc < 2) { pcn::printHelp(std::cout); return 0; }
 	try {
 		std::vector<std::string> args; for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
+		if (args[0] == "link")return pcn::runExternalCOFFLink(args);
 		auto isSource = [](const std::string& s) { return std::filesystem::path(s).extension() == ".pcn"; };
 		std::string command, emitKind, sourceArg, outputArg, legacyMode;
 		pcn::CompilerOptions options;
@@ -7655,20 +8307,19 @@ int main(int argc, char** argv) {
 		if (command == "cpp") { pcn::CppIREmitter e; auto text = e.emit(artifacts.pcir); if (outputArg.empty())std::cout << text; else pcn::writeTextFile(outputArg, text); return 0; }
 
 		if (command == "run") {
-			pcn::PCIRInterpreter oracle(artifacts.pcir); auto oracleResult = oracle.run(options.entry);
+			// `run` executes native output once. The independent `test` command
+			// performs oracle/native differential execution.
 			pcn::PECOFFGenerator generator; auto bytes = generator.emitExecutable(artifacts.pcir, options.entry);
 			auto exe = pcn::withExtension(sourcePath, ".exe"); pcn::writeBinaryFile(exe, bytes);
 #ifdef _WIN32
 			int nativeResult = pcn::runNativeExecutable(exe);
-			if (static_cast<std::int64_t>(nativeResult) != oracleResult) { std::cerr << "native/oracle mismatch: native=" << nativeResult << " PCIR=" << oracleResult << "\n"; return 2; }
-			std::cout << "Paracine run completed with exit code " << nativeResult << " (PCIR oracle matched).\n"; return nativeResult;
+			std::cout << "Paracine run completed with native exit code " << nativeResult << ".\n"; return nativeResult;
 #elif defined(__linux__) && defined(__x86_64__)
-			auto nativeResult = pcn::executeEmittedMachineText(artifacts.machine);
-			if (nativeResult != oracleResult) { std::cerr << "emitted-x64/oracle mismatch: x64=" << nativeResult << " PCIR=" << oracleResult << "\n"; return 2; }
-			std::cout << "Paracine run: emitted x86-64 executed (Microsoft x64 ABI), exit=" << nativeResult << "; oracle matched. PE image: " << exe.string() << "\n";
+			auto nativeResult = pcn::executeEmittedMachineTextIsolated(artifacts.machine);
+			std::cout << "Paracine run: isolated emitted x86-64 execution (Microsoft x64 ABI), exit=" << nativeResult << "; PE image: " << exe.string() << "\n";
 			return static_cast<int>(nativeResult);
 #else
-			std::cout << "Paracine PCIR oracle result: " << oracleResult << ". PE32+ emitted to " << exe.string() << "; native execution requires Windows x86-64.\n"; return 0;
+			std::cout << "PE32+ emitted to " << exe.string() << "; execution requires Windows x86-64.\n"; return 0;
 #endif
 		}
 		if (command == "test") {
@@ -7676,7 +8327,7 @@ int main(int argc, char** argv) {
 			pcn::PECOFFGenerator generator; auto obj = generator.emitObject(artifacts.pcir, options.entry); auto pe = generator.emitExecutable(artifacts.pcir, options.entry);
 			if (obj.empty() || pe.empty())throw std::runtime_error("native backend emitted empty artifact");
 #if defined(__linux__) && defined(__x86_64__)
-			const auto native = pcn::executeEmittedMachineText(artifacts.machine);
+			const auto native = pcn::executeEmittedMachineTextIsolated(artifacts.machine);
 			if (native != value) { std::cerr << "Paracine test FAILED: emitted x64=" << native << ", oracle=" << value << "\n"; return 2; }
 			std::cout << "Paracine test passed: emitted x64=" << native << ", PCIR oracle=" << value << "; COFF and PE32+ generated.\n";
 #elif defined(_WIN32)
