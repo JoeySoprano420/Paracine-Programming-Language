@@ -49,3 +49,32 @@ routine main(args: view<text>) gives int
     let result = sum_numbers(args)
     print_result(result)
     give 0
+
+routine square(x: double) gives double
+    give x * x
+
+routine main() gives int
+    let x: double = 1.5
+    let y: double = square(x)
+    let z: double = y + 0.75
+
+    if z == 3.0
+        give 31
+
+    give 1
+
+record Point
+    x: int
+    y: int
+
+routine main() gives int with trap
+    var numbers: array<int,3> = [3, 4, 5]
+
+    numbers[1] = 17
+
+    var point: Point = Point{x: 1, y: 2}
+    point.x = numbers[1]
+
+    give point.x + point.y
+
+
