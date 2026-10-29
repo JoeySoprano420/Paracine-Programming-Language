@@ -6122,3 +6122,142 @@ On Windows, add Paracine_Backend_Expanded.cpp to an x64 C++23 Visual Studio proj
 
 ## *** ##
 
+
+
+Build and verification
+Paracine is currently an experimental Windows-x64 compiler, implemented in C++23. This package has a genuine, import-backed Windows process heap path for owning UTF-8 strings and real COFF imported-symbol relocations. It does not implement a general Windows linker or full Paracine edition-2026 semantics.
+Windows (Visual Studio 2022)
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+.\build\Debug\paracine.exe check .\tests\heap_contents.pcn
+.\build\Debug\paracine.exe test .\tests\heap_contents.pcn
+.\build\Debug\paracine.exe build .\tests\heap_contents.pcn -o heap_contents.exe
+.\build\Debug\paracine.exe obj .\tests\heap_contents.pcn -o heap_contents.obj
+The emitted PE requires KERNEL32's GetProcessHeap, HeapAlloc, HeapFree; these are loaded via the emitted PE import address table. A Windows test runner should actually load the executable; an import-table parser alone is not enough.
+Linux developer / native instruction differential testing
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DPARACINE_ENABLE_TESTS=ON
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+python3 tests/conformance.py --compiler build/paracine --root .
+On Linux/x86-64, paracine test maps emitted Microsoft-x64 ABI code inside a restricted child process. The native imported calls are rebound to special ms_abi test shims. It is not an emulation of the Windows PE loader.
+Host reference runtime with sanitizers
+clang++ -std=c++23 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer tests/runtime_test.cpp -o runtime_san
+ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 ./runtime_san
+Regression cases
+- heap_contents.pcn: literal UTF-8 to owned string, zero-copy view, actual content equality, explicit free.
+- heap_contents_false.pcn: unequal text contents must compare false.
+- heap_count.pcn: byte count returned through native registers.
+- heap_empty.pcn: zero-length text -> allocated empty string -> safe free.
+- heap_utf8.pcn: multibyte UTF-8 bytes, not codepoint count.
+- heap_clear.pcn: mutable clear preserves own allocation; subsequent explicit free.
+- dispose_use_after_move.pcn: rejecting use-after-dispose.
+- dispose_borrow_conflict.pcn: rejecting exclusive destruction overlapping a borrowed text view.
+- borrowed_dispose_rejected.pcn: var borrow cannot free someone else's owned allocation.
+- imports_check.py: independent verification of PE imports and COFF rel32 fixups.
+A passing regression suite is not evidence that the entire language is conformant; refer to IMPLEMENTATION_STATUS.md.
+
+## *** ##
+
+
+Paracine: native heap imports and owning UTF-8 runtime integration
+Classification: experimental native compiler upgrade, not conformant Paracine 1.0.
+
+This patch is based directly on Paracine_Production_Hardening.cpp. It preserves the existing SAGE → PCIR → optimized PCIR → PMIR → x86-64 encoder and COFF/PE32+ writers. It does not introduce LLVM or rely on an external assembler/linker for supported internal routines and imported heap APIs.
+Implemented in this release
+- Win64 allocation path: PCIR text.to_string now emits real Microsoft x64 calls to GetProcessHeap and HeapAlloc through a PE32+ .idata import-address table, allocates its own byte storage, copies UTF-8, NUL-terminates storage, and materializes the 24-byte {ptr,count,capacity} native string value. Zero-length text receives a distinct heap allocation.
+- Explicit ownership release: string.dispose() emits GetProcessHeap+`HeapFree` and zeros the object. This is a consuming operation; the semantic analysis rejects a subsequent use (E0412), disposal through var/shared parameter borrows (E0422), and disposal across an overlapping text-view borrow (E0416). Immutable owned locals may be consumed.
+- Read-only rich operations: text.count()/`string.count()` read the UTF-8 byte count in native code. text.equals(text) compares the actual bytes with bounds-aware short-circuiting. Differential tests prove the heap clone matches the source literal byte-for-byte.
+- Native PE import handling: a deterministic .idata section with import descriptors, import lookup and address tables, IMAGE_IMPORT_BY_NAME entries, and Win32 DLL name KERNEL32.dll is now emitted only when needed. The linker patches RIP-relative imported call sites to IAT slots. objdump -x recognizes the import directory and each method.
+- COFF imported-symbol relocation: .obj emission writes IMAGE_REL_AMD64_REL32 records referring to undefined __imp_ symbols, and correct section relocation pointers/counts. Independent parsing and objdump -r confirm the fixups.
+- Isolated Linux ABI test import resolution: executable memory maps test-specific import slots pointing to ms_abi host shims. This checks the actual generated machine instructions, not a Windows loader. Host-side tracking rejects leaks and double frees during the differential execution tests.
+- C++23 host reference runtime: runtime/paracine_runtime.hpp includes strict UTF-8 validation, ABI-sized borrowed Text, owned move-only RAII String, fallible allocation, reserve and append, explicit null sentinels, and deterministic release. It is tested separately with AddressSanitizer/UBSan. It is not yet a complete language-level stdlib.
+Verification performed in this environment
+- cmake --build: passed (GCC C++23).
+- ctest: passed 2/2 suites.
+- tests/conformance.py: 90/90 assertions passed, including the existing scalar/rich/closure/result/control-flow regression cases and heap cases across -O0/`-O1`/`-O2`/`-O3`.
+- clang++ -std=c++23 -Wall -Wextra -pedantic -fsyntax-only: passed without diagnostics.
+- g++ -std=c++23 -O2 executable: built, new native UTF-8 content comparison test passed at -O3.
+- Host reference runtime with clang++ -fsanitize=address,undefined: passed (including leak detection).
+- objdump -x: valid PE32+ import directory with GetProcessHeap, HeapAlloc, HeapFree, Windows x64 unwind data.
+- objdump -r and tests/imports_check.py: valid COFF AMD64_REL32 relocation records.
+Not verified: Actual Windows loader execution, MSVC compiler build, external archive linking, Windows ASLR/rebasing, full Windows ABI conformance, fuzzing across malicious COFF/PE inputs, or a professional security audit. The included Windows CI job is a proposed automatic check; it is not evidence of a completed run.
+Remaining production blockers (not misrepresented as implemented)
+Component	Status / remaining work
+Runtime lifetime	Incomplete. string.dispose() currently provides explicit release. Automatic scope-exit destruction, move-safe rich aggregate copying, per-field drop flags, cleanup across early returns/branches, and returned-owner provenance are not implemented. Do not treat explicit release as conformant ownership.
+Owned-string stdlib	Incomplete. Host-side RAII runtime has fallible reserve/append. The emitted Paracine program only has to_string, to_text, count, equals, clear, dispose. Native fallible allocation/results, safe growth, and general constructors are absent.
+Complete COFF linker	Incomplete. The native PE linker resolves internal routines and known KERNEL32 imports. It does not read/link arbitrary external .obj/`.lib` archives, all relocation kinds, COMDAT, weak externals, DLL exports, TLS, PDB, or resources.
+PE hardening	Incomplete. ASLR and high-entropy VA remain intentionally disabled without base relocation support. CFG/load-config, Windows loader matrix and certificate/signing are absent.
+Scalar types	Incomplete. IEEE-754 float/double and Microsoft x64 XMM/FP calling conventions are not implemented.
+Aggregates/containers	Incomplete. array, buffer, view, span, variants/unions/atomics/SIMD and all ownership/drop paths need language + native coverage.
+PMIR	Incomplete. There is no production graph-coloring/linear-scan register allocator, spilling policy, comprehensive floating point, machine scheduler, vectorizer, or stack-probe coverage.
+SAGE	Incomplete. Full projection-sensitive NLL/partial moves, FFI safety, closure escape and structured-thread ownership conformance remain incomplete.
+Toolchain	Incomplete. Rich modules/imports, package management, formatter, profiler, debugger/PDB, installer/update policy, release signing and complete conformance suite remain incomplete.
+
+
+Run
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+build\Debug\paracine.exe test tests\heap_contents.pcn
+build\Debug\paracine.exe build tests\heap_count.pcn -o heap_count.exe
+build\Debug\paracine.exe obj tests\heap_count.pcn -o heap_count.obj
+Linux:
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+Compiler source: src/Paracine.cpp; host runtime: runtime/paracine_runtime.hpp.
+
+
+## *** ##
+
+Paracine — ownership-aware cleanup and optional external COFF linking
+Status: experimental, not complete Paracine 1.0 and not qualified for industry-grade production.
+
+Baseline: Paracine_RuntimeLinker_Expanded.cpp (7,789 lines).
+Updated single-file source: Paracine_OwnershipLink_Expanded.cpp (~8,040 lines).
+Implemented and verified
+Automatic direct-`string` ownership
+- Scope-local direct owning UTF-8 buffers are disposed in reverse creation order after deferred expressions.
+- Cleanup is inserted for normal scope fallthrough, returning, break, continue, and the explicit try error-propagation branch handled by the current lowering.
+- own s: string parameters are disposed by their callee unless ownership is moved onward.
+- PCIR string.move, PMIR string.move, and the x86-64 encoder perform a consuming move: copy the 24-byte {ptr,count,capacity} object, then zero the old owner.
+- String return values are moved to escaping return storage rather than copied and later freed.
+- String assignment releases the replaced owned allocation and transfers in the new value.
+- Explicit string.dispose remains safe with subsequent implicit cleanup (the object is cleared after freeing).
+- Nonlexical borrow check rejects returning a text view backed by an auto-destroyed local or own string (E0425).
+- The existing use-after-move detection rejects reading an owning string transferred into another local (E0412).
+- PCIR verifier checks string.move source/destination shape; PMIR rejects composite/aggregate values containing direct owned strings (E0426) until recursive drop glue is correct.
+Optional external COFF interoperability
+- paracine link [file.pcn] [other.obj/.lib/.res ...] -o output.exe --entry main emits a Paracine COFF object and invokes the installed lld-link directly via CreateProcessW or POSIX execvp, never through a shell.
+- Supports /dll /noentry, /libpath, /subsystem, and an explicitly selected linker path.
+- Verified actual cross-object resolution: a Clang-generated COFF object calling Paracine's add function linked into a Windows x64 DLL exporting external_probe.
+- Requires user-provided Windows SDK/CRT import libraries when external Windows imports are referenced, e.g. kernel32.lib for the Paracine owned-string heap path.
+- This external adapter is not the canonical, fully self-contained Paracine native linker specified by the language. Existing build, obj, pe commands continue to use Paracine's internal writer.
+Tests and qualification
+- 90/90 existing Paracine native/runtime assertions passed.
+- 41/41 additional ownership, negative diagnostic and cross-object COFF integration assertions passed.
+- 3/3 CTest suites passed from cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS_DEBUG='-O0 -g0'.
+- Actual emitted Microsoft-x64-ABI machine code executed under isolated Linux child processes; the heap shim checks for leaked/double-freed allocations.
+- Linker output inspected as PE32+ Windows DLL with an export entry.
+- C++23 GCC debug compiler built and ran.
+- CMake Release build timed out in this environment; no Release-build pass is claimed.
+- Actual Windows OS loader runs, MSVC build/CI, adversarial fuzzing and production security review were not performed.
+Release blockers — not completed
+1. Recursive, tag-aware, projection-sensitive owning aggregate/variant/result/option/closure drop glue and reliable partial-move flags; composite string owners currently produce E0426 when used in PMIR.
+2. Fully proven nonlexical lifetime analysis including nested borrowed aggregates, returned borrow provenance, threads, FFI, and exceptional transitions. E0425 handles a concrete direct text-view escape, not every possible path.
+3. Complete scalar semantics and native encoding: float/double XMM, unsigned integer operations/widths, atomics, SIMD, memory ordering, all FFI ABIs, stack probes and register allocation/spilling.
+4. The self-contained native linker still lacks arbitrary COFF/archive consumption, complete relocations and COMDAT, import-library generation, full DLL exports, TLS/resources/PDB and hardened ASLR relocations; advanced objects can be linked only using the optional lld-link adapter.
+5. Complete standard library, compiler conformance corpus, actual Windows process/loader/ABI validation, fuzzing/security release qualification.
+6. Automatic cleanup currently tracks direct string allocation and return/assignment movement, not every ownership path through containers, conditionally initialized partial aggregates or cross-thread ownership.
+Build and example commands
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+paracine test tests/autodrop_return_owner.pcn -O3
+paracine link tests/link_scalar.pcn -o sample.exe --entry main --linker lld-link
+paracine link tests/link_scalar.pcn tests/probe.obj --dll -o sample.dll --linker lld-link
+For imported Win32 symbols, supply the corresponding platform .lib and --libpath. Do not interpret an external linker success as certification of the internal linker.
+
+## *** ##
+
