@@ -1267,6 +1267,10 @@ namespace pcn {
         StringMove,
         ByteCount,
         TextEquals,
+        TextByteAt,
+        TextFindByte,
+        TextStartsWith,
+        NumericCheckedCast,
         MakeAggregate,
         ExtractField,
         ArrayIndex,
@@ -3800,6 +3804,32 @@ namespace pcn {
                 if (!call.arguments.empty())report(call.location, "text/string.count() takes no arguments");
                 return { SemanticTypeKind::Number,"size" };
             }
+            if (objectType.kind == SemanticTypeKind::Text &&
+                (member.member == "byte_at" || member.member == "find_byte")) {
+                if (call.arguments.size() != 1) {
+                    report(call.location, "text." + member.member + " requires one integer argument");
+                }
+                else {
+                    const auto arg = analyzeExpr(call.arguments[0]);
+                    bool fractionalLiteral = false;
+                    if (const auto* number = std::get_if<NumberExpr>(&call.arguments[0]->node)) {
+                        const auto& literal = number->value;
+                        fractionalLiteral = literal.find('.') != std::string::npos ||
+                            ((literal.rfind("0x", 0) != 0 && literal.rfind("0X", 0) != 0 &&
+                                literal.rfind("0b", 0) != 0 && literal.rfind("0B", 0) != 0) &&
+                                literal.find_first_of("eE") != std::string::npos);
+                    }
+                    if (arg.kind != SemanticTypeKind::Number ||
+                        arg.name == "float" || arg.name == "double" || fractionalLiteral)
+                        report(call.location, "text." + member.member + " requires an integer argument");
+                }
+                return { SemanticTypeKind::Number, "int" };
+            }
+            if (objectType.kind == SemanticTypeKind::Text && member.member == "starts_with") {
+                if (call.arguments.size() != 1 || analyzeExpr(call.arguments[0]).kind != SemanticTypeKind::Text)
+                    report(call.location, "text.starts_with requires exactly one text argument");
+                return makeBoolType();
+            }
             if (objectType.kind == SemanticTypeKind::Text && member.member == "equals") {
                 if (call.arguments.size() != 1 || analyzeExpr(call.arguments[0]).kind != SemanticTypeKind::Text)
                     report(call.location, "text.equals requires one text argument");
@@ -3822,6 +3852,12 @@ namespace pcn {
                 auto objectType = member->object ? analyzeExpr(member->object) : makeUnknownType();
                 if (objectType.kind == SemanticTypeKind::Text || objectType.kind == SemanticTypeKind::String)
                     return analyzeTextStringMemberCall(*member, node);
+                if (objectType.kind == SemanticTypeKind::Number &&
+                    ((objectType.name == "size" && member->member == "to_int") ||
+                        (objectType.name == "int" && member->member == "to_size"))) {
+                    if (!node.arguments.empty())report(node.location, "numeric checked conversion takes no arguments");
+                    return { SemanticTypeKind::Number,member->member == "to_int" ? "int" : "size" };
+                }
             }
             if (const auto* callee = std::get_if<VariableExpr>(&node.callee->node)) {
                 if (callee->name == "ok" || callee->name == "err" || callee->name == "some") {
@@ -4481,7 +4517,7 @@ namespace pcn {
             }return nullptr;
         }
         std::string inferCallType(const CallExpr& c) {
-            if (auto* m = c.callee ? std::get_if<MemberExpr>(&c.callee->node) : nullptr) { auto o = inferExprType(m->object); if (o == "text" && m->member == "to_string")return "string"; if (o == "string" && m->member == "to_text")return "text"; if ((o == "text" || o == "string") && m->member == "count")return "size"; if (o == "text" && m->member == "equals")return "bool"; if (o == "string" && (m->member == "clear" || m->member == "dispose"))return "void"; }
+            if (auto* m = c.callee ? std::get_if<MemberExpr>(&c.callee->node) : nullptr) { auto o = inferExprType(m->object); if (o == "text" && m->member == "to_string")return "string"; if (o == "string" && m->member == "to_text")return "text"; if ((o == "text" || o == "string") && m->member == "count")return "size"; if (o == "text" && (m->member == "equals" || m->member == "starts_with"))return "bool"; if (o == "text" && (m->member == "byte_at" || m->member == "find_byte"))return "int"; if ((o == "size" && m->member == "to_int") || (o == "int" && m->member == "to_size"))return m->member == "to_int" ? "int" : "size"; if (o == "string" && (m->member == "clear" || m->member == "dispose"))return "void"; }
             auto* v = c.callee ? std::get_if<VariableExpr>(&c.callee->node) : nullptr; if (v && (v->name == "ok" || v->name == "err" || v->name == "some") && c.arguments.size() == 1)return "__" + v->name + "<" + inferExprType(c.arguments[0]) + ">"; if (v && v->name == "none")return "__none"; std::map<std::string, std::string>s; if (auto* r = resolveCall(c, &s))return substituteGenericType(r->returnType, s); return "unknown";
         }
 
@@ -4570,7 +4606,7 @@ namespace pcn {
             if (!e)return; std::visit([&](const auto& n) {using T = std::decay_t<decltype(n)>;
             if constexpr (std::is_same_v<T, UnaryExpr>)inferClosureExprEffects(n.operand, out);
             else if constexpr (std::is_same_v<T, BinaryExpr>) { inferClosureExprEffects(n.left, out); inferClosureExprEffects(n.right, out); if (n.op == "/" || n.op == "%")out.insert("trap"); }
-            else if constexpr (std::is_same_v<T, CallExpr>) { for (auto& a : n.arguments)inferClosureExprEffects(a, out); if (auto* m = n.callee ? std::get_if<MemberExpr>(&n.callee->node) : nullptr) { inferClosureExprEffects(m->object, out); if (m->member == "to_string")out.insert("alloc"); } else if (auto* v = n.callee ? std::get_if<VariableExpr>(&n.callee->node) : nullptr) { if (v->name == "print" || v->name == "println")out.insert("io"); auto ri = routines_.find(v->name); if (ri != routines_.end())for (auto* r : ri->second)if (r->parameters.size() == n.arguments.size()) { auto ef = result_->resolvedEffects.find(keyFor(*r)); if (ef != result_->resolvedEffects.end())out.insert(ef->second.begin(), ef->second.end()); break; } } }
+            else if constexpr (std::is_same_v<T, CallExpr>) { for (auto& a : n.arguments)inferClosureExprEffects(a, out); if (auto* m = n.callee ? std::get_if<MemberExpr>(&n.callee->node) : nullptr) { inferClosureExprEffects(m->object, out); if (m->member == "to_string")out.insert("alloc"); if (m->member == "byte_at" || m->member == "to_int" || m->member == "to_size")out.insert("trap"); } else if (auto* v = n.callee ? std::get_if<VariableExpr>(&n.callee->node) : nullptr) { if (v->name == "print" || v->name == "println")out.insert("io"); auto ri = routines_.find(v->name); if (ri != routines_.end())for (auto* r : ri->second)if (r->parameters.size() == n.arguments.size()) { auto ef = result_->resolvedEffects.find(keyFor(*r)); if (ef != result_->resolvedEffects.end())out.insert(ef->second.begin(), ef->second.end()); break; } } }
             else if constexpr (std::is_same_v<T, PipelineExpr>) { inferClosureExprEffects(n.input, out); for (auto& x : n.stages)inferClosureExprEffects(x, out); }
             else if constexpr (std::is_same_v<T, RangeExpr>) { inferClosureExprEffects(n.start, out); inferClosureExprEffects(n.end, out); inferClosureExprEffects(n.step, out); }
             else if constexpr (std::is_same_v<T, ChooseExpr>) { inferClosureExprEffects(n.subject, out); for (auto& x : n.cases) { inferClosureExprEffects(x.condition, out); inferClosureExprEffects(x.value, out); }inferClosureExprEffects(n.otherwiseValue, out); }
@@ -4846,6 +4882,9 @@ namespace pcn {
                         collectExprEffects(member->object, facts);
                         if (member->member == "to_string") {
                             facts.direct.insert("alloc");
+                        }
+                        else if (member->member == "byte_at" || member->member == "to_int" || member->member == "to_size") {
+                            facts.direct.insert("trap");
                         }
                     }
                     else if (const auto* variable = node.callee ? std::get_if<VariableExpr>(&node.callee->node) : nullptr) {
@@ -5836,6 +5875,14 @@ namespace pcn {
                 IRInstruction cp; cp.op = IROpcode::Copy; cp.dest = allocateVReg(); cp.args = { value }; cp.valueType = lastValueType_;
                 value = cp.dest; emit(std::move(cp));
             }
+            // Every named scalar binding has an independent virtual-register cell.
+            // Reusing the initializer's register aliases mutable locals and breaks
+            // snapshots such as `let start = pos` and `var sum = count` in loops.
+            if (lastValueType_.kind == IRValueKind::Int64 || lastValueType_.kind == IRValueKind::Bool ||
+                lastValueType_.kind == IRValueKind::Float32 || lastValueType_.kind == IRValueKind::Float64) {
+                IRInstruction cp; cp.op = IROpcode::Copy; cp.dest = allocateVReg(); cp.args = { value };
+                cp.valueType = lastValueType_; value = cp.dest; emit(std::move(cp));
+            }
             locals_[node.name] = value;
             localValueTypes_[node.name] = lastValueType_;
             lastValue_ = value;
@@ -5854,6 +5901,14 @@ namespace pcn {
                 std::holds_alternative<VariableExpr>(node.initializer->node)) {
                 IRInstruction cp; cp.op = IROpcode::Copy; cp.dest = allocateVReg(); cp.args = { value }; cp.valueType = lastValueType_;
                 value = cp.dest; emit(std::move(cp));
+            }
+            // Every named scalar binding has an independent virtual-register cell.
+            // Reusing the initializer's register aliases mutable locals and breaks
+            // snapshots such as `let start = pos` and `var sum = count` in loops.
+            if (lastValueType_.kind == IRValueKind::Int64 || lastValueType_.kind == IRValueKind::Bool ||
+                lastValueType_.kind == IRValueKind::Float32 || lastValueType_.kind == IRValueKind::Float64) {
+                IRInstruction cp; cp.op = IROpcode::Copy; cp.dest = allocateVReg(); cp.args = { value };
+                cp.valueType = lastValueType_; value = cp.dest; emit(std::move(cp));
             }
             locals_[node.name] = value;
             localValueTypes_[node.name] = lastValueType_;
@@ -6412,7 +6467,9 @@ namespace pcn {
                         if (objectType.kind == IRValueKind::Text && m->member == "to_string")return makeIRStringType();
                         if (objectType.kind == IRValueKind::String && m->member == "to_text")return makeIRTextType();
                         if ((objectType.kind == IRValueKind::Text || objectType.kind == IRValueKind::String) && m->member == "count")return makeIRIntType();
-                        if (objectType.kind == IRValueKind::Text && m->member == "equals")return makeIRBoolType();
+                        if (objectType.kind == IRValueKind::Text && (m->member == "equals" || m->member == "starts_with"))return makeIRBoolType();
+                        if (objectType.kind == IRValueKind::Text && (m->member == "byte_at" || m->member == "find_byte"))return makeIRIntType();
+                        if ((m->member == "to_int" || m->member == "to_size") && objectType.kind == IRValueKind::Int64)return makeIRIntType();
                         if (objectType.kind == IRValueKind::String && m->member == "clear")return makeIRVoidType();
                     }
                     if (const auto* v = node.callee ? std::get_if<VariableExpr>(&node.callee->node) : nullptr) {
@@ -6601,6 +6658,29 @@ namespace pcn {
                 if ((objectType.kind == IRValueKind::Text || objectType.kind == IRValueKind::String) && member->member == "count") {
                     if (!node.arguments.empty())throw std::runtime_error("text/string.count takes no arguments");
                     auto dest = allocateVReg(); inst.op = IROpcode::ByteCount; inst.dest = dest; inst.args.push_back(lowerExpr(member->object)); inst.valueType = makeIRIntType(); emit(inst); lastValueType_ = inst.valueType; return dest;
+                }
+                if (objectType.kind == IRValueKind::Int64 &&
+                    (member->member == "to_int" || member->member == "to_size")) {
+                    if (!node.arguments.empty())throw std::runtime_error("numeric checked cast takes no arguments");
+                    auto dest = allocateVReg(); inst.op = IROpcode::NumericCheckedCast; inst.dest = dest;
+                    inst.args.push_back(lowerExpr(member->object)); inst.valueType = makeIRIntType();
+                    emit(inst); lastValueType_ = inst.valueType; return dest;
+                }
+                if (objectType.kind == IRValueKind::Text &&
+                    (member->member == "byte_at" || member->member == "find_byte")) {
+                    if (node.arguments.size() != 1)throw std::runtime_error("text byte method requires one argument");
+                    auto dest = allocateVReg();
+                    inst.op = member->member == "byte_at" ? IROpcode::TextByteAt : IROpcode::TextFindByte;
+                    inst.dest = dest; inst.valueType = makeIRIntType();
+                    inst.args.push_back(lowerExpr(member->object));
+                    inst.args.push_back(lowerExpr(node.arguments[0]));
+                    emit(inst); lastValueType_ = inst.valueType; return dest;
+                }
+                if (objectType.kind == IRValueKind::Text && member->member == "starts_with") {
+                    if (node.arguments.size() != 1)throw std::runtime_error("text.starts_with requires one text argument");
+                    auto dest = allocateVReg(); inst.op = IROpcode::TextStartsWith; inst.dest = dest;
+                    inst.args.push_back(lowerExpr(member->object)); inst.args.push_back(lowerExpr(node.arguments[0]));
+                    inst.valueType = makeIRBoolType(); emit(inst); lastValueType_ = inst.valueType; return dest;
                 }
                 if (objectType.kind == IRValueKind::Text && member->member == "equals") {
                     if (node.arguments.size() != 1)throw std::runtime_error("text.equals requires one argument");
@@ -7029,7 +7109,7 @@ namespace pcn {
             case IROpcode::Add: case IROpcode::Sub: case IROpcode::Mul: case IROpcode::BitAnd: case IROpcode::BitOr:
             case IROpcode::BitXor: case IROpcode::Shl: case IROpcode::Shr: case IROpcode::Neg: case IROpcode::BitNot:
             case IROpcode::Not: case IROpcode::Eq: case IROpcode::Ne: case IROpcode::Lt: case IROpcode::Le:
-            case IROpcode::Gt: case IROpcode::Ge: case IROpcode::And: case IROpcode::Or: case IROpcode::StringToText:case IROpcode::ByteCount:case IROpcode::TextEquals:
+            case IROpcode::Gt: case IROpcode::Ge: case IROpcode::And: case IROpcode::Or: case IROpcode::StringToText:case IROpcode::ByteCount:case IROpcode::TextEquals:case IROpcode::TextByteAt:case IROpcode::TextFindByte:case IROpcode::TextStartsWith:case IROpcode::NumericCheckedCast:
             case IROpcode::MakeAggregate: case IROpcode::ExtractField: case IROpcode::ResultOk: case IROpcode::ResultErr:
             case IROpcode::OptionSome: case IROpcode::OptionNone: case IROpcode::MakeClosure: return true;
             default: return false;
@@ -7480,6 +7560,31 @@ namespace pcn {
                     case IROpcode::Call: { std::vector<Value>ca; for (auto v : inst.args)ca.push_back(regs.at(static_cast<std::uint32_t>(v))); if (inst.callee == "print" || inst.callee == "println") { if (!ca.empty())std::cout << asInt(ca.front()); if (inst.callee == "println")std::cout << '\n'; set(scalar(0)); } else { auto it = functions_.find(inst.callee); if (it == functions_.end())throw std::runtime_error("PCIR oracle unresolved call: " + inst.callee); set(execute(*it->second, ca)); }break; }
                     case IROpcode::TextToString: { auto src = get(0); if (!src.object || src.object->typeName != "text")throw std::runtime_error("PCIR oracle text.to_string on non-text"); auto v = object("string"); v.object->text = src.object->text; set(v); break; }
                     case IROpcode::StringToText: { auto src = get(0); if (!src.object || src.object->typeName != "string")throw std::runtime_error("PCIR oracle string.to_text on non-string"); auto v = object("text"); v.object->text = src.object->text; set(v); break; }
+                    case IROpcode::NumericCheckedCast: {
+                        const auto v = asInt(get(0));
+                        if (v < 0)throw std::runtime_error("Paracine trap: checked integer conversion out of range");
+                        set(scalar(v)); break;
+                    }
+                    case IROpcode::TextStartsWith: {
+                        const auto hay = get(0), needle = get(1);
+                        if (!hay.object || !needle.object || hay.object->typeName != "text" || needle.object->typeName != "text")
+                            throw std::runtime_error("PCIR text.starts_with requires two text values");
+                        set(scalar(hay.object->text.starts_with(needle.object->text))); break;
+                    }
+                    case IROpcode::TextByteAt: {
+                        auto src = get(0); auto index = asInt(get(1));
+                        if (!src.object || src.object->typeName != "text")throw std::runtime_error("PCIR text.byte_at requires text");
+                        if (index < 0 || static_cast<std::uint64_t>(index) >= src.object->text.size())
+                            throw std::runtime_error("Paracine trap: text.byte_at index out of bounds");
+                        set(scalar(static_cast<unsigned char>(src.object->text[static_cast<std::size_t>(index)]))); break;
+                    }
+                    case IROpcode::TextFindByte: {
+                        auto src = get(0); auto byte = asInt(get(1));
+                        if (!src.object || src.object->typeName != "text")throw std::runtime_error("PCIR text.find_byte requires text");
+                        if (byte < 0 || byte>255) { set(scalar(-1)); break; }
+                        const auto pos = src.object->text.find(static_cast<char>(byte));
+                        set(scalar(pos == std::string::npos ? -1 : static_cast<std::int64_t>(pos))); break;
+                    }
                     case IROpcode::TextEquals: { auto x = get(0), y = get(1); if (!x.object || !y.object || x.object->typeName != "text" || y.object->typeName != "text")throw std::runtime_error("PCIR text.equals requires two text values"); set(scalar(x.object->text == y.object->text)); break; }
                     case IROpcode::ByteCount: { auto src = get(0); if (!src.object)throw std::runtime_error("PCIR byte_count requires text/string"); set(scalar(static_cast<std::int64_t>(src.object->text.size()))); break; }
                     case IROpcode::StringMove: { auto src = get(0); if (!src.object || src.object->typeName != "string")throw std::runtime_error("PCIR oracle string.move on non-string"); auto v = object("string"); v.object->text = std::move(src.object->text); set(v); break; }
@@ -7510,7 +7615,7 @@ namespace pcn {
     enum class PMIROpcode {
         ConstInt, ConstFloat, ConstBool, ConstNull, ConstText, Copy, Add, Sub, Mul, Div, Mod, BitAnd, BitOr, BitXor,
         Shl, Shr, Neg, BitNot, Not, Eq, Ne, Lt, Le, Gt, Ge, And, Or, Branch, BranchIf, Call, CallClosure,
-        TextToString, StringToText, StringClear, StringDispose, StringMove, ByteCount, TextEquals, MakeAggregate, ExtractField, StoreField, ArrayIndex, ArrayStore, ResultOk, ResultErr, ResultIsErr, ResultTry, OptionSome, OptionNone, MakeClosure, Return, Nop
+        TextToString, StringToText, StringClear, StringDispose, StringMove, ByteCount, TextEquals, TextByteAt, TextFindByte, TextStartsWith, NumericCheckedCast, MakeAggregate, ExtractField, StoreField, ArrayIndex, ArrayStore, ResultOk, ResultErr, ResultIsErr, ResultTry, OptionSome, OptionNone, MakeClosure, Return, Nop
     };
 
     struct PMIRInstruction {
@@ -7642,7 +7747,7 @@ namespace pcn {
             case IROpcode::BitNot:return PMIROpcode::BitNot; case IROpcode::Not:return PMIROpcode::Not; case IROpcode::Eq:return PMIROpcode::Eq; case IROpcode::Ne:return PMIROpcode::Ne;
             case IROpcode::Lt:return PMIROpcode::Lt; case IROpcode::Le:return PMIROpcode::Le; case IROpcode::Gt:return PMIROpcode::Gt; case IROpcode::Ge:return PMIROpcode::Ge;
             case IROpcode::And:return PMIROpcode::And; case IROpcode::Or:return PMIROpcode::Or; case IROpcode::Branch:return PMIROpcode::Branch; case IROpcode::BranchIf:return PMIROpcode::BranchIf;
-            case IROpcode::Call:return PMIROpcode::Call; case IROpcode::CallClosure:return PMIROpcode::CallClosure; case IROpcode::TextToString:return PMIROpcode::TextToString; case IROpcode::StringToText:return PMIROpcode::StringToText; case IROpcode::StringClear:return PMIROpcode::StringClear; case IROpcode::StringDispose:return PMIROpcode::StringDispose; case IROpcode::StringMove:return PMIROpcode::StringMove; case IROpcode::ByteCount:return PMIROpcode::ByteCount; case IROpcode::TextEquals:return PMIROpcode::TextEquals; case IROpcode::MakeAggregate:return PMIROpcode::MakeAggregate;
+            case IROpcode::Call:return PMIROpcode::Call; case IROpcode::CallClosure:return PMIROpcode::CallClosure; case IROpcode::TextToString:return PMIROpcode::TextToString; case IROpcode::StringToText:return PMIROpcode::StringToText; case IROpcode::StringClear:return PMIROpcode::StringClear; case IROpcode::StringDispose:return PMIROpcode::StringDispose; case IROpcode::StringMove:return PMIROpcode::StringMove; case IROpcode::ByteCount:return PMIROpcode::ByteCount; case IROpcode::TextEquals:return PMIROpcode::TextEquals; case IROpcode::TextByteAt:return PMIROpcode::TextByteAt; case IROpcode::TextFindByte:return PMIROpcode::TextFindByte; case IROpcode::TextStartsWith:return PMIROpcode::TextStartsWith; case IROpcode::NumericCheckedCast:return PMIROpcode::NumericCheckedCast; case IROpcode::MakeAggregate:return PMIROpcode::MakeAggregate;
             case IROpcode::ExtractField:return PMIROpcode::ExtractField; case IROpcode::StoreField:return PMIROpcode::StoreField; case IROpcode::ArrayIndex:return PMIROpcode::ArrayIndex; case IROpcode::ArrayStore:return PMIROpcode::ArrayStore; case IROpcode::ResultOk:return PMIROpcode::ResultOk; case IROpcode::ResultErr:return PMIROpcode::ResultErr;
             case IROpcode::ResultIsErr:return PMIROpcode::ResultIsErr; case IROpcode::ResultTry:return PMIROpcode::ResultTry; case IROpcode::OptionSome:return PMIROpcode::OptionSome; case IROpcode::OptionNone:return PMIROpcode::OptionNone;
             case IROpcode::MakeClosure:return PMIROpcode::MakeClosure; case IROpcode::Return:return PMIROpcode::Return;
@@ -7732,7 +7837,7 @@ namespace pcn {
     static std::string pmirOpcodeName(PMIROpcode op) {
         switch (op) {
         case PMIROpcode::ConstInt:return"mov.imm"; case PMIROpcode::ConstFloat:return"mov.fp.bits"; case PMIROpcode::ConstBool:return"mov.bool"; case PMIROpcode::ConstNull:return"mov.null"; case PMIROpcode::ConstText:return"text.literal"; case PMIROpcode::Copy:return"copy";
-        case PMIROpcode::Add:return"add"; case PMIROpcode::Sub:return"sub"; case PMIROpcode::Mul:return"imul"; case PMIROpcode::Div:return"idiv.defined"; case PMIROpcode::Mod:return"imod.defined"; case PMIROpcode::BitAnd:return"and"; case PMIROpcode::BitOr:return"or"; case PMIROpcode::BitXor:return"xor"; case PMIROpcode::Shl:return"shl"; case PMIROpcode::Shr:return"sar"; case PMIROpcode::Neg:return"neg"; case PMIROpcode::BitNot:return"not"; case PMIROpcode::Not:return"logical.not"; case PMIROpcode::Eq:return"cmp.eq"; case PMIROpcode::Ne:return"cmp.ne"; case PMIROpcode::Lt:return"cmp.lt"; case PMIROpcode::Le:return"cmp.le"; case PMIROpcode::Gt:return"cmp.gt"; case PMIROpcode::Ge:return"cmp.ge"; case PMIROpcode::And:return"logical.and"; case PMIROpcode::Or:return"logical.or"; case PMIROpcode::Branch:return"jmp"; case PMIROpcode::BranchIf:return"br.if"; case PMIROpcode::Call:return"call"; case PMIROpcode::CallClosure:return"call.closure"; case PMIROpcode::TextToString:return"text.to_string"; case PMIROpcode::StringToText:return"string.to_text"; case PMIROpcode::StringClear:return"string.clear"; case PMIROpcode::StringDispose:return"string.dispose"; case PMIROpcode::StringMove:return"string.move"; case PMIROpcode::ByteCount:return"text.count"; case PMIROpcode::TextEquals:return"text.equals"; case PMIROpcode::MakeAggregate:return"aggregate.make"; case PMIROpcode::ExtractField:return"aggregate.field"; case PMIROpcode::StoreField:return"aggregate.store.field"; case PMIROpcode::ArrayIndex:return"array.index.checked"; case PMIROpcode::ArrayStore:return"array.store.checked"; case PMIROpcode::ResultOk:return"result.ok"; case PMIROpcode::ResultErr:return"result.err"; case PMIROpcode::ResultIsErr:return"result.is_err"; case PMIROpcode::ResultTry:return"result.try"; case PMIROpcode::OptionSome:return"option.some"; case PMIROpcode::OptionNone:return"option.none"; case PMIROpcode::MakeClosure:return"closure.make"; case PMIROpcode::Return:return"ret"; case PMIROpcode::Nop:return"nop";
+        case PMIROpcode::Add:return"add"; case PMIROpcode::Sub:return"sub"; case PMIROpcode::Mul:return"imul"; case PMIROpcode::Div:return"idiv.defined"; case PMIROpcode::Mod:return"imod.defined"; case PMIROpcode::BitAnd:return"and"; case PMIROpcode::BitOr:return"or"; case PMIROpcode::BitXor:return"xor"; case PMIROpcode::Shl:return"shl"; case PMIROpcode::Shr:return"sar"; case PMIROpcode::Neg:return"neg"; case PMIROpcode::BitNot:return"not"; case PMIROpcode::Not:return"logical.not"; case PMIROpcode::Eq:return"cmp.eq"; case PMIROpcode::Ne:return"cmp.ne"; case PMIROpcode::Lt:return"cmp.lt"; case PMIROpcode::Le:return"cmp.le"; case PMIROpcode::Gt:return"cmp.gt"; case PMIROpcode::Ge:return"cmp.ge"; case PMIROpcode::And:return"logical.and"; case PMIROpcode::Or:return"logical.or"; case PMIROpcode::Branch:return"jmp"; case PMIROpcode::BranchIf:return"br.if"; case PMIROpcode::Call:return"call"; case PMIROpcode::CallClosure:return"call.closure"; case PMIROpcode::TextToString:return"text.to_string"; case PMIROpcode::StringToText:return"string.to_text"; case PMIROpcode::StringClear:return"string.clear"; case PMIROpcode::StringDispose:return"string.dispose"; case PMIROpcode::StringMove:return"string.move"; case PMIROpcode::ByteCount:return"text.count"; case PMIROpcode::TextEquals:return"text.equals"; case PMIROpcode::TextByteAt:return"text.byte_at.checked"; case PMIROpcode::TextFindByte:return"text.find_byte"; case PMIROpcode::TextStartsWith:return"text.starts_with"; case PMIROpcode::NumericCheckedCast:return"numeric.checked_cast"; case PMIROpcode::MakeAggregate:return"aggregate.make"; case PMIROpcode::ExtractField:return"aggregate.field"; case PMIROpcode::StoreField:return"aggregate.store.field"; case PMIROpcode::ArrayIndex:return"array.index.checked"; case PMIROpcode::ArrayStore:return"array.store.checked"; case PMIROpcode::ResultOk:return"result.ok"; case PMIROpcode::ResultErr:return"result.err"; case PMIROpcode::ResultIsErr:return"result.is_err"; case PMIROpcode::ResultTry:return"result.try"; case PMIROpcode::OptionSome:return"option.some"; case PMIROpcode::OptionNone:return"option.none"; case PMIROpcode::MakeClosure:return"closure.make"; case PMIROpcode::Return:return"ret"; case PMIROpcode::Nop:return"nop";
         }return"?";
     }
 
@@ -7914,6 +8019,74 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                                           case PMIROpcode::Div:case PMIROpcode::Mod: { binaryLoad(); b.insert(b.end(), { 0x49,0x83,0xFA,0x00 }); auto jz = emitLocalJcc(b, 0x84); b.insert(b.end(), { 0x49,0x83,0xFA,0xFF }); auto jne = emitLocalJcc(b, 0x85); movImm(b, 11, 0x8000000000000000ull); b.insert(b.end(), { 0x4C,0x39,0xD8 }); auto jne2 = emitLocalJcc(b, 0x85); if (i.op == PMIROpcode::Mod)b.insert(b.end(), { 0x31,0xC0 }); auto done = emitLocalJmp(b); auto normal = b.size(); patchLocal(b, jne, normal); patchLocal(b, jne2, normal); b.insert(b.end(), { 0x48,0x99,0x49,0xF7,0xFA }); if (i.op == PMIROpcode::Mod)b.insert(b.end(), { 0x48,0x89,0xD0 }); auto after = emitLocalJmp(b); auto trap = b.size(); patchLocal(b, jz, trap); b.insert(b.end(), { 0x0F,0x0B }); auto finish = b.size(); patchLocal(b, done, finish); patchLocal(b, after, finish); save(); break; }
                                                           case PMIROpcode::Branch:emitJmp(b, i.targets.at(0), branches); break; case PMIROpcode::BranchIf:loadSlot(b, 0, fn, i.srcSlots.at(0)); b.insert(b.end(), { 0x48,0x85,0xC0 }); emitJcc(b, 0x85, i.targets.at(0), branches); emitJmp(b, i.targets.at(1), branches); break;
                                                           case PMIROpcode::Call:encodeCall(fn, i, abi, b, calls); break; case PMIROpcode::CallClosure:encodeClosureCall(fn, i, abi, b, calls); break;
+                                                          case PMIROpcode::NumericCheckedCast: {
+                                                              if (i.srcSlots.size() != 1)throw std::runtime_error("checked numeric cast requires one operand");
+                                                              loadSlot(b, 0, fn, i.srcSlots[0]);
+                                                              b.insert(b.end(), { 0x48,0x85,0xC0 }); // test rax,rax (negative signed value / oversized size)
+                                                              auto good = emitLocalJcc(b, 0x89);  // jns
+                                                              b.insert(b.end(), { 0x0F,0x0B }); // ud2 overflow trap
+                                                              patchLocal(b, good, b.size()); storeSlot(b, 0, fn, i.destSlot); break;
+                                                          }
+                                                          case PMIROpcode::TextStartsWith: {
+                                                              if (i.srcSlots.size() != 2)throw std::runtime_error("text.starts_with expects two text operands");
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 8, 10, 8, 8, false); // hay length
+                                                              loadSlot(b, 11, fn, i.srcSlots[1]); loadMem(b, 9, 11, 8, 8, false); // prefix length
+                                                              b.insert(b.end(), { 0x4D,0x39,0xC8 }); // cmp r8,r9
+                                                              auto failedSize = emitLocalJcc(b, 0x82); // jb: hay shorter
+                                                              loadMem(b, 10, 10, 0, 8, false); loadMem(b, 11, 11, 0, 8, false);
+                                                              b.insert(b.end(), { 0x4D,0x85,0xC9 }); // test r9,r9
+                                                              auto empty = emitLocalJcc(b, 0x84);
+                                                              auto loop = b.size();
+                                                              loadMem(b, 0, 10, 0, 1, false); loadMem(b, 1, 11, 0, 1, false);
+                                                              b.insert(b.end(), { 0x38,0xC8 }); // cmp al,cl
+                                                              auto failedByte = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC3,0x49,0xFF,0xC9 });
+                                                              auto more = emitLocalJcc(b, 0x85); patchLocal(b, more, loop);
+                                                              const auto yes = b.size(); patchLocal(b, empty, yes);
+                                                              movImm(b, 0, 1); auto done = emitLocalJmp(b);
+                                                              const auto no = b.size(); patchLocal(b, failedSize, no); patchLocal(b, failedByte, no);
+                                                              movImm(b, 0, 0); patchLocal(b, done, b.size());
+                                                              storeSlot(b, 0, fn, i.destSlot); break;
+                                                          }
+                                                          case PMIROpcode::TextByteAt: {
+                                                              if (i.srcSlots.size() != 2)throw std::runtime_error("text.byte_at expects text and integer index");
+                                                              loadSlot(b, 9, fn, i.srcSlots[1]);  // r9 = signed index, compared as unsigned
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]); // r10 = text {pointer,length}
+                                                              loadMem(b, 8, 10, 8, 8, false); // r8 = byte length
+                                                              b.insert(b.end(), { 0x4D,0x39,0xC1 }); // cmp r9,r8
+                                                              auto inRange = emitLocalJcc(b, 0x82); // jb (negative indices fail unsigned comparison)
+                                                              b.insert(b.end(), { 0x0F,0x0B }); // ud2 on invalid byte index
+                                                              patchLocal(b, inRange, b.size());
+                                                              loadMem(b, 10, 10, 0, 8, false);
+                                                              b.insert(b.end(), { 0x4D,0x01,0xCA }); // add r10,r9
+                                                              loadMem(b, 0, 10, 0, 1, false); // zero extend unsigned byte
+                                                              storeSlot(b, 0, fn, i.destSlot); break;
+                                                          }
+                                                          case PMIROpcode::TextFindByte: {
+                                                              if (i.srcSlots.size() != 2)throw std::runtime_error("text.find_byte expects text and byte number");
+                                                              loadSlot(b, 9, fn, i.srcSlots[1]); // r9 search byte [0,255]
+                                                              b.insert(b.end(), { 0x49,0x81,0xF9,0xFF,0x00,0x00,0x00 }); // cmp r9,255
+                                                              auto invalid = emitLocalJcc(b, 0x87); // ja (also excludes negatives)
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]);
+                                                              loadMem(b, 11, 10, 0, 8, false); // r11 byte pointer
+                                                              loadMem(b, 8, 10, 8, 8, false);  // r8 byte length
+                                                              movImm(b, 2, 0); // rdx = offset
+                                                              auto loop = b.size();
+                                                              b.insert(b.end(), { 0x4C,0x39,0xC2 }); // cmp rdx,r8
+                                                              auto missing = emitLocalJcc(b, 0x83); // jae
+                                                              movReg(b, 10, 11);
+                                                              b.insert(b.end(), { 0x49,0x01,0xD2 }); // add r10,rdx
+                                                              loadMem(b, 0, 10, 0, 1, false);
+                                                              b.insert(b.end(), { 0x4C,0x39,0xC8 }); // cmp rax,r9
+                                                              auto found = emitLocalJcc(b, 0x84);
+                                                              b.insert(b.end(), { 0x48,0xFF,0xC2 }); // inc rdx
+                                                              auto back = emitLocalJmp(b); patchLocal(b, back, loop);
+                                                              auto foundLabel = b.size(); patchLocal(b, found, foundLabel);
+                                                              movReg(b, 0, 2); auto finished = emitLocalJmp(b);
+                                                              auto absent = b.size(); patchLocal(b, missing, absent); patchLocal(b, invalid, absent);
+                                                              movImm(b, 0, ~std::uint64_t{ 0 }); patchLocal(b, finished, b.size());
+                                                              storeSlot(b, 0, fn, i.destSlot); break;
+                                                          }
                                                           case PMIROpcode::TextEquals: {
                                                               if (i.srcSlots.size() != 2)throw std::runtime_error("text.equals requires two operands");
                                                               loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 8, 10, 8, 8, false);
@@ -8099,7 +8272,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                               for (const auto& i : b.instructions) {
                                                   switch (i.op) {
                                                   case IROpcode::ConstFloat:case IROpcode::ConstText:case IROpcode::CallClosure:
-                                                  case IROpcode::TextToString:case IROpcode::StringToText:case IROpcode::StringClear:case IROpcode::StringDispose:case IROpcode::StringMove:case IROpcode::ByteCount:case IROpcode::TextEquals:
+                                                  case IROpcode::TextToString:case IROpcode::StringToText:case IROpcode::StringClear:case IROpcode::StringDispose:case IROpcode::StringMove:case IROpcode::ByteCount:case IROpcode::TextEquals:case IROpcode::TextByteAt:case IROpcode::TextFindByte:case IROpcode::TextStartsWith:case IROpcode::NumericCheckedCast:
                                                   case IROpcode::ResultOk:case IROpcode::ResultErr:case IROpcode::ResultIsErr:case IROpcode::ResultTry:
                                                   case IROpcode::OptionSome:case IROpcode::OptionNone:
                                                   case IROpcode::MakeAggregate:case IROpcode::ExtractField:case IROpcode::StoreField:case IROpcode::ArrayIndex:case IROpcode::ArrayStore:case IROpcode::MakeClosure:
@@ -8253,7 +8426,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       case IROpcode::StringToText:
                                           oss << "    /* string.to_text: zero-copy immutable borrow; rich portable runtime legalization required */\n"; break;
                                       case IROpcode::TextEquals:throw std::runtime_error("C++20 exporter lacks text equality legalization");
-                                      case IROpcode::ByteCount:throw std::runtime_error("C++20 exporter lacks rich byte-count legalization");
+                                      case IROpcode::ByteCount:case IROpcode::TextByteAt:case IROpcode::TextFindByte:case IROpcode::TextStartsWith:case IROpcode::NumericCheckedCast:throw std::runtime_error("C++20 exporter lacks rich text byte-operation legalization");
                                       case IROpcode::StringDispose:case IROpcode::StringMove:
                                           throw std::runtime_error("C++20 exporter lacks string disposal");
                                       case IROpcode::StringClear:
@@ -8913,7 +9086,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   case IROpcode::Gt: return "gt"; case IROpcode::Ge: return "ge"; case IROpcode::And: return "and";
                                   case IROpcode::Or: return "or"; case IROpcode::Phi: return "phi"; case IROpcode::Branch: return "br";
                                   case IROpcode::BranchIf: return "br.if"; case IROpcode::Call: return "call"; case IROpcode::CallClosure: return "call.closure";
-                                  case IROpcode::TextToString: return "text.to_string"; case IROpcode::StringToText: return "string.to_text"; case IROpcode::StringClear: return "string.clear"; case IROpcode::StringDispose: return "string.dispose"; case IROpcode::StringMove:return "string.move"; case IROpcode::ByteCount: return "text.count"; case IROpcode::TextEquals: return "text.equals";
+                                  case IROpcode::TextToString: return "text.to_string"; case IROpcode::StringToText: return "string.to_text"; case IROpcode::StringClear: return "string.clear"; case IROpcode::StringDispose: return "string.dispose"; case IROpcode::StringMove:return "string.move"; case IROpcode::ByteCount: return "text.count"; case IROpcode::TextEquals: return "text.equals"; case IROpcode::TextByteAt:return "text.byte_at"; case IROpcode::TextFindByte:return "text.find_byte"; case IROpcode::TextStartsWith:return "text.starts_with"; case IROpcode::NumericCheckedCast:return "numeric.checked_cast";
                                   case IROpcode::MakeAggregate: return "aggregate.make"; case IROpcode::ExtractField: return "aggregate.field"; case IROpcode::ArrayIndex:return "array.index"; case IROpcode::StoreField:return "aggregate.store.field"; case IROpcode::ArrayStore:return "array.store";
                                   case IROpcode::ResultOk: return "result.ok"; case IROpcode::ResultErr: return "result.err"; case IROpcode::ResultIsErr: return "result.is_err"; case IROpcode::ResultTry: return "result.try";
                                   case IROpcode::OptionSome: return "option.some"; case IROpcode::OptionNone: return "option.none"; case IROpcode::MakeClosure: return "closure.make";
