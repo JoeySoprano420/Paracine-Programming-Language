@@ -77,4 +77,13 @@ routine main() gives int with trap
 
     give point.x + point.y
 
+const BASE: double = 1.5
+const SCALED: double = BASE * 2.0
+const APPROX: float = 0.1 + 0.2
+
+routine main() gives int
+    if SCALED == 3.0 and APPROX > 0.29
+        give 43
+    give 1
+
 
