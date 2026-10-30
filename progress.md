@@ -1,71 +1,59 @@
-Paracine Fast Output — verification and limitations
-Updated compiler: 10,302 C++23 LOC, extending 9,844-line Paracine Bootstrap OS Expansion.
-Implemented
-- Reuse verified PMIR and x86-64 machine code for PE32+/COFF emission.
-- SHA-256 keyed, dependency-aware incremental caching for native build, pe, obj.
-- Persistent compiler-binary SHA-256 fingerprint stamp, refreshed on executable size/mtime change.
-- SHA-256 payload corruption rejection, recompile on cache miss, source-change recheck before cache storage.
-- Do not rewrite byte-identical generated COFF/PE, preserving timestamps.
-- size / size --json, four-level audit / audit --json, deps, and streamed hash tools.
-Verified here
-- Clang C++23 CMake build succeeded.
-- 14/14 default CTest suites passed; new fast-output suite 58/58 assertions passed.
-- 24/24 previous-vs-upgraded COFF/PE bytes comparisons matched for 6 source programs at -O0/-O3.
-- GCC C++23 syntax check passed, Clang C++23 -Wall -Wextra -Wpedantic -Werror syntax check passed.
-- Exact unified patch applied and reproduced updated source byte-for-byte.
-- SHA-256 outputs checked against Python hashlib.sha256 vectors.
-Representative measured build times
-- Previous uncached median: ~55 ms.
-- Upgraded uncached median: ~47 ms.
-- Upgraded warm-cache median: ~6.4 ms.
-- Initial cache-enabled build: ~1.55 s due to one-time compiler-binary hashing in this unoptimized host build.
-  These are representative for one arithmetic compiler program, not universal benchmarks.
-Not completed or certified
-- Complete Paracine frontend/borrow checker/runtime/standard library or self-hosting stages.
-- Full COFF archival linking, TLS/ASLR/PDB, production Windows/MSVC verification.
-- Parallel IR/codegen, profile-guided machine optimization, or execution-performance superiority.
-- Cache does not defend against maliciously preserved compiler executable timestamps and sizes, or untrusted local cache poisoning.
-- MSVC build with locally edited main.cpp is not validated here.
+Paracine Ultimate — Verified Native Compiler Extension
+Edition: 2026-10-30 engineering pass (not Paracine 1.0 certification)
+Deliverable
+The complete C++23 compiler implementation extends the genuine Paracine_Premium_Compiler.cpp source and preserves the existing lexer, parser, SAGE/SKM, PCIR, PMIR, Windows-x64 native encoder, COFF/PE32+ generation, runtime and developer commands. The complete project includes the updated compiler in Paracine_Project/src/Paracine.cpp.
+New executable operations
+- text.codepoint_at(byte_index) -> int: returns a Unicode scalar value. Generated x86-64 checks the unsigned byte boundary, UTF-8 lead/continuation sequences, overlong forms, surrogates and U+10FFFF maximum; invalid indices and malformed values trap. The PCIR interpreter has an independent checked implementation.
+- text.codepoint_count() -> int: counts leading UTF-8 bytes (one per scalar) in a valid UTF-8 text. Validity is a text invariant; this is not a general-purpose validation operation for arbitrary binary buffers.
+- text.is_ascii() -> bool: native scanning predicate with an early exit on any byte >= 0x80.
+- All three operations are implemented in source typing, effect inference, PCIR opcode, verifier, optimizer safety handling, PCIR oracle, PMIR lowering, native x86-64 and tooling stringification.
+- New bootstrap demonstration bootstrap/unicode_lexer.pcn performs UTF-8-aware iteration using real Paracine-native instructions.
+Fail-closed optional backend
+The optional C++20 exporter now raises explicit errors for text literals, closure calls, ownership conversions, rich mutation, PHI nodes and rich aggregate/result/option semantics it cannot legally emit; it no longer generates comment-only substitutes that silently skip behavior. Simple supported integer C++20 export was compiled using the host C++20 compiler and returned the expected exit status of 21.
+Verified on this host
+- Clean Clang C++23 CMake Debug build: PASS.
+- GCC C++23 and Clang C++23 strict warnings-as-errors source syntax: PASS.
+- CTest: 17/17 suites passed on Linux x86-64.
+- Deterministic generated Unicode regression: 86/86 assertions passed. Includes randomized UTF-8 strings, lead-byte boundaries, all Unicode UTF-8 widths, out-of-range and continuation-byte traps, and compile-time type rejection.
+- Optional C++20 exporter: 3/3 safety assertions passed.
+- Dedicated Unicode Paracine-written lexer demonstration: -O0, -O1, -O2, -O3 all returned 97 and matched PCIR oracle.
+- Patch against Paracine_Premium_Compiler.cpp: applies and reproduces the updated C++23 source byte for byte.
+- Tested generated x86-64 instructions with Microsoft-x64 ABI on Linux; Windows/MSVC compilation and Windows PE loader execution were not performed.
+Remaining blockers to complete industry-grade 1.0
+The complete published Paracine language still cannot be truthfully claimed fully implemented. Missing or incomplete areas include full recursive ownership/drop of aggregate owners, complete dynamic vectors/buffers available in generated .pcn, all module/namespace/capability semantics, all integer widths/atomics/SIMD, full internal COFF/PE linker (arbitrary .obj/`.lib`, import/export, TLS, ASLR/PDB), complete I/O standard library, standalone Windows qualification, security/fuzz coverage of the entire compiler, and a real Paracine-written stage-1 and stage-2 self-build.
+
+No placeholders were used for the newly implemented Unicode native operations. Unsupported optional C++20 exporter constructs fail explicitly instead of emitting false-success code. Remaining language-wide gaps are not filled by this patch.
+
+
 
 ## *** ##
 
-Paracine Fast Native Output Edition
-This is an executable development compiler expansion based on Paracine_Bootstrap_OS_Expansion.cpp (9,844 LOC). It is not a declaration of complete language conformance, full bootstrap self-hosting, or Windows production certification.
-New capabilities
-Backend reuse: The native builder reuses the already verified PMIR and x86-64 machine representation when packaging COFF .obj and PE32+ .exe; no second full PMIR lowering/encoding pass is needed. The original PECOFFGenerator APIs remain usable as compatibility entry points.
 
-Native artifact caching (opt-in): build, pe, and obj accept --cache or --cache-dir PATH. The key incorporates the compiler executable SHA-256, canonical local .pcn source dependency graph contents, target artifact type, -O setting, and selected entry routine. Modified or missing imports invalidate the key; cycles and invalid imports still fail. Each cached artifact stores its own SHA-256 payload integrity checksum. Corrupt cache data produces a miss and regeneration. The compiler itself is fully hashed after a binary update and a persistent SHA-256 fingerprint is reused as long as executable size and high-resolution modification time stay unchanged. Deleting the cache directory forces full compiler identity rehashing. A deliberate adversary preserving executable size/mtime is outside the cache threat model. This is not a cryptographic code-signing or remote-trust system.
 
-Unchanged output preservation: Generated COFF/PE files are compared byte-for-byte before overwriting. Repeated identical builds retain file modification times, reducing downstream build invalidation.
+Build and use Paracine Ultimate
+The full compiler is in Paracine_Project/src/Paracine.cpp; the standalone identical source is Paracine_Ultimate.cpp.
+Windows / MSVC (reproduction instructions, not host-verified)
+cmake -S Paracine_Project -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+build\Debug\paracine.exe test Paracine_Project\bootstrap\unicode_lexer.pcn -O3
+The project requires MSVC C++23 support and uses /permissive- /EHsc /utf-8 /Zc:__cplusplus. Do not silently replace the project source with an older local main.cpp. If Visual Studio reports C3530, inspect the actual source path and failing declaration; the tested source does not contain an auto char variable.
+Linux build / executed here
+cmake -S Paracine_Project -B build -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS_DEBUG='-O0 -g0'
+cmake --build build -j2
+ctest --test-dir build -j4 --output-on-failure
+./build/paracine test Paracine_Project/bootstrap/unicode_lexer.pcn -O3
+New Paracine code
+routine main() gives int with trap
+    let input: text = "λ中🙂"
+    if input.codepoint_count() == 3 and input.codepoint_at(2) == 20013 and not input.is_ascii()
+        give 97
+    give 1
+codepoint_at interprets its index as a UTF-8 byte offset, not a Unicode scalar ordinal. For example, "λ".codepoint_at(1) traps because byte 1 is a continuation byte.
 
-Tools:
-paracine build app.pcn --cache -O3 -o app.exe
-paracine obj app.pcn --cache --cache-dir build/cache -O3 -o app.obj
-paracine size app.pcn -O3
-paracine size app.pcn --json
-paracine audit app.pcn
-paracine audit app.pcn --json -o audit.json
-paracine deps app.pcn
-paracine hash app.pcn app.exe
-paracine profile app.pcn -O3
-size shows .text bytes, imports, IR instructions, and the 20 largest machine-code functions. audit compiles all four optimization levels and reports compilation duration, generated code size, PCIR instruction counts, and block counts. Neither command misrepresents compilation time as generated-program execution speed. hash streams SHA-256 without loading the whole input file. deps reports canonical local sources and per-file SHA-256 values.
-Reproducibility and correctness checks
-The native_fast_output CTest suite runs 58 assertions covering cache miss/hit behavior, import modification invalidation, optimization-level segregation, object and executable byte equality, corruption recovery, no-touch outputs, hashes matching Python's SHA-256 implementation, size/JSON/audit tools, and missing-import errors.
 
-Separately, 24 output comparisons between the previous and upgraded compiler matched byte-for-byte on six .pcn programs, for both .obj/`.exe` and -O0/`-O3` combinations.
-
-The default 14 CTest suites passed on Linux x86-64 using Clang C++23. GCC and strict Clang C++23 syntax checks passed. MSVC/Windows PE loader tests and the optional heavyweight IR harnesses were not run in this pass. The compiler is still a development compiler; safe ownership, full packages/modules, stdlib, and a complete internal COFF linker remain release blockers.
-Performance example (this host, local development build)
-For the Paracine-written arithmetic compiler program, repeated executable builds measured around 55 ms with the prior binary, 47 ms with the upgraded compiler uncached, and 6.4 ms median on cache hits. The first cache-enabled build was around 1.55 s, mostly due to a one-time full SHA-256 of the host compiler executable. Performance changes with build configuration, input complexity, filesystem, and CPU; these numbers are workload-specific, not broad throughput promises.
-Build and test
-cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure -j 3
-For MSVC on Windows (commands provided, not verified here):
-cmake -S . -B build-msvc -G "Visual Studio 17 2022" -A x64
-cmake --build build-msvc --config Release
-ctest --test-dir build-msvc -C Release --output-on-failure
-Cache identity note: compiler executable content is fully hashed once per updated compiler binary per cache directory; subsequent invocations rely on metadata to avoid repeating that expensive work. Cache entries must reside in a trusted local directory. To invalidate manually, remove --cache-dir or .paracine-cache.
 
 ## *** ##
+
+
 
