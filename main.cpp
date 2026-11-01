@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <bit>
+#include <array>
+#include <random>
 #include <charconv>
 #include <cstdint>
 #include <cctype>
@@ -320,9 +322,15 @@ namespace pcn {
                         symbol.push_back(advance());
                     }
 
-                    if (symbol == "(" || symbol == "[" || symbol == "{") ++delimiterDepth_;
+                    if (symbol == "(" || symbol == "[" || symbol == "{") {
+                        groupingStack_.push_back(symbol[0]);
+                        ++delimiterDepth_;
+                    }
                     if (symbol == ")" || symbol == "]" || symbol == "}") {
-                        if (delimiterDepth_ == 0) throw lexicalError("E0111", "unmatched closing delimiter", symbolLoc);
+                        const char expected = symbol == ")" ? '(' : symbol == "]" ? '[' : '{';
+                        if (groupingStack_.empty() || groupingStack_.back() != expected)
+                            throw lexicalError("E0111", "unmatched or mismatched closing delimiter", symbolLoc);
+                        groupingStack_.pop_back();
                         --delimiterDepth_;
                     }
                     tokens.push_back({ TokenKind::Symbol, symbol, symbolLoc });
@@ -491,6 +499,7 @@ namespace pcn {
         std::size_t column_ = 1;
         std::size_t delimiterDepth_ = 0;
         bool pipelineContinuation_ = false;
+        std::vector<char> groupingStack_;
         std::vector<std::size_t> indentStack_{ 0 };
         static constexpr std::size_t kIndentWidth = 4;
     };
@@ -1265,11 +1274,22 @@ namespace pcn {
         StringClear,
         StringDispose,
         StringMove,
+        StringAppend,
         ByteCount,
         TextEquals,
         TextByteAt,
         TextFindByte,
         TextStartsWith,
+        TextEndsWith,
+        TextSlice,
+        TextHash64,
+        TextCodepointAt,
+        TextCodepointCount,
+        TextIsAscii,
+        TextFindText,
+        TextCompare,
+        TextRFindText,
+        TextStreamWrite,
         NumericCheckedCast,
         MakeAggregate,
         ExtractField,
@@ -3825,15 +3845,87 @@ namespace pcn {
                 }
                 return { SemanticTypeKind::Number, "int" };
             }
-            if (objectType.kind == SemanticTypeKind::Text && member.member == "starts_with") {
+            if (objectType.kind == SemanticTypeKind::Text &&
+                (member.member == "compare" || member.member == "contains")) {
                 if (call.arguments.size() != 1 || analyzeExpr(call.arguments[0]).kind != SemanticTypeKind::Text)
-                    report(call.location, "text.starts_with requires exactly one text argument");
+                    report(call.location, "text." + member.member + " requires exactly one text argument");
+                return member.member == "contains" ? makeBoolType() : SemanticType{ SemanticTypeKind::Number,"int" };
+            }
+            if (objectType.kind == SemanticTypeKind::Text && member.member == "rfind") {
+                if (call.arguments.size() != 1 || analyzeExpr(call.arguments[0]).kind != SemanticTypeKind::Text)
+                    report(call.location, "text.rfind requires exactly one text argument");
+                return { SemanticTypeKind::Number,"int" };
+            }
+            if (objectType.kind == SemanticTypeKind::Text && member.member == "find") {
+                if (call.arguments.size() != 1 || analyzeExpr(call.arguments[0]).kind != SemanticTypeKind::Text)
+                    report(call.location, "text.find requires exactly one text argument");
+                return { SemanticTypeKind::Number,"int" };
+            }
+            if (objectType.kind == SemanticTypeKind::Text && member.member == "codepoint_at") {
+                if (call.arguments.size() != 1)report(call.location, "text.codepoint_at expects exactly one byte index");
+                else {
+                    const auto ty = analyzeExpr(call.arguments[0]);
+                    bool fractional = false;
+                    if (const auto* lit = std::get_if<NumberExpr>(&call.arguments[0]->node))
+                        fractional = lit->value.find('.') != std::string::npos ||
+                        (lit->value.rfind("0x", 0) != 0 && lit->value.rfind("0X", 0) != 0 &&
+                            lit->value.rfind("0b", 0) != 0 && lit->value.rfind("0B", 0) != 0 &&
+                            lit->value.find_first_of("eE") != std::string::npos);
+                    if (ty.kind != SemanticTypeKind::Number || ty.name == "float" || ty.name == "double" || fractional)
+                        report(call.location, "text.codepoint_at requires an integral byte index");
+                }
+                return { SemanticTypeKind::Number,"int" };
+            }
+            if (objectType.kind == SemanticTypeKind::Text &&
+                (member.member == "codepoint_count" || member.member == "is_ascii")) {
+                if (!call.arguments.empty())report(call.location, "text." + member.member + " takes no arguments");
+                return member.member == "is_ascii" ? makeBoolType() : SemanticType{ SemanticTypeKind::Number,"int" };
+            }
+            if (objectType.kind == SemanticTypeKind::Text && member.member == "hash64") {
+                if (!call.arguments.empty())report(call.location, "text.hash64() takes no arguments");
+                return { SemanticTypeKind::Number,"int" };
+            }
+            if (objectType.kind == SemanticTypeKind::Text && member.member == "slice") {
+                if (call.arguments.size() != 2) {
+                    report(call.location, "text.slice(start, length) requires two integer byte offsets");
+                }
+                else {
+                    for (const auto& argument : call.arguments) {
+                        const auto ty = analyzeExpr(argument);
+                        bool decimalFraction = false;
+                        if (const auto* literal = std::get_if<NumberExpr>(&argument->node)) {
+                            const auto& n = literal->value;
+                            decimalFraction = n.find('.') != std::string::npos ||
+                                ((n.rfind("0x", 0) != 0 && n.rfind("0X", 0) != 0 &&
+                                    n.rfind("0b", 0) != 0 && n.rfind("0B", 0) != 0) &&
+                                    n.find_first_of("eE") != std::string::npos);
+                        }
+                        if (ty.kind != SemanticTypeKind::Number || ty.name == "float" ||
+                            ty.name == "double" || decimalFraction)
+                            report(call.location, "text.slice requires integer byte offsets");
+                    }
+                }
+                return makeTextType();
+            }
+            if (objectType.kind == SemanticTypeKind::Text && (member.member == "starts_with" || member.member == "ends_with")) {
+                if (call.arguments.size() != 1 || analyzeExpr(call.arguments[0]).kind != SemanticTypeKind::Text)
+                    report(call.location, "text." + member.member + " requires exactly one text argument");
+                return makeBoolType();
+            }
+            if (objectType.kind == SemanticTypeKind::Text &&
+                (member.member == "stdout_write" || member.member == "stderr_write")) {
+                if (!call.arguments.empty())report(call.location, "text stream write takes no arguments");
                 return makeBoolType();
             }
             if (objectType.kind == SemanticTypeKind::Text && member.member == "equals") {
                 if (call.arguments.size() != 1 || analyzeExpr(call.arguments[0]).kind != SemanticTypeKind::Text)
                     report(call.location, "text.equals requires one text argument");
                 return makeBoolType();
+            }
+            if (objectType.kind == SemanticTypeKind::String && member.member == "append") {
+                if (call.arguments.size() != 1 || semanticTypeName(analyzeExpr(call.arguments[0])) != "text")
+                    report(call.location, "string.append requires exactly one text argument");
+                return makeVoidType();
             }
             if (objectType.kind == SemanticTypeKind::String && (member.member == "clear" || member.member == "dispose")) {
                 if (!call.arguments.empty()) {
@@ -4517,7 +4609,7 @@ namespace pcn {
             }return nullptr;
         }
         std::string inferCallType(const CallExpr& c) {
-            if (auto* m = c.callee ? std::get_if<MemberExpr>(&c.callee->node) : nullptr) { auto o = inferExprType(m->object); if (o == "text" && m->member == "to_string")return "string"; if (o == "string" && m->member == "to_text")return "text"; if ((o == "text" || o == "string") && m->member == "count")return "size"; if (o == "text" && (m->member == "equals" || m->member == "starts_with"))return "bool"; if (o == "text" && (m->member == "byte_at" || m->member == "find_byte"))return "int"; if ((o == "size" && m->member == "to_int") || (o == "int" && m->member == "to_size"))return m->member == "to_int" ? "int" : "size"; if (o == "string" && (m->member == "clear" || m->member == "dispose"))return "void"; }
+            if (auto* m = c.callee ? std::get_if<MemberExpr>(&c.callee->node) : nullptr) { auto o = inferExprType(m->object); if (o == "text" && m->member == "to_string")return "string"; if (o == "string" && m->member == "to_text")return "text"; if ((o == "text" || o == "string") && m->member == "count")return "size"; if (o == "text" && (m->member == "equals" || m->member == "starts_with" || m->member == "ends_with" || m->member == "stdout_write" || m->member == "stderr_write" || m->member == "is_ascii" || m->member == "contains"))return "bool"; if (o == "text" && (m->member == "byte_at" || m->member == "find_byte" || m->member == "find" || m->member == "hash64" || m->member == "codepoint_at" || m->member == "codepoint_count" || m->member == "compare" || m->member == "rfind"))return "int"; if ((o == "size" && m->member == "to_int") || (o == "int" && m->member == "to_size"))return m->member == "to_int" ? "int" : "size"; if (o == "string" && (m->member == "clear" || m->member == "dispose" || m->member == "append"))return "void"; }
             auto* v = c.callee ? std::get_if<VariableExpr>(&c.callee->node) : nullptr; if (v && (v->name == "ok" || v->name == "err" || v->name == "some") && c.arguments.size() == 1)return "__" + v->name + "<" + inferExprType(c.arguments[0]) + ">"; if (v && v->name == "none")return "__none"; std::map<std::string, std::string>s; if (auto* r = resolveCall(c, &s))return substituteGenericType(r->returnType, s); return "unknown";
         }
 
@@ -4574,7 +4666,7 @@ namespace pcn {
             if (auto* m = call.callee ? std::get_if<MemberExpr>(&call.callee->node) : nullptr) {
                 const std::string objectType = inferExprType(m->object);
                 walkExpr(m->object, inClosure);
-                if (auto* v = m->object ? std::get_if<VariableExpr>(&m->object->node) : nullptr) { if (auto* ls = lookup(v->name)) { static const std::unordered_set<std::string> mutators = { "clear", "dispose" }; if (objectType == "string" && mutators.contains(m->member))addBorrow(*ls, v->name, BorrowKind::Exclusive, point_, point_, 0, false, call.location); else if (objectType == "string" && m->member == "to_text")addBorrow(*ls, v->name, BorrowKind::Shared, point_, point_, 0, false, call.location); } }
+                if (auto* v = m->object ? std::get_if<VariableExpr>(&m->object->node) : nullptr) { if (auto* ls = lookup(v->name)) { static const std::unordered_set<std::string> mutators = { "clear", "dispose", "append" }; if (objectType == "string" && mutators.contains(m->member))addBorrow(*ls, v->name, BorrowKind::Exclusive, point_, point_, 0, false, call.location); else if (objectType == "string" && m->member == "to_text")addBorrow(*ls, v->name, BorrowKind::Shared, point_, point_, 0, false, call.location); } }
                 result_->skm.calls.push_back({ currentRoutine_,objectType + "." + m->member,call.location });
                 for (const auto& a : call.arguments)walkExpr(a, inClosure);
                 return;
@@ -4606,7 +4698,7 @@ namespace pcn {
             if (!e)return; std::visit([&](const auto& n) {using T = std::decay_t<decltype(n)>;
             if constexpr (std::is_same_v<T, UnaryExpr>)inferClosureExprEffects(n.operand, out);
             else if constexpr (std::is_same_v<T, BinaryExpr>) { inferClosureExprEffects(n.left, out); inferClosureExprEffects(n.right, out); if (n.op == "/" || n.op == "%")out.insert("trap"); }
-            else if constexpr (std::is_same_v<T, CallExpr>) { for (auto& a : n.arguments)inferClosureExprEffects(a, out); if (auto* m = n.callee ? std::get_if<MemberExpr>(&n.callee->node) : nullptr) { inferClosureExprEffects(m->object, out); if (m->member == "to_string")out.insert("alloc"); if (m->member == "byte_at" || m->member == "to_int" || m->member == "to_size")out.insert("trap"); } else if (auto* v = n.callee ? std::get_if<VariableExpr>(&n.callee->node) : nullptr) { if (v->name == "print" || v->name == "println")out.insert("io"); auto ri = routines_.find(v->name); if (ri != routines_.end())for (auto* r : ri->second)if (r->parameters.size() == n.arguments.size()) { auto ef = result_->resolvedEffects.find(keyFor(*r)); if (ef != result_->resolvedEffects.end())out.insert(ef->second.begin(), ef->second.end()); break; } } }
+            else if constexpr (std::is_same_v<T, CallExpr>) { for (auto& a : n.arguments)inferClosureExprEffects(a, out); if (auto* m = n.callee ? std::get_if<MemberExpr>(&n.callee->node) : nullptr) { inferClosureExprEffects(m->object, out); if (m->member == "to_string" || m->member == "append")out.insert("alloc"); if (m->member == "append")out.insert("trap"); if (m->member == "stdout_write" || m->member == "stderr_write")out.insert("io"); if (m->member == "byte_at" || m->member == "codepoint_at" || m->member == "to_int" || m->member == "to_size")out.insert("trap"); } else if (auto* v = n.callee ? std::get_if<VariableExpr>(&n.callee->node) : nullptr) { if (v->name == "print" || v->name == "println")out.insert("io"); auto ri = routines_.find(v->name); if (ri != routines_.end())for (auto* r : ri->second)if (r->parameters.size() == n.arguments.size()) { auto ef = result_->resolvedEffects.find(keyFor(*r)); if (ef != result_->resolvedEffects.end())out.insert(ef->second.begin(), ef->second.end()); break; } } }
             else if constexpr (std::is_same_v<T, PipelineExpr>) { inferClosureExprEffects(n.input, out); for (auto& x : n.stages)inferClosureExprEffects(x, out); }
             else if constexpr (std::is_same_v<T, RangeExpr>) { inferClosureExprEffects(n.start, out); inferClosureExprEffects(n.end, out); inferClosureExprEffects(n.step, out); }
             else if constexpr (std::is_same_v<T, ChooseExpr>) { inferClosureExprEffects(n.subject, out); for (auto& x : n.cases) { inferClosureExprEffects(x.condition, out); inferClosureExprEffects(x.value, out); }inferClosureExprEffects(n.otherwiseValue, out); }
@@ -4880,10 +4972,16 @@ namespace pcn {
                     for (const auto& a : node.arguments) collectExprEffects(a, facts);
                     if (const auto* member = node.callee ? std::get_if<MemberExpr>(&node.callee->node) : nullptr) {
                         collectExprEffects(member->object, facts);
+                        if (member->member == "stdout_write" || member->member == "stderr_write") {
+                            facts.direct.insert("io");
+                        }
+                        if (member->member == "append") {
+                            facts.direct.insert("alloc"); facts.direct.insert("trap");
+                        }
                         if (member->member == "to_string") {
                             facts.direct.insert("alloc");
                         }
-                        else if (member->member == "byte_at" || member->member == "to_int" || member->member == "to_size") {
+                        else if (member->member == "byte_at" || member->member == "codepoint_at" || member->member == "slice" || member->member == "to_int" || member->member == "to_size") {
                             facts.direct.insert("trap");
                         }
                     }
@@ -4995,7 +5093,7 @@ namespace pcn {
                     if (const auto* member = node.callee ? std::get_if<MemberExpr>(&node.callee->node) : nullptr) {
                         analyzeBorrowExpr(member->object, state);
                         const std::string objectType = inferBorrowType(member->object, state);
-                        static const std::unordered_set<std::string> mutators = { "clear", "dispose" };
+                        static const std::unordered_set<std::string> mutators = { "clear", "dispose", "append" };
                         if (objectType == "string" && mutators.contains(member->member)) {
                             const auto* variable = member->object ? std::get_if<VariableExpr>(&member->object->node) : nullptr;
                             auto* sym = variable ? lookup(state, variable->name) : nullptr;
@@ -6467,10 +6565,11 @@ namespace pcn {
                         if (objectType.kind == IRValueKind::Text && m->member == "to_string")return makeIRStringType();
                         if (objectType.kind == IRValueKind::String && m->member == "to_text")return makeIRTextType();
                         if ((objectType.kind == IRValueKind::Text || objectType.kind == IRValueKind::String) && m->member == "count")return makeIRIntType();
-                        if (objectType.kind == IRValueKind::Text && (m->member == "equals" || m->member == "starts_with"))return makeIRBoolType();
-                        if (objectType.kind == IRValueKind::Text && (m->member == "byte_at" || m->member == "find_byte"))return makeIRIntType();
+                        if (objectType.kind == IRValueKind::Text && (m->member == "equals" || m->member == "starts_with" || m->member == "ends_with" || m->member == "stdout_write" || m->member == "stderr_write" || m->member == "is_ascii" || m->member == "contains"))return makeIRBoolType();
+                        if (objectType.kind == IRValueKind::Text && (m->member == "byte_at" || m->member == "find_byte" || m->member == "find" || m->member == "hash64" || m->member == "codepoint_at" || m->member == "codepoint_count" || m->member == "compare" || m->member == "rfind"))return makeIRIntType();
+                        if (objectType.kind == IRValueKind::Text && m->member == "slice")return makeIRTextType();
                         if ((m->member == "to_int" || m->member == "to_size") && objectType.kind == IRValueKind::Int64)return makeIRIntType();
-                        if (objectType.kind == IRValueKind::String && m->member == "clear")return makeIRVoidType();
+                        if (objectType.kind == IRValueKind::String && (m->member == "clear" || m->member == "append"))return makeIRVoidType();
                     }
                     if (const auto* v = node.callee ? std::get_if<VariableExpr>(&node.callee->node) : nullptr) {
                         if (v->name == "ok" || v->name == "err") return currentReturnType_.rfind("result<", 0) == 0 ? irValueTypeFromName(currentReturnType_) : IRValueType{ IRValueKind::Result,"result" };
@@ -6676,17 +6775,101 @@ namespace pcn {
                     inst.args.push_back(lowerExpr(node.arguments[0]));
                     emit(inst); lastValueType_ = inst.valueType; return dest;
                 }
-                if (objectType.kind == IRValueKind::Text && member->member == "starts_with") {
-                    if (node.arguments.size() != 1)throw std::runtime_error("text.starts_with requires one text argument");
-                    auto dest = allocateVReg(); inst.op = IROpcode::TextStartsWith; inst.dest = dest;
+                if (objectType.kind == IRValueKind::Text && member->member == "compare") {
+                    if (node.arguments.size() != 1)throw std::runtime_error("text.compare requires one text argument");
+                    const auto dest = allocateVReg(); inst.op = IROpcode::TextCompare; inst.dest = dest;
+                    inst.args.push_back(lowerExpr(member->object));
+                    inst.args.push_back(lowerExprWithExpected(node.arguments[0], makeIRTextType()));
+                    inst.valueType = makeIRIntType(); emit(inst); lastValueType_ = inst.valueType; return dest;
+                }
+                if (objectType.kind == IRValueKind::Text && member->member == "contains") {
+                    if (node.arguments.size() != 1)throw std::runtime_error("text.contains requires one text argument");
+                    const auto src = lowerExpr(member->object);
+                    const auto needle = lowerExprWithExpected(node.arguments[0], makeIRTextType());
+                    IRInstruction search; search.op = IROpcode::TextFindText; search.dest = allocateVReg();
+                    search.args = { src,needle }; search.valueType = makeIRIntType();
+                    emit(search);
+                    const auto missing = emitConst(IROpcode::ConstInt, "-1");
+                    IRInstruction found; found.op = IROpcode::Ne; found.dest = allocateVReg();
+                    found.args = { search.dest,missing }; found.valueType = makeIRBoolType();
+                    emit(found); lastValueType_ = found.valueType; return found.dest;
+                }
+                if (objectType.kind == IRValueKind::Text && member->member == "rfind") {
+                    if (node.arguments.size() != 1)throw std::runtime_error("text.rfind requires one text argument");
+                    const auto dest = allocateVReg(); inst.op = IROpcode::TextRFindText; inst.dest = dest;
+                    inst.args.push_back(lowerExpr(member->object));
+                    inst.args.push_back(lowerExprWithExpected(node.arguments[0], makeIRTextType()));
+                    inst.valueType = makeIRIntType(); emit(inst); lastValueType_ = inst.valueType; return dest;
+                }
+                if (objectType.kind == IRValueKind::Text && member->member == "find") {
+                    if (node.arguments.size() != 1)throw std::runtime_error("text.find requires one text argument");
+                    auto dest = allocateVReg(); inst.op = IROpcode::TextFindText; inst.dest = dest;
+                    inst.args.push_back(lowerExpr(member->object));
+                    inst.args.push_back(lowerExprWithExpected(node.arguments[0], makeIRTextType()));
+                    inst.valueType = makeIRIntType(); emit(inst); lastValueType_ = inst.valueType; return dest;
+                }
+                if (objectType.kind == IRValueKind::Text && member->member == "codepoint_at") {
+                    if (node.arguments.size() != 1)throw std::runtime_error("text.codepoint_at requires one byte index");
+                    auto dest = allocateVReg(); inst.op = IROpcode::TextCodepointAt; inst.dest = dest;
+                    inst.args.push_back(lowerExpr(member->object)); inst.args.push_back(lowerExpr(node.arguments[0]));
+                    inst.valueType = makeIRIntType(); emit(inst); lastValueType_ = inst.valueType; return dest;
+                }
+                if (objectType.kind == IRValueKind::Text &&
+                    (member->member == "codepoint_count" || member->member == "is_ascii")) {
+                    if (!node.arguments.empty())throw std::runtime_error("text Unicode query takes no arguments");
+                    auto dest = allocateVReg(); inst.op = member->member == "is_ascii" ? IROpcode::TextIsAscii : IROpcode::TextCodepointCount;
+                    inst.dest = dest; inst.args.push_back(lowerExpr(member->object));
+                    inst.valueType = member->member == "is_ascii" ? makeIRBoolType() : makeIRIntType();
+                    emit(inst); lastValueType_ = inst.valueType; return dest;
+                }
+                if (objectType.kind == IRValueKind::Text && member->member == "hash64") {
+                    if (!node.arguments.empty())throw std::runtime_error("text.hash64 takes no arguments");
+                    auto dest = allocateVReg(); inst.op = IROpcode::TextHash64; inst.dest = dest;
+                    inst.args.push_back(lowerExpr(member->object)); inst.valueType = makeIRIntType();
+                    emit(inst); lastValueType_ = inst.valueType; return dest;
+                }
+                if (objectType.kind == IRValueKind::Text && member->member == "slice") {
+                    if (node.arguments.size() != 2)throw std::runtime_error("text.slice requires start and length");
+                    auto dest = allocateVReg(); inst.op = IROpcode::TextSlice; inst.dest = dest;
+                    inst.args.push_back(lowerExpr(member->object));
+                    inst.args.push_back(lowerExpr(node.arguments[0]));
+                    inst.args.push_back(lowerExpr(node.arguments[1]));
+                    // Preserve borrowed-owner provenance through a subview. Without
+                    // this edge, `give local.to_text().slice(...)` could escape
+                    // the storage that automatic scope cleanup immediately frees.
+                    if (const auto owner = textViewOwners_.find(static_cast<std::uint32_t>(inst.args[0]));
+                        owner != textViewOwners_.end())
+                        textViewOwners_[static_cast<std::uint32_t>(dest)] = owner->second;
+                    inst.valueType = makeIRTextType(); emit(inst); lastValueType_ = inst.valueType; return dest;
+                }
+                if (objectType.kind == IRValueKind::Text && (member->member == "starts_with" || member->member == "ends_with")) {
+                    if (node.arguments.size() != 1)throw std::runtime_error("text prefix/suffix method requires one text argument");
+                    auto dest = allocateVReg(); inst.op = member->member == "starts_with" ? IROpcode::TextStartsWith : IROpcode::TextEndsWith; inst.dest = dest;
                     inst.args.push_back(lowerExpr(member->object)); inst.args.push_back(lowerExpr(node.arguments[0]));
                     inst.valueType = makeIRBoolType(); emit(inst); lastValueType_ = inst.valueType; return dest;
+                }
+                if (objectType.kind == IRValueKind::Text &&
+                    (member->member == "stdout_write" || member->member == "stderr_write")) {
+                    if (!node.arguments.empty())throw std::runtime_error("text stream write requires no arguments");
+                    auto dest = allocateVReg(); inst.op = IROpcode::TextStreamWrite;
+                    inst.dest = dest; inst.valueType = makeIRBoolType();
+                    inst.literalText = member->member == "stdout_write" ? "stdout" : "stderr";
+                    inst.args.push_back(lowerExpr(member->object)); emit(inst);
+                    lastValueType_ = inst.valueType; return dest;
                 }
                 if (objectType.kind == IRValueKind::Text && member->member == "equals") {
                     if (node.arguments.size() != 1)throw std::runtime_error("text.equals requires one argument");
                     auto dest = allocateVReg(); inst.op = IROpcode::TextEquals; inst.dest = dest;
                     inst.args.push_back(lowerExpr(member->object)); inst.args.push_back(lowerExpr(node.arguments[0]));
                     inst.valueType = makeIRBoolType(); emit(inst); lastValueType_ = inst.valueType; return dest;
+                }
+                if (objectType.kind == IRValueKind::String && member->member == "append") {
+                    if (node.arguments.size() != 1)throw std::runtime_error("string.append requires one text argument");
+                    auto dest = allocateVReg(); inst.op = IROpcode::StringAppend; inst.dest = dest;
+                    inst.args.push_back(lowerExpr(member->object));
+                    inst.args.push_back(lowerExprWithExpected(node.arguments[0], makeIRTextType()));
+                    inst.valueType = makeIRVoidType(); inst.typeName = "string";
+                    emit(inst); lastValueType_ = inst.valueType; return dest;
                 }
                 if (objectType.kind == IRValueKind::String && (member->member == "clear" || member->member == "dispose")) {
                     if (!node.arguments.empty()) throw std::runtime_error("PCIR string.clear takes no arguments");
@@ -6999,6 +7182,27 @@ namespace pcn {
                         errors.push_back(fn.name + ": malformed record field write");
                     if (inst.op == IROpcode::ArrayStore && (inst.args.size() != 3 || inst.dest != VReg::None))
                         errors.push_back(fn.name + ": malformed checked indexed write");
+                    if ((inst.op == IROpcode::TextFindText || inst.op == IROpcode::TextCompare || inst.op == IROpcode::TextRFindText) && (inst.args.size() != 2 ||
+                        inst.valueType.kind != IRValueKind::Int64 || inst.dest == VReg::None))
+                        errors.push_back(fn.name + ": malformed UTF-8 substring search");
+                    if (inst.op == IROpcode::TextCodepointAt && (inst.args.size() != 2 ||
+                        inst.valueType.kind != IRValueKind::Int64 || inst.dest == VReg::None))
+                        errors.push_back(fn.name + ": malformed checked Unicode decoder");
+                    if (inst.op == IROpcode::TextCodepointCount && (inst.args.size() != 1 ||
+                        inst.valueType.kind != IRValueKind::Int64 || inst.dest == VReg::None))
+                        errors.push_back(fn.name + ": malformed Unicode scalar count");
+                    if (inst.op == IROpcode::TextIsAscii && (inst.args.size() != 1 ||
+                        inst.valueType.kind != IRValueKind::Bool || inst.dest == VReg::None))
+                        errors.push_back(fn.name + ": malformed ASCII predicate");
+                    if (inst.op == IROpcode::TextHash64 && (inst.args.size() != 1 ||
+                        inst.valueType.kind != IRValueKind::Int64 || inst.dest == VReg::None))
+                        errors.push_back(fn.name + ": malformed UTF-8 byte hash");
+                    if (inst.op == IROpcode::TextSlice && (inst.args.size() != 3 ||
+                        inst.valueType.kind != IRValueKind::Text || inst.dest == VReg::None))
+                        errors.push_back(fn.name + ": malformed checked UTF-8 text slice");
+                    if (inst.op == IROpcode::TextEndsWith && (inst.args.size() != 2 ||
+                        inst.valueType.kind != IRValueKind::Bool))
+                        errors.push_back(fn.name + ": malformed text suffix comparison");
                     if (inst.op == IROpcode::StringDispose && inst.args.size() != 1)
                         errors.push_back(fn.name + ": owned-string drop requires one operand");
                     if (inst.op == IROpcode::Branch && inst.targetBlocks.size() != 1) errors.push_back(fn.name + ": branch requires one target");
@@ -7109,7 +7313,7 @@ namespace pcn {
             case IROpcode::Add: case IROpcode::Sub: case IROpcode::Mul: case IROpcode::BitAnd: case IROpcode::BitOr:
             case IROpcode::BitXor: case IROpcode::Shl: case IROpcode::Shr: case IROpcode::Neg: case IROpcode::BitNot:
             case IROpcode::Not: case IROpcode::Eq: case IROpcode::Ne: case IROpcode::Lt: case IROpcode::Le:
-            case IROpcode::Gt: case IROpcode::Ge: case IROpcode::And: case IROpcode::Or: case IROpcode::StringToText:case IROpcode::ByteCount:case IROpcode::TextEquals:case IROpcode::TextByteAt:case IROpcode::TextFindByte:case IROpcode::TextStartsWith:case IROpcode::NumericCheckedCast:
+            case IROpcode::Gt: case IROpcode::Ge: case IROpcode::And: case IROpcode::Or: case IROpcode::StringToText:case IROpcode::ByteCount:case IROpcode::TextEquals:case IROpcode::TextFindByte:case IROpcode::TextStartsWith:case IROpcode::TextEndsWith:case IROpcode::TextHash64:case IROpcode::TextCodepointCount:case IROpcode::TextIsAscii:case IROpcode::TextFindText:case IROpcode::TextCompare:case IROpcode::TextRFindText:
             case IROpcode::MakeAggregate: case IROpcode::ExtractField: case IROpcode::ResultOk: case IROpcode::ResultErr:
             case IROpcode::OptionSome: case IROpcode::OptionNone: case IROpcode::MakeClosure: return true;
             default: return false;
@@ -7358,7 +7562,8 @@ namespace pcn {
                 const auto& n = ni->second; ABITypeLayout x; x.kind = ABIRepresentationKind::Aggregate; x.typeName = name; x.rich = true;
                 if (const auto* sl = skmLayout(name)) { x.size = sl->size; x.alignment = sl->alignment; for (const auto& f : n.fields) { std::size_t off = 0; for (const auto& sf : sl->fieldOffsets)if (sf.first == f.first) { off = sf.second; break; }x.fields.push_back({ f.first,f.second,off,false }); } }
                 else { std::size_t off = 0, al = 1; for (const auto& f : n.fields) { auto fl = layout(f.second); off = alignUp(off, fl.alignment); x.fields.push_back({ f.first,f.second,off,false }); off += fl.size; al = std::max(al, fl.alignment); }x.alignment = al; x.size = alignUp(off, al); }
-                if (x.size == 0)x.size = 1; return x;
+                if (x.size == 0)x.size = 1;
+                return x;
             }
             return scalarLayout(name, 8, 8, false);
         }
@@ -7554,7 +7759,8 @@ namespace pcn {
                         if (!inst.argumentValueTypes.empty() &&
                             (inst.argumentValueTypes[0].kind == IRValueKind::Float32 || inst.argumentValueTypes[0].kind == IRValueKind::Float64))
                             set(scalar(floatBinary(inst.op, asInt(get(0)), asInt(get(1)), inst.argumentValueTypes[0].kind == IRValueKind::Float32)));
-                        else set(scalar(binary(inst.op, asInt(get(0)), asInt(get(1))))); break;
+                        else set(scalar(binary(inst.op, asInt(get(0)), asInt(get(1)))));
+                        break;
                     }
                     case IROpcode::Branch:pred = block.id; current = bi.at(static_cast<std::uint32_t>(inst.targetBlocks.at(0))); jumped = true; break; case IROpcode::BranchIf:pred = block.id; current = bi.at(static_cast<std::uint32_t>(asInt(get(0)) ? inst.targetBlocks.at(0) : inst.targetBlocks.at(1))); jumped = true; break;
                     case IROpcode::Call: { std::vector<Value>ca; for (auto v : inst.args)ca.push_back(regs.at(static_cast<std::uint32_t>(v))); if (inst.callee == "print" || inst.callee == "println") { if (!ca.empty())std::cout << asInt(ca.front()); if (inst.callee == "println")std::cout << '\n'; set(scalar(0)); } else { auto it = functions_.find(inst.callee); if (it == functions_.end())throw std::runtime_error("PCIR oracle unresolved call: " + inst.callee); set(execute(*it->second, ca)); }break; }
@@ -7565,11 +7771,114 @@ namespace pcn {
                         if (v < 0)throw std::runtime_error("Paracine trap: checked integer conversion out of range");
                         set(scalar(v)); break;
                     }
+                    case IROpcode::TextStreamWrite: {
+                        auto src = get(0);
+                        if (!src.object || src.object->typeName != "text")throw std::runtime_error("text stream write requires text");
+                        std::ostream& stream = (inst.literalText == "stderr") ? std::cerr : std::cout;
+                        stream.write(src.object->text.data(), static_cast<std::streamsize>(src.object->text.size()));
+                        stream.flush(); set(scalar(stream.good() ? 1 : 0)); break;
+                    }
                     case IROpcode::TextStartsWith: {
                         const auto hay = get(0), needle = get(1);
                         if (!hay.object || !needle.object || hay.object->typeName != "text" || needle.object->typeName != "text")
                             throw std::runtime_error("PCIR text.starts_with requires two text values");
                         set(scalar(hay.object->text.starts_with(needle.object->text))); break;
+                    }
+                    case IROpcode::TextRFindText: {
+                        const auto hay = get(0), needle = get(1);
+                        if (!hay.object || !needle.object || hay.object->typeName != "text" || needle.object->typeName != "text")
+                            throw std::runtime_error("PCIR text.rfind requires text operands");
+                        const auto pos = hay.object->text.rfind(needle.object->text);
+                        set(scalar(pos == std::string::npos ? -1 : static_cast<std::int64_t>(pos))); break;
+                    }
+                    case IROpcode::TextCompare: {
+                        const auto lhs = get(0), rhs = get(1);
+                        if (!lhs.object || !rhs.object || lhs.object->typeName != "text" || rhs.object->typeName != "text")
+                            throw std::runtime_error("PCIR text.compare requires text operands");
+                        const auto& a = lhs.object->text; const auto& b = rhs.object->text;
+                        const auto count = std::min(a.size(), b.size());
+                        std::int64_t cmp = 0;
+                        for (std::size_t j = 0; j < count; ++j) {
+                            const auto ca = static_cast<unsigned char>(a[j]);
+                            const auto cb = static_cast<unsigned char>(b[j]);
+                            if (ca != cb) { cmp = ca < cb ? -1 : 1; break; }
+                        }
+                        if (!cmp)cmp = a.size() < b.size() ? -1 : (a.size() > b.size() ? 1 : 0);
+                        set(scalar(cmp)); break;
+                    }
+                    case IROpcode::TextFindText: {
+                        const auto hay = get(0), needle = get(1);
+                        if (!hay.object || !needle.object || hay.object->typeName != "text" || needle.object->typeName != "text")
+                            throw std::runtime_error("PCIR text.find requires two text operands");
+                        const auto pos = hay.object->text.find(needle.object->text);
+                        set(scalar(pos == std::string::npos ? -1 : static_cast<std::int64_t>(pos))); break;
+                    }
+                    case IROpcode::TextCodepointAt: {
+                        const auto source = get(0); const auto index = asInt(get(1));
+                        if (!source.object || source.object->typeName != "text")throw std::runtime_error("PCIR Unicode decode requires text");
+                        const auto& bytes = source.object->text;
+                        if (index < 0 || static_cast<std::uint64_t>(index) >= bytes.size())
+                            throw std::runtime_error("Paracine trap: Unicode index outside text");
+                        const auto pos = static_cast<std::size_t>(index);
+                        const auto lead = static_cast<unsigned char>(bytes[pos]);
+                        unsigned continuation = 0; std::uint32_t value = 0, minValue = 0;
+                        if (lead < 0x80u) { set(scalar(lead)); break; }
+                        if (lead >= 0xC2u && lead <= 0xDFu) { continuation = 1; value = lead & 0x1Fu; minValue = 0x80; }
+                        else if (lead >= 0xE0u && lead <= 0xEFu) { continuation = 2; value = lead & 0x0Fu; minValue = 0x800; }
+                        else if (lead >= 0xF0u && lead <= 0xF4u) { continuation = 3; value = lead & 0x07u; minValue = 0x10000; }
+                        else throw std::runtime_error("Paracine trap: index not at Unicode scalar start");
+                        if (bytes.size() - pos <= continuation)throw std::runtime_error("Paracine trap: truncated UTF-8 scalar");
+                        for (unsigned j = 1; j <= continuation; ++j) {
+                            const auto byte = static_cast<unsigned char>(bytes[pos + j]);
+                            if ((byte & 0xC0u) != 0x80u)throw std::runtime_error("Paracine trap: invalid UTF-8 continuation");
+                            value = (value << 6) | (byte & 0x3Fu);
+                        }
+                        if (value < minValue || value>0x10FFFFu || (value >= 0xD800u && value <= 0xDFFFu))
+                            throw std::runtime_error("Paracine trap: noncanonical UTF-8 scalar");
+                        set(scalar(value)); break;
+                    }
+                    case IROpcode::TextCodepointCount: {
+                        const auto source = get(0);
+                        if (!source.object || source.object->typeName != "text")throw std::runtime_error("PCIR scalar count requires text");
+                        std::int64_t count = 0;
+                        for (unsigned char byte : source.object->text)if ((byte & 0xC0u) != 0x80u)++count;
+                        set(scalar(count)); break;
+                    }
+                    case IROpcode::TextIsAscii: {
+                        const auto source = get(0);
+                        if (!source.object || source.object->typeName != "text")throw std::runtime_error("PCIR ASCII check requires text");
+                        bool ascii = true; for (unsigned char byte : source.object->text)if (byte >= 0x80u) { ascii = false; break; }
+                        set(scalar(ascii)); break;
+                    }
+                    case IROpcode::TextHash64: {
+                        const auto src = get(0);
+                        if (!src.object || src.object->typeName != "text")throw std::runtime_error("PCIR text.hash64 requires text");
+                        std::uint64_t value = 14695981039346656037ull;
+                        for (unsigned char byte : src.object->text) {
+                            value ^= byte;
+                            value *= 1099511628211ull;
+                        }
+                        set(scalar(std::bit_cast<std::int64_t>(value))); break;
+                    }
+                    case IROpcode::TextEndsWith: {
+                        const auto hay = get(0), needle = get(1);
+                        if (!hay.object || !needle.object || hay.object->typeName != "text" || needle.object->typeName != "text")
+                            throw std::runtime_error("PCIR text.ends_with requires two text values");
+                        set(scalar(hay.object->text.ends_with(needle.object->text))); break;
+                    }
+                    case IROpcode::TextSlice: {
+                        const auto src = get(0);
+                        const auto begin = asInt(get(1)), length = asInt(get(2));
+                        if (!src.object || src.object->typeName != "text")throw std::runtime_error("PCIR text.slice requires text");
+                        const auto& bytes = src.object->text;
+                        if (begin<0 || length<0 || static_cast<std::uint64_t>(begin)>bytes.size() ||
+                            static_cast<std::uint64_t>(length)>bytes.size() - static_cast<std::size_t>(begin))
+                            throw std::runtime_error("Paracine trap: text.slice out of bounds");
+                        const std::size_t start = static_cast<std::size_t>(begin), end = start + static_cast<std::size_t>(length);
+                        auto boundary = [&](std::size_t at) {return at == bytes.size() ||
+                            (static_cast<unsigned char>(bytes[at]) & 0xc0u) != 0x80u; };
+                        if (!boundary(start) || !boundary(end))throw std::runtime_error("Paracine trap: text.slice splits UTF-8 code point");
+                        auto v = object("text"); v.object->text = bytes.substr(start, static_cast<std::size_t>(length)); set(v); break;
                     }
                     case IROpcode::TextByteAt: {
                         auto src = get(0); auto index = asInt(get(1));
@@ -7587,6 +7896,14 @@ namespace pcn {
                     }
                     case IROpcode::TextEquals: { auto x = get(0), y = get(1); if (!x.object || !y.object || x.object->typeName != "text" || y.object->typeName != "text")throw std::runtime_error("PCIR text.equals requires two text values"); set(scalar(x.object->text == y.object->text)); break; }
                     case IROpcode::ByteCount: { auto src = get(0); if (!src.object)throw std::runtime_error("PCIR byte_count requires text/string"); set(scalar(static_cast<std::int64_t>(src.object->text.size()))); break; }
+                    case IROpcode::StringAppend: {
+                        auto target = get(0), added = get(1);
+                        if (!target.object || target.object->typeName != "string" || !added.object || added.object->typeName != "text")
+                            throw std::runtime_error("PCIR string.append needs owning string and text");
+                        if (added.object->text.size() > target.object->text.max_size() - target.object->text.size())
+                            throw std::runtime_error("Paracine trap: string.append capacity overflow");
+                        target.object->text.append(added.object->text); set(scalar(0)); break;
+                    }
                     case IROpcode::StringMove: { auto src = get(0); if (!src.object || src.object->typeName != "string")throw std::runtime_error("PCIR oracle string.move on non-string"); auto v = object("string"); v.object->text = std::move(src.object->text); set(v); break; }
                     case IROpcode::StringDispose: { auto src = get(0); if (!src.object || src.object->typeName != "string")throw std::runtime_error("PCIR oracle string.dispose on non-string"); src.object->text.clear(); set(scalar(0)); break; }
                     case IROpcode::StringClear: { auto src = get(0); if (!src.object || src.object->typeName != "string")throw std::runtime_error("PCIR oracle string.clear on non-string"); src.object->text.clear(); set(scalar(0)); break; }
@@ -7615,7 +7932,7 @@ namespace pcn {
     enum class PMIROpcode {
         ConstInt, ConstFloat, ConstBool, ConstNull, ConstText, Copy, Add, Sub, Mul, Div, Mod, BitAnd, BitOr, BitXor,
         Shl, Shr, Neg, BitNot, Not, Eq, Ne, Lt, Le, Gt, Ge, And, Or, Branch, BranchIf, Call, CallClosure,
-        TextToString, StringToText, StringClear, StringDispose, StringMove, ByteCount, TextEquals, TextByteAt, TextFindByte, TextStartsWith, NumericCheckedCast, MakeAggregate, ExtractField, StoreField, ArrayIndex, ArrayStore, ResultOk, ResultErr, ResultIsErr, ResultTry, OptionSome, OptionNone, MakeClosure, Return, Nop
+        TextToString, StringToText, StringClear, StringDispose, StringMove, StringAppend, ByteCount, TextEquals, TextByteAt, TextFindByte, TextStartsWith, TextEndsWith, TextSlice, TextHash64, TextCodepointAt, TextCodepointCount, TextIsAscii, TextFindText, TextCompare, TextRFindText, TextStreamWrite, NumericCheckedCast, MakeAggregate, ExtractField, StoreField, ArrayIndex, ArrayStore, ResultOk, ResultErr, ResultIsErr, ResultTry, OptionSome, OptionNone, MakeClosure, Return, Nop
     };
 
     struct PMIRInstruction {
@@ -7747,7 +8064,7 @@ namespace pcn {
             case IROpcode::BitNot:return PMIROpcode::BitNot; case IROpcode::Not:return PMIROpcode::Not; case IROpcode::Eq:return PMIROpcode::Eq; case IROpcode::Ne:return PMIROpcode::Ne;
             case IROpcode::Lt:return PMIROpcode::Lt; case IROpcode::Le:return PMIROpcode::Le; case IROpcode::Gt:return PMIROpcode::Gt; case IROpcode::Ge:return PMIROpcode::Ge;
             case IROpcode::And:return PMIROpcode::And; case IROpcode::Or:return PMIROpcode::Or; case IROpcode::Branch:return PMIROpcode::Branch; case IROpcode::BranchIf:return PMIROpcode::BranchIf;
-            case IROpcode::Call:return PMIROpcode::Call; case IROpcode::CallClosure:return PMIROpcode::CallClosure; case IROpcode::TextToString:return PMIROpcode::TextToString; case IROpcode::StringToText:return PMIROpcode::StringToText; case IROpcode::StringClear:return PMIROpcode::StringClear; case IROpcode::StringDispose:return PMIROpcode::StringDispose; case IROpcode::StringMove:return PMIROpcode::StringMove; case IROpcode::ByteCount:return PMIROpcode::ByteCount; case IROpcode::TextEquals:return PMIROpcode::TextEquals; case IROpcode::TextByteAt:return PMIROpcode::TextByteAt; case IROpcode::TextFindByte:return PMIROpcode::TextFindByte; case IROpcode::TextStartsWith:return PMIROpcode::TextStartsWith; case IROpcode::NumericCheckedCast:return PMIROpcode::NumericCheckedCast; case IROpcode::MakeAggregate:return PMIROpcode::MakeAggregate;
+            case IROpcode::Call:return PMIROpcode::Call; case IROpcode::CallClosure:return PMIROpcode::CallClosure; case IROpcode::TextToString:return PMIROpcode::TextToString; case IROpcode::StringToText:return PMIROpcode::StringToText; case IROpcode::StringClear:return PMIROpcode::StringClear; case IROpcode::StringDispose:return PMIROpcode::StringDispose; case IROpcode::StringMove:return PMIROpcode::StringMove; case IROpcode::StringAppend:return PMIROpcode::StringAppend; case IROpcode::ByteCount:return PMIROpcode::ByteCount; case IROpcode::TextEquals:return PMIROpcode::TextEquals; case IROpcode::TextByteAt:return PMIROpcode::TextByteAt; case IROpcode::TextFindByte:return PMIROpcode::TextFindByte; case IROpcode::TextStartsWith:return PMIROpcode::TextStartsWith; case IROpcode::TextEndsWith:return PMIROpcode::TextEndsWith; case IROpcode::TextSlice:return PMIROpcode::TextSlice; case IROpcode::TextHash64:return PMIROpcode::TextHash64; case IROpcode::TextCodepointAt:return PMIROpcode::TextCodepointAt; case IROpcode::TextCodepointCount:return PMIROpcode::TextCodepointCount; case IROpcode::TextIsAscii:return PMIROpcode::TextIsAscii; case IROpcode::TextFindText:return PMIROpcode::TextFindText; case IROpcode::TextCompare:return PMIROpcode::TextCompare; case IROpcode::TextRFindText:return PMIROpcode::TextRFindText; case IROpcode::TextStreamWrite:return PMIROpcode::TextStreamWrite; case IROpcode::NumericCheckedCast:return PMIROpcode::NumericCheckedCast; case IROpcode::MakeAggregate:return PMIROpcode::MakeAggregate;
             case IROpcode::ExtractField:return PMIROpcode::ExtractField; case IROpcode::StoreField:return PMIROpcode::StoreField; case IROpcode::ArrayIndex:return PMIROpcode::ArrayIndex; case IROpcode::ArrayStore:return PMIROpcode::ArrayStore; case IROpcode::ResultOk:return PMIROpcode::ResultOk; case IROpcode::ResultErr:return PMIROpcode::ResultErr;
             case IROpcode::ResultIsErr:return PMIROpcode::ResultIsErr; case IROpcode::ResultTry:return PMIROpcode::ResultTry; case IROpcode::OptionSome:return PMIROpcode::OptionSome; case IROpcode::OptionNone:return PMIROpcode::OptionNone;
             case IROpcode::MakeClosure:return PMIROpcode::MakeClosure; case IROpcode::Return:return PMIROpcode::Return;
@@ -7797,6 +8114,11 @@ namespace pcn {
                 else if (i.op == IROpcode::CallClosure && !i.args.empty()) { auto cl = abi.layout(vregTypes[static_cast<std::uint32_t>(i.args[0])]); std::size_t n = cl.fields.size() + (i.args.size() - 1) + (abi.isRich(i.valueType) ? 1 : 0); maxAbiArgs = std::max(maxAbiArgs, n); }
             }
             out.outgoingArea = static_cast<std::uint32_t>(32 + (maxAbiArgs > 4 ? (maxAbiArgs - 4) * 8 : 0));
+            // WriteFile uses five Win64 arguments and needs two private scratch cells.
+            // These cells are beyond its mandatory 32-byte home space / 5th argument.
+            for (const auto& b : fn.blocks)for (const auto& i : b.instructions)
+                if (i.op == IROpcode::TextStreamWrite)out.outgoingArea = std::max(out.outgoingArea, 64u);
+                else if (i.op == IROpcode::StringAppend)out.outgoingArea = std::max(out.outgoingArea, 80u);
             std::uint32_t cursor = out.totalSlots * 8u;
             if (out.richReturn) { out.sretCellOffset = cursor + 8u; cursor = out.sretCellOffset; }
             for (std::uint32_t slot = 1; slot <= out.totalSlots; ++slot) { PMIRSlotInfo info; info.type = vregTypes[slot]; info.cellOffset = slot * 8u; auto lay = abi.layout(info.type); info.rich = lay.rich; info.objectSize = static_cast<std::uint32_t>(lay.size); info.objectAlignment = static_cast<std::uint32_t>(std::max<std::size_t>(lay.alignment, 1)); if (info.rich) { cursor = alignUp32(cursor + std::max<std::uint32_t>(info.objectSize, 1), info.objectAlignment); info.objectOffset = cursor; }out.slots[slot] = info; }
@@ -7813,7 +8135,9 @@ namespace pcn {
                         else throw std::runtime_error("floating literal needs concrete float/double type");
                         p.hasImmediate = true;
                     }if (i.op == IROpcode::ConstBool) { p.immediate = i.immediate ? 1 : 0; p.hasImmediate = true; }if (i.op == IROpcode::ConstNull) { p.immediate = 0; p.hasImmediate = true; }
-                    for (auto v : i.args)p.srcSlots.push_back(static_cast<std::uint32_t>(v)); for (auto t : i.targetBlocks)p.targets.push_back(static_cast<std::uint32_t>(t)); pb.instructions.push_back(std::move(p));
+                    for (auto v : i.args)p.srcSlots.push_back(static_cast<std::uint32_t>(v));
+                    for (auto t : i.targetBlocks)p.targets.push_back(static_cast<std::uint32_t>(t));
+                    pb.instructions.push_back(std::move(p));
                 }
                 out.blocks.push_back(std::move(pb));
             }
@@ -7837,7 +8161,7 @@ namespace pcn {
     static std::string pmirOpcodeName(PMIROpcode op) {
         switch (op) {
         case PMIROpcode::ConstInt:return"mov.imm"; case PMIROpcode::ConstFloat:return"mov.fp.bits"; case PMIROpcode::ConstBool:return"mov.bool"; case PMIROpcode::ConstNull:return"mov.null"; case PMIROpcode::ConstText:return"text.literal"; case PMIROpcode::Copy:return"copy";
-        case PMIROpcode::Add:return"add"; case PMIROpcode::Sub:return"sub"; case PMIROpcode::Mul:return"imul"; case PMIROpcode::Div:return"idiv.defined"; case PMIROpcode::Mod:return"imod.defined"; case PMIROpcode::BitAnd:return"and"; case PMIROpcode::BitOr:return"or"; case PMIROpcode::BitXor:return"xor"; case PMIROpcode::Shl:return"shl"; case PMIROpcode::Shr:return"sar"; case PMIROpcode::Neg:return"neg"; case PMIROpcode::BitNot:return"not"; case PMIROpcode::Not:return"logical.not"; case PMIROpcode::Eq:return"cmp.eq"; case PMIROpcode::Ne:return"cmp.ne"; case PMIROpcode::Lt:return"cmp.lt"; case PMIROpcode::Le:return"cmp.le"; case PMIROpcode::Gt:return"cmp.gt"; case PMIROpcode::Ge:return"cmp.ge"; case PMIROpcode::And:return"logical.and"; case PMIROpcode::Or:return"logical.or"; case PMIROpcode::Branch:return"jmp"; case PMIROpcode::BranchIf:return"br.if"; case PMIROpcode::Call:return"call"; case PMIROpcode::CallClosure:return"call.closure"; case PMIROpcode::TextToString:return"text.to_string"; case PMIROpcode::StringToText:return"string.to_text"; case PMIROpcode::StringClear:return"string.clear"; case PMIROpcode::StringDispose:return"string.dispose"; case PMIROpcode::StringMove:return"string.move"; case PMIROpcode::ByteCount:return"text.count"; case PMIROpcode::TextEquals:return"text.equals"; case PMIROpcode::TextByteAt:return"text.byte_at.checked"; case PMIROpcode::TextFindByte:return"text.find_byte"; case PMIROpcode::TextStartsWith:return"text.starts_with"; case PMIROpcode::NumericCheckedCast:return"numeric.checked_cast"; case PMIROpcode::MakeAggregate:return"aggregate.make"; case PMIROpcode::ExtractField:return"aggregate.field"; case PMIROpcode::StoreField:return"aggregate.store.field"; case PMIROpcode::ArrayIndex:return"array.index.checked"; case PMIROpcode::ArrayStore:return"array.store.checked"; case PMIROpcode::ResultOk:return"result.ok"; case PMIROpcode::ResultErr:return"result.err"; case PMIROpcode::ResultIsErr:return"result.is_err"; case PMIROpcode::ResultTry:return"result.try"; case PMIROpcode::OptionSome:return"option.some"; case PMIROpcode::OptionNone:return"option.none"; case PMIROpcode::MakeClosure:return"closure.make"; case PMIROpcode::Return:return"ret"; case PMIROpcode::Nop:return"nop";
+        case PMIROpcode::Add:return"add"; case PMIROpcode::Sub:return"sub"; case PMIROpcode::Mul:return"imul"; case PMIROpcode::Div:return"idiv.defined"; case PMIROpcode::Mod:return"imod.defined"; case PMIROpcode::BitAnd:return"and"; case PMIROpcode::BitOr:return"or"; case PMIROpcode::BitXor:return"xor"; case PMIROpcode::Shl:return"shl"; case PMIROpcode::Shr:return"sar"; case PMIROpcode::Neg:return"neg"; case PMIROpcode::BitNot:return"not"; case PMIROpcode::Not:return"logical.not"; case PMIROpcode::Eq:return"cmp.eq"; case PMIROpcode::Ne:return"cmp.ne"; case PMIROpcode::Lt:return"cmp.lt"; case PMIROpcode::Le:return"cmp.le"; case PMIROpcode::Gt:return"cmp.gt"; case PMIROpcode::Ge:return"cmp.ge"; case PMIROpcode::And:return"logical.and"; case PMIROpcode::Or:return"logical.or"; case PMIROpcode::Branch:return"jmp"; case PMIROpcode::BranchIf:return"br.if"; case PMIROpcode::Call:return"call"; case PMIROpcode::CallClosure:return"call.closure"; case PMIROpcode::TextToString:return"text.to_string"; case PMIROpcode::StringToText:return"string.to_text"; case PMIROpcode::StringClear:return"string.clear"; case PMIROpcode::StringDispose:return"string.dispose"; case PMIROpcode::StringMove:return"string.move"; case PMIROpcode::StringAppend:return"string.append"; case PMIROpcode::ByteCount:return"text.count"; case PMIROpcode::TextEquals:return"text.equals"; case PMIROpcode::TextByteAt:return"text.byte_at.checked"; case PMIROpcode::TextFindByte:return"text.find_byte"; case PMIROpcode::TextStartsWith:return"text.starts_with"; case PMIROpcode::TextEndsWith:return"text.ends_with"; case PMIROpcode::TextSlice:return"text.slice.utf8_checked"; case PMIROpcode::TextHash64:return"text.hash64.fnv1a"; case PMIROpcode::TextCodepointAt:return"text.codepoint_at.utf8_checked"; case PMIROpcode::TextCodepointCount:return"text.codepoint_count"; case PMIROpcode::TextIsAscii:return"text.is_ascii"; case PMIROpcode::TextFindText:return"text.find.bytewise"; case PMIROpcode::TextCompare:return"text.compare.unsigned_lexicographic"; case PMIROpcode::TextRFindText:return"text.rfind.bytewise"; case PMIROpcode::TextStreamWrite:return"text.stream_write"; case PMIROpcode::NumericCheckedCast:return"numeric.checked_cast"; case PMIROpcode::MakeAggregate:return"aggregate.make"; case PMIROpcode::ExtractField:return"aggregate.field"; case PMIROpcode::StoreField:return"aggregate.store.field"; case PMIROpcode::ArrayIndex:return"array.index.checked"; case PMIROpcode::ArrayStore:return"array.store.checked"; case PMIROpcode::ResultOk:return"result.ok"; case PMIROpcode::ResultErr:return"result.err"; case PMIROpcode::ResultIsErr:return"result.is_err"; case PMIROpcode::ResultTry:return"result.try"; case PMIROpcode::OptionSome:return"option.some"; case PMIROpcode::OptionNone:return"option.none"; case PMIROpcode::MakeClosure:return"closure.make"; case PMIROpcode::Return:return"ret"; case PMIROpcode::Nop:return"nop";
         }return"?";
     }
 
@@ -7914,7 +8238,8 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       auto& info = fn.slots.at(slot); xmmRbp(b, xmm, negDisp(info.cellOffset), true, info.type.kind == IRValueKind::Float32);
                                   }
                                   static void xmmCompare(std::vector<std::uint8_t>& b, bool single) {
-                                      if (!single)b.push_back(0x66); b.insert(b.end(), { 0x0F,0x2E,0xC1 });
+                                      if (!single)b.push_back(0x66);
+                                      b.insert(b.end(), { 0x0F,0x2E,0xC1 });
                                   }
                                   static void floatOp(const PMIRFunction& fn, const PMIRInstruction& i, std::vector<std::uint8_t>& b) {
                                       const bool single = fn.slots.at(i.srcSlots.at(0)).type.kind == IRValueKind::Float32;
@@ -7956,7 +8281,8 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       for (std::size_t i = 0; i < fn.parameterSlots.size(); ++i) {
                                           s = b.size(); const auto slot = fn.parameterSlots[i]; loadIncoming(b, abiBase + i); const auto& si = fn.slots.at(slot); if (si.rich) {/* Rich parameters remain indirect. */storeSlot(b, 0, fn, slot); }
                                           else if (fpType(si.type.kind) && abiBase + i < 4) { xmmSlotStore(b, fn, slot, static_cast<int>(abiBase + i)); }
-                                          else storeSlot(b, 0, fn, slot); record(s, "legalize parameter -> s" + std::to_string(slot) + (si.rich ? " (indirect rich)" : ""));
+                                          else storeSlot(b, 0, fn, slot);
+                                          record(s, "legalize parameter -> s" + std::to_string(slot) + (si.rich ? " (indirect rich)" : ""));
                                       }
                                       for (const auto& block : fn.blocks) { blockOffsets[block.id] = b.size(); for (const auto& ins : block.instructions) { s = b.size(); encodeInstruction(fn, ins, abi, b, branches, out.calls, out.literals, out.imports); record(s, pmirOpcodeName(ins.op)); } }
                                       if (fn.blocks.empty() || b.empty() || b.back() != 0xC3) { s = b.size(); b.insert(b.end(), { 0x31,0xC0 }); epilogue(b); record(s, "implicit return 0"); }
@@ -7975,7 +8301,8 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       if (i.destSlot && !richRet) { if (fpType(i.valueType.kind))xmmSlotStore(b, fn, i.destSlot); else storeSlot(b, 0, fn, i.destSlot); }
                                   }
                                   void encodeClosureCall(const PMIRFunction& fn, const PMIRInstruction& i, const RichABIResolver& abi, std::vector<std::uint8_t>& b, std::vector<EncodedFunction::Call>& calls)const {
-                                      if (i.srcSlots.empty())throw std::runtime_error("closure call missing closure value"); const auto closureType = fn.slots.at(i.srcSlots[0]).type; auto cl = abi.layout(closureType); if (cl.kind != ABIRepresentationKind::Closure)throw std::runtime_error("call.closure source is not a concrete closure type"); loadSlot(b, 10, fn, i.srcSlots[0]); std::size_t ai = 0; const bool richRet = abi.isRich(i.valueType); if (richRet) { initRichDest(b, fn, i.destSlot); loadSlot(b, 0, fn, i.destSlot); placeArgFromRax(b, ai++); }for (const auto& f : cl.fields) {
+                                      if (i.srcSlots.empty())throw std::runtime_error("closure call missing closure value");
+                                      const auto closureType = fn.slots.at(i.srcSlots[0]).type; auto cl = abi.layout(closureType); if (cl.kind != ABIRepresentationKind::Closure)throw std::runtime_error("call.closure source is not a concrete closure type"); loadSlot(b, 10, fn, i.srcSlots[0]); std::size_t ai = 0; const bool richRet = abi.isRich(i.valueType); if (richRet) { initRichDest(b, fn, i.destSlot); loadSlot(b, 0, fn, i.destSlot); placeArgFromRax(b, ai++); }for (const auto& f : cl.fields) {
                                           auto fl = abi.layout(f.typeName);
                                           if ((f.typeName == "float" || f.typeName == "double") && ai < 4) {
                                               b.push_back(f.typeName == "float" ? 0xF3 : 0xF2);
@@ -8026,6 +8353,326 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                                               auto good = emitLocalJcc(b, 0x89);  // jns
                                                               b.insert(b.end(), { 0x0F,0x0B }); // ud2 overflow trap
                                                               patchLocal(b, good, b.size()); storeSlot(b, 0, fn, i.destSlot); break;
+                                                          }
+                                                          case PMIROpcode::TextStreamWrite: {
+                                                              if (i.srcSlots.size() != 1 || (i.literalText != "stdout" && i.literalText != "stderr"))
+                                                                  throw std::runtime_error("malformed PMIR stream output");
+                                                              if (fn.outgoingArea < 64)throw std::runtime_error("stream output needs 64-byte call area");
+                                                              // RSP+32 = fifth Win64 argument (OVERLAPPED*=nullptr).
+                                                              // RSP+40 = DWORD bytesWritten; RSP+48 = cursor; RSP+56 = remaining.
+                                                              // Windows imports may freely clobber all volatile registers.
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]);
+                                                              loadMem(b, 0, 10, 0, 8, false); storeRspRax(b, 48);
+                                                              loadMem(b, 0, 10, 8, 8, false); storeRspRax(b, 56);
+                                                              movImm(b, 1, i.literalText == "stdout" ? static_cast<std::uint64_t>(-11) : static_cast<std::uint64_t>(-12));
+                                                              emitImportedCall(b, "GetStdHandle", imports);
+                                                              storeSlot(b, 0, fn, i.destSlot); // private temporary handle
+                                                              b.insert(b.end(), { 0x48,0x85,0xC0 }); auto absent = emitLocalJcc(b, 0x84);
+                                                              b.insert(b.end(), { 0x48,0x83,0xF8,0xFF }); auto invalid = emitLocalJcc(b, 0x84);
+                                                              auto loop = b.size();
+                                                              // If empty, even a zero-length write succeeds with a valid handle.
+                                                              b.insert(b.end(), { 0x48,0x8B,0x84,0x24 }); put32(b, 56); // mov rax,[rsp+56]
+                                                              b.insert(b.end(), { 0x48,0x85,0xC0 }); auto complete = emitLocalJcc(b, 0x84);
+                                                              // DWORD count = min(remaining, 0xFFFFFFFF); write all bytes in chunks.
+                                                              movReg(b, 8, 0);
+                                                              movImm(b, 10, 0xFFFFFFFFu);
+                                                              b.insert(b.end(), { 0x4D,0x39,0xD0 });
+                                                              const std::size_t jccChunkFits = emitLocalJcc(b, 0x86); // jbe (r8<=r10)
+                                                              movReg(b, 8, 10);
+                                                              patchLocal(b, jccChunkFits, b.size());
+                                                              movImm(b, 0, 0); storeRspRax(b, 40); storeRspRax(b, 32);
+                                                              loadSlot(b, 1, fn, i.destSlot); // RCX handle
+                                                              b.insert(b.end(), { 0x48,0x8B,0x94,0x24 }); put32(b, 48); // RDX cursor
+                                                              b.insert(b.end(), { 0x4C,0x8D,0x8C,0x24 }); put32(b, 40); // lea R9,[rsp+40]
+                                                              emitImportedCall(b, "WriteFile", imports);
+                                                              b.insert(b.end(), { 0x48,0x85,0xC0 }); auto failed = emitLocalJcc(b, 0x84);
+                                                              b.insert(b.end(), { 0x8B,0x84,0x24 }); put32(b, 40); // mov eax,dword [rsp+40]
+                                                              b.insert(b.end(), { 0x48,0x85,0xC0 }); auto stalled = emitLocalJcc(b, 0x84);
+                                                              b.insert(b.end(), { 0x48,0x01,0x84,0x24 }); put32(b, 48); // add [rsp+48],rax
+                                                              b.insert(b.end(), { 0x48,0x29,0x84,0x24 }); put32(b, 56); // sub [rsp+56],rax
+                                                              auto again = emitLocalJmp(b); patchLocal(b, again, loop);
+                                                              auto yes = b.size(); patchLocal(b, complete, yes); movImm(b, 0, 1);
+                                                              auto done = emitLocalJmp(b);
+                                                              auto no = b.size(); patchLocal(b, absent, no); patchLocal(b, invalid, no);
+                                                              patchLocal(b, failed, no); patchLocal(b, stalled, no); movImm(b, 0, 0);
+                                                              patchLocal(b, done, b.size()); storeSlot(b, 0, fn, i.destSlot); break;
+                                                          }
+                                                          case PMIROpcode::TextRFindText: {
+                                                              if (i.srcSlots.size() != 2)throw std::runtime_error("text.rfind expects text and needle");
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 8, 10, 8, 8, false);
+                                                              loadSlot(b, 11, fn, i.srcSlots[1]); loadMem(b, 9, 11, 8, 8, false);
+                                                              b.insert(b.end(), { 0x4D,0x39,0xC8 }); // cmp r8,r9
+                                                              const auto hayTooShort = emitLocalJcc(b, 0x82); // jb
+                                                              loadMem(b, 10, 10, 0, 8, false); loadMem(b, 11, 11, 0, 8, false);
+                                                              b.insert(b.end(), { 0x4D,0x29,0xC8 }); // r8=last possible start offset
+                                                              movReg(b, 2, 8); // rdx=reverse search offset
+                                                              const auto outer = b.size();
+                                                              movImm(b, 1, 0); // rcx=needle byte offset
+                                                              const auto inner = b.size();
+                                                              b.insert(b.end(), { 0x4C,0x39,0xC9 }); // cmp rcx,r9
+                                                              const auto found = emitLocalJcc(b, 0x83); // jae
+                                                              movReg(b, 0, 10); // rax=hay base
+                                                              b.insert(b.end(), { 0x48,0x01,0xD0,0x48,0x01,0xC8 }); // add rax,rdx; add rax,rcx
+                                                              loadMem(b, 0, 0, 0, 1, false);
+                                                              b.insert(b.end(), { 0x41,0x3A,0x04,0x0B }); // cmp al,[r11+rcx]
+                                                              const auto mismatch = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x48,0xFF,0xC1 }); // ++rcx
+                                                              const auto againInner = emitLocalJmp(b); patchLocal(b, againInner, inner);
+                                                              patchLocal(b, mismatch, b.size());
+                                                              b.insert(b.end(), { 0x48,0x85,0xD2 }); // test rdx,rdx
+                                                              const auto exhausted = emitLocalJcc(b, 0x84);
+                                                              b.insert(b.end(), { 0x48,0xFF,0xCA }); // --rdx
+                                                              const auto againOuter = emitLocalJmp(b); patchLocal(b, againOuter, outer);
+                                                              patchLocal(b, found, b.size()); movReg(b, 0, 2);
+                                                              const auto done = emitLocalJmp(b);
+                                                              const auto absent = b.size(); patchLocal(b, hayTooShort, absent); patchLocal(b, exhausted, absent);
+                                                              movImm(b, 0, ~std::uint64_t{ 0 }); patchLocal(b, done, b.size());
+                                                              storeSlot(b, 0, fn, i.destSlot); break;
+                                                          }
+                                                          case PMIROpcode::TextCompare: {
+                                                              if (i.srcSlots.size() != 2)throw std::runtime_error("text.compare requires two text slots");
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 8, 10, 8, 8, false);
+                                                              loadSlot(b, 11, fn, i.srcSlots[1]); loadMem(b, 9, 11, 8, 8, false);
+                                                              loadMem(b, 10, 10, 0, 8, false); loadMem(b, 11, 11, 0, 8, false);
+                                                              movReg(b, 2, 8); // rdx=min(first byte count, second byte count)
+                                                              b.insert(b.end(), { 0x4C,0x39,0xCA }); // cmp rdx,r9 (unsigned)
+                                                              const auto firstShorter = emitLocalJcc(b, 0x86); // jbe
+                                                              movReg(b, 2, 9);
+                                                              patchLocal(b, firstShorter, b.size());
+                                                              const auto loop = b.size();
+                                                              b.insert(b.end(), { 0x48,0x85,0xD2 }); // test rdx,rdx
+                                                              const auto equalPrefix = emitLocalJcc(b, 0x84);
+                                                              loadMem(b, 0, 10, 0, 1, false); loadMem(b, 1, 11, 0, 1, false);
+                                                              b.insert(b.end(), { 0x39,0xC8 }); // cmp eax,ecx (unsigned UTF-8 octets)
+                                                              const auto lessByte = emitLocalJcc(b, 0x82);
+                                                              const auto greaterByte = emitLocalJcc(b, 0x87);
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC3,0x48,0xFF,0xCA }); // ++r10;++r11;--rdx
+                                                              const auto repeat = emitLocalJmp(b); patchLocal(b, repeat, loop);
+                                                              patchLocal(b, equalPrefix, b.size());
+                                                              b.insert(b.end(), { 0x4D,0x39,0xC8 }); // cmp r8,r9
+                                                              const auto lessLength = emitLocalJcc(b, 0x82);
+                                                              const auto greaterLength = emitLocalJcc(b, 0x87);
+                                                              movImm(b, 0, 0); const auto endEqual = emitLocalJmp(b);
+                                                              const auto less = b.size(); patchLocal(b, lessByte, less); patchLocal(b, lessLength, less);
+                                                              movImm(b, 0, ~std::uint64_t{ 0 }); const auto endLess = emitLocalJmp(b);
+                                                              const auto greater = b.size(); patchLocal(b, greaterByte, greater); patchLocal(b, greaterLength, greater);
+                                                              movImm(b, 0, 1);
+                                                              patchLocal(b, endEqual, b.size()); patchLocal(b, endLess, b.size());
+                                                              storeSlot(b, 0, fn, i.destSlot); break;
+                                                          }
+                                                          case PMIROpcode::TextFindText: {
+                                                              if (i.srcSlots.size() != 2)throw std::runtime_error("text.find expects haystack and needle");
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 8, 10, 8, 8, false); // hay length
+                                                              loadSlot(b, 11, fn, i.srcSlots[1]); loadMem(b, 9, 11, 8, 8, false); // needle length
+                                                              b.insert(b.end(), { 0x4D,0x39,0xC8 }); // cmp r8,r9
+                                                              auto shortHay = emitLocalJcc(b, 0x82); // unsigned below
+                                                              loadMem(b, 10, 10, 0, 8, false);
+                                                              loadMem(b, 11, 11, 0, 8, false);
+                                                              b.insert(b.end(), { 0x4D,0x29,0xC8 }); // sub r8,r9 = last candidate offset
+                                                              movImm(b, 2, 0); // RDX = candidate index
+                                                              const auto outer = b.size();
+                                                              b.insert(b.end(), { 0x4C,0x39,0xC2 }); // cmp rdx,r8
+                                                              auto exhausted = emitLocalJcc(b, 0x87); // ja
+                                                              movImm(b, 1, 0); // RCX = matching byte offset
+                                                              const auto inner = b.size();
+                                                              b.insert(b.end(), { 0x4C,0x39,0xC9 }); // cmp rcx,r9
+                                                              auto found = emitLocalJcc(b, 0x83); // jae (needle fully matched)
+                                                              movReg(b, 0, 10); // RAX = candidate hay pointer
+                                                              b.insert(b.end(), { 0x48,0x01,0xC8 }); // add rax,rcx
+                                                              loadMem(b, 0, 0, 0, 1, false); // AL = byte at candidate + offset
+                                                              b.insert(b.end(), { 0x41,0x3A,0x04,0x0B }); // cmp al,[r11 + rcx]
+                                                              auto mismatch = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x48,0xFF,0xC1 }); // inc rcx
+                                                              auto matchNext = emitLocalJmp(b); patchLocal(b, matchNext, inner);
+                                                              const auto next = b.size(); patchLocal(b, mismatch, next);
+                                                              b.insert(b.end(), { 0x48,0xFF,0xC2,0x49,0xFF,0xC2 }); // pos++, hayptr++
+                                                              auto retry = emitLocalJmp(b); patchLocal(b, retry, outer);
+                                                              const auto foundLabel = b.size(); patchLocal(b, found, foundLabel);
+                                                              movReg(b, 0, 2); auto done = emitLocalJmp(b);
+                                                              const auto absent = b.size(); patchLocal(b, shortHay, absent); patchLocal(b, exhausted, absent);
+                                                              movImm(b, 0, ~std::uint64_t{ 0 }); patchLocal(b, done, b.size());
+                                                              storeSlot(b, 0, fn, i.destSlot); break;
+                                                          }
+                                                          case PMIROpcode::TextCodepointCount: {
+                                                              if (i.srcSlots.size() != 1)throw std::runtime_error("text.codepoint_count needs a text operand");
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 8, 10, 8, 8, false);
+                                                              loadMem(b, 10, 10, 0, 8, false);
+                                                              movImm(b, 0, 0); // counter
+                                                              const auto loop = b.size();
+                                                              b.insert(b.end(), { 0x4D,0x85,0xC0 }); // test r8,r8
+                                                              const auto done = emitLocalJcc(b, 0x84);
+                                                              loadMem(b, 2, 10, 0, 1, false); // movzx edx,byte [r10]
+                                                              b.insert(b.end(), { 0x83,0xE2,0xC0,0x81,0xFA,0x80,0x00,0x00,0x00 }); // and edx,0xc0;cmp edx,0x80
+                                                              const auto cont = emitLocalJcc(b, 0x84);
+                                                              b.insert(b.end(), { 0x48,0xFF,0xC0 }); // inc rax
+                                                              patchLocal(b, cont, b.size());
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC8 }); // ++pointer;--remaining
+                                                              const auto again = emitLocalJmp(b); patchLocal(b, again, loop);
+                                                              patchLocal(b, done, b.size()); storeSlot(b, 0, fn, i.destSlot); break;
+                                                          }
+                                                          case PMIROpcode::TextIsAscii: {
+                                                              if (i.srcSlots.size() != 1)throw std::runtime_error("text.is_ascii needs a text operand");
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 8, 10, 8, 8, false);
+                                                              loadMem(b, 10, 10, 0, 8, false);
+                                                              const auto loop = b.size();
+                                                              b.insert(b.end(), { 0x4D,0x85,0xC0 }); // test remaining
+                                                              const auto yes = emitLocalJcc(b, 0x84);
+                                                              loadMem(b, 0, 10, 0, 1, false); // byte
+                                                              b.insert(b.end(), { 0x3C,0x80 }); // cmp al,128
+                                                              const auto nonAscii = emitLocalJcc(b, 0x83); // jae
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC8 });
+                                                              const auto retry = emitLocalJmp(b); patchLocal(b, retry, loop);
+                                                              patchLocal(b, yes, b.size()); movImm(b, 0, 1);
+                                                              const auto done = emitLocalJmp(b);
+                                                              patchLocal(b, nonAscii, b.size()); movImm(b, 0, 0);
+                                                              patchLocal(b, done, b.size()); storeSlot(b, 0, fn, i.destSlot); break;
+                                                          }
+                                                          case PMIROpcode::TextCodepointAt: {
+                                                              if (i.srcSlots.size() != 2)throw std::runtime_error("text.codepoint_at requires text and byte index");
+                                                              loadSlot(b, 9, fn, i.srcSlots[1]); // unsigned byte index; negative fails
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 8, 10, 8, 8, false);
+                                                              b.insert(b.end(), { 0x4D,0x39,0xC1 }); // cmp r9,r8
+                                                              const auto inRange = emitLocalJcc(b, 0x82);
+                                                              const auto invalidStart = b.size(); // all failures branch to a single UD2
+                                                              b.insert(b.end(), { 0x0F,0x0B });
+                                                              patchLocal(b, inRange, b.size());
+                                                              b.insert(b.end(), { 0x4D,0x29,0xC8 }); // r8 = byte length - index
+                                                              loadMem(b, 10, 10, 0, 8, false);
+                                                              b.insert(b.end(), { 0x4D,0x01,0xCA }); // r10 += index
+                                                              loadMem(b, 0, 10, 0, 1, false); // lead byte in AL/RAX
+                                                              b.insert(b.end(), { 0x3C,0x80 }); // cmp al,128
+                                                              const auto ascii = emitLocalJcc(b, 0x82);
+                                                              b.insert(b.end(), { 0x3C,0xC2 }); // cmp al,0xc2
+                                                              const auto invalidLead1 = emitLocalJcc(b, 0x82);
+                                                              b.insert(b.end(), { 0x3C,0xDF }); // cmp al,0xdf
+                                                              const auto two = emitLocalJcc(b, 0x86);
+                                                              b.insert(b.end(), { 0x3C,0xEF }); // cmp al,0xef
+                                                              const auto three = emitLocalJcc(b, 0x86);
+                                                              b.insert(b.end(), { 0x3C,0xF4 }); // cmp al,0xf4
+                                                              const auto four = emitLocalJcc(b, 0x86);
+                                                              const auto invalidLead2 = emitLocalJmp(b);
+                                                              const auto twoLabel = b.size(); patchLocal(b, two, twoLabel);
+                                                              movImm(b, 9, 1); b.insert(b.end(), { 0x83,0xE0,0x1F }); // and eax,0x1f
+                                                              const auto twoContinue = emitLocalJmp(b);
+                                                              const auto threeLabel = b.size(); patchLocal(b, three, threeLabel);
+                                                              movImm(b, 9, 2); b.insert(b.end(), { 0x83,0xE0,0x0F });
+                                                              const auto threeContinue = emitLocalJmp(b);
+                                                              const auto fourLabel = b.size(); patchLocal(b, four, fourLabel);
+                                                              movImm(b, 9, 3); b.insert(b.end(), { 0x83,0xE0,0x07 });
+                                                              const auto decode = b.size(); patchLocal(b, twoContinue, decode); patchLocal(b, threeContinue, decode);
+                                                              movReg(b, 11, 9); // retain the codepoint's UTF-8 continuation count
+                                                              b.insert(b.end(), { 0x4D,0x39,0xC8 }); // cmp r8,r9
+                                                              const auto shortSeq = emitLocalJcc(b, 0x86); // need more bytes than suffix contains
+                                                              const auto loop = b.size();
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC2 }); // advance pointer
+                                                              loadMem(b, 2, 10, 0, 1, false); // next byte
+                                                              movReg(b, 1, 2); // rcx=rdx
+                                                              b.insert(b.end(), { 0x83,0xE1,0xC0,0x81,0xF9,0x80,0x00,0x00,0x00 }); // mask continuation
+                                                              const auto badContinuation = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x48,0xC1,0xE0,0x06,0x83,0xE2,0x3F,0x48,0x09,0xD0 }); // acc=(acc<<6)|(byte&63)
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC9 }); // --r9
+                                                              const auto more = emitLocalJcc(b, 0x85); patchLocal(b, more, loop);
+                                                              b.insert(b.end(), { 0x49,0x83,0xFB,0x02 }); // cmp r11,2
+                                                              const auto other = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x48,0x3D,0x00,0x08,0x00,0x00 }); // cmp rax,0x800
+                                                              const auto overlong3 = emitLocalJcc(b, 0x82);
+                                                              b.insert(b.end(), { 0x48,0x3D,0x00,0xD8,0x00,0x00 }); // cmp rax,0xd800
+                                                              const auto good3 = emitLocalJcc(b, 0x82);
+                                                              b.insert(b.end(), { 0x48,0x3D,0xFF,0xDF,0x00,0x00 }); // cmp rax,0xdfff
+                                                              const auto good3b = emitLocalJcc(b, 0x87);
+                                                              const auto invalidSurrogate = emitLocalJmp(b);
+                                                              const auto otherLabel = b.size(); patchLocal(b, other, otherLabel);
+                                                              b.insert(b.end(), { 0x49,0x83,0xFB,0x03 }); // cmp r11,3
+                                                              const auto good2 = emitLocalJcc(b, 0x85); // two-byte sequences valid after lead validation
+                                                              b.insert(b.end(), { 0x48,0x3D,0x00,0x00,0x01,0x00 }); // cmp rax,0x10000
+                                                              const auto overlong4 = emitLocalJcc(b, 0x82);
+                                                              b.insert(b.end(), { 0x48,0x3D,0xFF,0xFF,0x10,0x00 }); // cmp rax,0x10ffff
+                                                              const auto aboveUnicode = emitLocalJcc(b, 0x87);
+                                                              const auto success = b.size(); patchLocal(b, ascii, success); patchLocal(b, good3, success);
+                                                              patchLocal(b, good3b, success); patchLocal(b, good2, success);
+                                                              storeSlot(b, 0, fn, i.destSlot);
+                                                              const auto finished = emitLocalJmp(b);
+                                                              const auto invalid = b.size(); b.insert(b.end(), { 0x0F,0x0B });
+                                                              for (auto j : { invalidLead1,invalidLead2,shortSeq,badContinuation,overlong3,invalidSurrogate,overlong4,aboveUnicode })patchLocal(b, j, invalid);
+                                                              patchLocal(b, finished, b.size());
+                                                              (void)invalidStart;
+                                                              break;
+                                                          }
+                                                          case PMIROpcode::TextHash64: {
+                                                              if (i.srcSlots.size() != 1)throw std::runtime_error("text.hash64 expects a text operand");
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]);
+                                                              loadMem(b, 8, 10, 8, 8, false); // R8 = length
+                                                              loadMem(b, 10, 10, 0, 8, false); // R10 = byte pointer
+                                                              movImm(b, 0, 14695981039346656037ull); // FNV-1a 64-bit offset basis
+                                                              movImm(b, 11, 1099511628211ull); // FNV-1a 64-bit prime
+                                                              auto loop = b.size();
+                                                              b.insert(b.end(), { 0x4D,0x85,0xC0 }); // test r8,r8
+                                                              auto finished = emitLocalJcc(b, 0x84);
+                                                              loadMem(b, 2, 10, 0, 1, false); // movzx rdx, byte [r10]
+                                                              b.insert(b.end(), { 0x48,0x31,0xD0 }); // xor rax,rdx
+                                                              b.insert(b.end(), { 0x49,0x0F,0xAF,0xC3 }); // imul rax,r11 (mod 2^64)
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC8 }); // pointer++, remaining--
+                                                              const auto back = emitLocalJmp(b); patchLocal(b, back, loop);
+                                                              patchLocal(b, finished, b.size()); storeSlot(b, 0, fn, i.destSlot); break;
+                                                          }
+                                                          case PMIROpcode::TextSlice: {
+                                                              if (i.srcSlots.size() != 3)throw std::runtime_error("text.slice expects text, start and length");
+                                                              loadSlot(b, 9, fn, i.srcSlots[1]); // R9 = start
+                                                              loadSlot(b, 8, fn, i.srcSlots[2]); // R8 = requested length
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]);
+                                                              loadMem(b, 11, 10, 8, 8, false); // R11 = source byte length
+                                                              b.insert(b.end(), { 0x4D,0x39,0xD9 }); // cmp r9,r11
+                                                              auto validStart = emitLocalJcc(b, 0x86); // jbe (negative values fail as unsigned)
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, validStart, b.size());
+                                                              movReg(b, 0, 11);
+                                                              b.insert(b.end(), { 0x4C,0x29,0xC8 }); // sub rax,r9 = remaining
+                                                              b.insert(b.end(), { 0x49,0x39,0xC0 }); // cmp r8,rax
+                                                              auto validLength = emitLocalJcc(b, 0x86);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, validLength, b.size());
+                                                              loadMem(b, 10, 10, 0, 8, false); // R10 = source data
+                                                              b.insert(b.end(), { 0x4D,0x01,0xCA }); // add r10,r9 (slice start)
+                                                              // UTF-8 boundary: slice may start/end only at a codepoint boundary.
+                                                              // If offset == byte length, its one-past-end pointer must not be dereferenced.
+                                                              b.insert(b.end(), { 0x4D,0x39,0xD9 }); // cmp r9,r11
+                                                              auto startAtEnd = emitLocalJcc(b, 0x84);
+                                                              loadMem(b, 0, 10, 0, 1, false);
+                                                              b.insert(b.end(), { 0x83,0xE0,0xC0,0x3C,0x80 }); // and eax,0xC0;cmp al,0x80
+                                                              auto startBoundary = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, startBoundary, b.size());
+                                                              patchLocal(b, startAtEnd, b.size());
+                                                              movReg(b, 2, 9); b.insert(b.end(), { 0x4C,0x01,0xC2 }); // rdx = start+length
+                                                              b.insert(b.end(), { 0x4C,0x39,0xDA }); // cmp rdx,r11
+                                                              auto endAtEnd = emitLocalJcc(b, 0x84);
+                                                              movReg(b, 0, 10); b.insert(b.end(), { 0x4C,0x01,0xC0 }); // rax=startptr+length
+                                                              loadMem(b, 0, 0, 0, 1, false);
+                                                              b.insert(b.end(), { 0x83,0xE0,0xC0,0x3C,0x80 });
+                                                              auto endBoundary = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, endBoundary, b.size());
+                                                              patchLocal(b, endAtEnd, b.size());
+                                                              // Destination is a 16-byte borrowed {pointer, byte count} pair.
+                                                              // The input pointer and length survive initRichDest in R10/R8.
+                                                              initRichDest(b, fn, i.destSlot);
+                                                              movReg(b, 11, 10); loadSlot(b, 10, fn, i.destSlot);
+                                                              storeMem(b, 10, 0, 11, 8); storeMem(b, 10, 8, 8, 8); break;
+                                                          }
+                                                          case PMIROpcode::TextEndsWith: {
+                                                              if (i.srcSlots.size() != 2)throw std::runtime_error("text.ends_with expects text and suffix");
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 8, 10, 8, 8, false);
+                                                              loadSlot(b, 11, fn, i.srcSlots[1]); loadMem(b, 9, 11, 8, 8, false);
+                                                              b.insert(b.end(), { 0x4D,0x39,0xC8 }); // cmp r8,r9
+                                                              auto tooShort = emitLocalJcc(b, 0x82);
+                                                              loadMem(b, 10, 10, 0, 8, false); loadMem(b, 11, 11, 0, 8, false);
+                                                              b.insert(b.end(), { 0x4D,0x29,0xC8 }); // subtract suffix length from source length
+                                                              b.insert(b.end(), { 0x4D,0x01,0xC2 }); // add r10,r8
+                                                              b.insert(b.end(), { 0x4D,0x85,0xC9 }); auto empty = emitLocalJcc(b, 0x84);
+                                                              auto loop = b.size();
+                                                              loadMem(b, 0, 10, 0, 1, false); loadMem(b, 1, 11, 0, 1, false);
+                                                              b.insert(b.end(), { 0x38,0xC8 }); auto mismatch = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC3,0x49,0xFF,0xC9 });
+                                                              auto again = emitLocalJcc(b, 0x85); patchLocal(b, again, loop);
+                                                              patchLocal(b, empty, b.size()); movImm(b, 0, 1); auto done = emitLocalJmp(b);
+                                                              const auto no = b.size(); patchLocal(b, tooShort, no); patchLocal(b, mismatch, no);
+                                                              movImm(b, 0, 0); patchLocal(b, done, b.size()); storeSlot(b, 0, fn, i.destSlot); break;
                                                           }
                                                           case PMIROpcode::TextStartsWith: {
                                                               if (i.srcSlots.size() != 2)throw std::runtime_error("text.starts_with expects two text operands");
@@ -8138,6 +8785,62 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                                               loadSlot(b, 11, fn, i.srcSlots[0]); zeroFixed(b, 11, 24);
                                                               break;
                                                           }
+                                                          case PMIROpcode::StringAppend: {
+                                                              if (i.srcSlots.size() != 2 || fn.outgoingArea < 80)
+                                                                  throw std::runtime_error("string.append missing argument/scratch space");
+                                                              // Allocate new owned storage. Both byte streams remain live until
+                                                              // after they are copied; the old owner is freed only at the end.
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 0, 10, 8, 8, false);
+                                                              loadSlot(b, 11, fn, i.srcSlots[1]); loadMem(b, 8, 11, 8, 8, false);
+                                                              b.insert(b.end(), { 0x4C,0x01,0xC0 }); // add rax,r8
+                                                              auto noCarry = emitLocalJcc(b, 0x83); // JNC/JAE
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, noCarry, b.size());
+                                                              b.insert(b.end(), { 0x48,0x83,0xF8,0xFF }); // cmp rax,-1 (len+1)
+                                                              auto belowLimit = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, belowLimit, b.size());
+                                                              storeRspRax(b, 64); // [rsp+64] new length
+                                                              emitImportedCall(b, "GetProcessHeap", imports);
+                                                              movReg(b, 1, 0); movImm(b, 2, 8); // heap, HEAP_ZERO_MEMORY
+                                                              b.insert(b.end(), { 0x4C,0x8B,0x84,0x24 }); put32(b, 64); // r8 new length
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC0 }); // inc r8 for terminator
+                                                              emitImportedCall(b, "HeapAlloc", imports);
+                                                              b.insert(b.end(), { 0x48,0x85,0xC0 });
+                                                              auto goodAlloc = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, goodAlloc, b.size());
+                                                              storeRspRax(b, 56); // [rsp+56] new pointer
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 9, 10, 8, 8, false);
+                                                              loadMem(b, 10, 10, 0, 8, false); movReg(b, 11, 0);
+                                                              b.insert(b.end(), { 0x4D,0x85,0xC9 }); auto noOld = emitLocalJcc(b, 0x84);
+                                                              auto oldLoop = b.size();
+                                                              loadMem(b, 0, 10, 0, 1, false); storeMem(b, 11, 0, 0, 1);
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC3,0x49,0xFF,0xC9 });
+                                                              auto oldAgain = emitLocalJcc(b, 0x85); patchLocal(b, oldAgain, oldLoop);
+                                                              patchLocal(b, noOld, b.size());
+                                                              loadSlot(b, 10, fn, i.srcSlots[1]); loadMem(b, 9, 10, 8, 8, false);
+                                                              loadMem(b, 10, 10, 0, 8, false);
+                                                              b.insert(b.end(), { 0x4D,0x85,0xC9 }); auto noExtra = emitLocalJcc(b, 0x84);
+                                                              auto extraLoop = b.size();
+                                                              loadMem(b, 0, 10, 0, 1, false); storeMem(b, 11, 0, 0, 1);
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC2,0x49,0xFF,0xC3,0x49,0xFF,0xC9 });
+                                                              auto extraAgain = emitLocalJcc(b, 0x85); patchLocal(b, extraAgain, extraLoop);
+                                                              patchLocal(b, noExtra, b.size());
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 0, 10, 0, 8, false);
+                                                              b.insert(b.end(), { 0x48,0x85,0xC0 }); auto noOldPointer = emitLocalJcc(b, 0x84);
+                                                              storeRspRax(b, 48); // [rsp+48] pointer to release
+                                                              emitImportedCall(b, "GetProcessHeap", imports);
+                                                              movReg(b, 1, 0); movImm(b, 2, 0);
+                                                              b.insert(b.end(), { 0x4C,0x8B,0x84,0x24 }); put32(b, 48);
+                                                              emitImportedCall(b, "HeapFree", imports);
+                                                              b.insert(b.end(), { 0x48,0x85,0xC0 }); auto freed = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, freed, b.size());
+                                                              patchLocal(b, noOldPointer, b.size());
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]);
+                                                              b.insert(b.end(), { 0x48,0x8B,0x84,0x24 }); put32(b, 56);
+                                                              storeMem(b, 10, 0, 0, 8);
+                                                              b.insert(b.end(), { 0x48,0x8B,0x84,0x24 }); put32(b, 64);
+                                                              storeMem(b, 10, 8, 0, 8); storeMem(b, 10, 16, 0, 8);
+                                                              break;
+                                                          }
                                                           case PMIROpcode::TextToString: {
                                                               if (i.srcSlots.size() != 1)throw std::runtime_error("text.to_string requires one text input");
                                                               // Owned string ABI {ptr,len,capacity}. The actual storage is obtained
@@ -8237,7 +8940,8 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                                               if (fn.richReturn) { if (i.srcSlots.empty())throw std::runtime_error("rich return missing source"); auto lay = abi.layout(fn.returnValueType); loadSlot(b, 10, fn, i.srcSlots[0]); loadRbp(b, 11, negDisp(fn.sretCellOffset)); copyFixed(b, 10, 11, lay.size); movReg(b, 0, 11); epilogue(b); }
                                                               else {
                                                                   if (i.srcSlots.empty())b.insert(b.end(), { 0x31,0xC0 }); else if (fpType(fn.returnValueType.kind))xmmSlotLoad(b, fn, i.srcSlots[0]);
-                                                                  else loadSlot(b, 0, fn, i.srcSlots[0]); epilogue(b);
+                                                                  else loadSlot(b, 0, fn, i.srcSlots[0]);
+                                                                  epilogue(b);
                                                               }break;
                                                           }
                                                           case PMIROpcode::Nop:b.push_back(0x90); break;
@@ -8272,7 +8976,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                               for (const auto& i : b.instructions) {
                                                   switch (i.op) {
                                                   case IROpcode::ConstFloat:case IROpcode::ConstText:case IROpcode::CallClosure:
-                                                  case IROpcode::TextToString:case IROpcode::StringToText:case IROpcode::StringClear:case IROpcode::StringDispose:case IROpcode::StringMove:case IROpcode::ByteCount:case IROpcode::TextEquals:case IROpcode::TextByteAt:case IROpcode::TextFindByte:case IROpcode::TextStartsWith:case IROpcode::NumericCheckedCast:
+                                                  case IROpcode::TextToString:case IROpcode::StringToText:case IROpcode::StringClear:case IROpcode::StringDispose:case IROpcode::StringMove:case IROpcode::ByteCount:case IROpcode::TextEquals:case IROpcode::TextByteAt:case IROpcode::TextFindByte:case IROpcode::TextStartsWith:case IROpcode::TextEndsWith:case IROpcode::TextSlice:case IROpcode::TextHash64:case IROpcode::TextCodepointCount:case IROpcode::TextIsAscii:case IROpcode::TextFindText:case IROpcode::TextCompare:case IROpcode::TextRFindText:case IROpcode::TextStreamWrite:case IROpcode::StringAppend:case IROpcode::NumericCheckedCast:
                                                   case IROpcode::ResultOk:case IROpcode::ResultErr:case IROpcode::ResultIsErr:case IROpcode::ResultTry:
                                                   case IROpcode::OptionSome:case IROpcode::OptionNone:
                                                   case IROpcode::MakeAggregate:case IROpcode::ExtractField:case IROpcode::StoreField:case IROpcode::ArrayIndex:case IROpcode::ArrayStore:case IROpcode::MakeClosure:
@@ -8385,7 +9089,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       case IROpcode::ConstFloat: throw std::runtime_error("C++20 backend does not support IEEE-754 PCIR yet");
                                       case IROpcode::ArrayIndex:case IROpcode::ArrayStore:case IROpcode::StoreField:throw std::runtime_error("C++20 backend cannot lower native aggregate mutation");
                                       case IROpcode::ConstInt: oss << "    v" << reg(inst.dest) << " = " << sanitizedIntegerLiteral(inst) << ";\n"; break;
-                                      case IROpcode::ConstText: oss << "    /* text literal retained in PCIR metadata: " << escapedComment(inst.literalText) << " */\n"; break;
+                                      case IROpcode::ConstText: throw std::runtime_error("C++20 exporter: text literal requires implemented text ABI");
                                       case IROpcode::ConstBool: oss << "    v" << reg(inst.dest) << " = " << (inst.hasImmediate && inst.immediate ? 1 : 0) << ";\n"; break;
                                       case IROpcode::ConstNull: oss << "    v" << reg(inst.dest) << " = 0;\n"; break;
                                       case IROpcode::Copy: emitBinaryCopy(oss, inst); break;
@@ -8411,8 +9115,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       case IROpcode::And: emitBinary(oss, inst, "&&"); break;
                                       case IROpcode::Or: emitBinary(oss, inst, "||"); break;
                                       case IROpcode::Phi:
-                                          if (!inst.phiInputs.empty()) oss << "    v" << reg(inst.dest) << " = v" << reg(inst.phiInputs.front().second) << "; /* conservative phi */\n";
-                                          break;
+                                          throw std::runtime_error("C++20 exporter: SSA phi requires predecessor-aware legalization");
                                       case IROpcode::Branch: if (!inst.targetBlocks.empty()) oss << "    goto " << blockLabel(inst.targetBlocks.front()) << ";\n"; break;
                                       case IROpcode::BranchIf:
                                           if (inst.args.size() && inst.targetBlocks.size() >= 2)
@@ -8420,20 +9123,18 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           break;
                                       case IROpcode::Call: emitCall(oss, inst); break;
                                       case IROpcode::CallClosure:
-                                          oss << "    /* indirect closure call requires closure environment legalization */\n"; break;
                                       case IROpcode::TextToString:
-                                          oss << "    /* text.to_string: allocates owned UTF-8 storage; rich portable runtime legalization required */\n"; break;
                                       case IROpcode::StringToText:
-                                          oss << "    /* string.to_text: zero-copy immutable borrow; rich portable runtime legalization required */\n"; break;
+                                          throw std::runtime_error("C++20 exporter: closure and owned/borrowed text ABI not implemented");
                                       case IROpcode::TextEquals:throw std::runtime_error("C++20 exporter lacks text equality legalization");
-                                      case IROpcode::ByteCount:case IROpcode::TextByteAt:case IROpcode::TextFindByte:case IROpcode::TextStartsWith:case IROpcode::NumericCheckedCast:throw std::runtime_error("C++20 exporter lacks rich text byte-operation legalization");
+                                      case IROpcode::ByteCount:case IROpcode::TextByteAt:case IROpcode::TextFindByte:case IROpcode::TextStartsWith:case IROpcode::TextEndsWith:case IROpcode::TextSlice:case IROpcode::TextHash64:case IROpcode::TextCodepointAt:case IROpcode::TextCodepointCount:case IROpcode::TextIsAscii:case IROpcode::TextFindText:case IROpcode::TextCompare:case IROpcode::TextRFindText:case IROpcode::TextStreamWrite:case IROpcode::StringAppend:case IROpcode::NumericCheckedCast:throw std::runtime_error("C++20 exporter lacks rich text byte-operation legalization");
                                       case IROpcode::StringDispose:case IROpcode::StringMove:
                                           throw std::runtime_error("C++20 exporter lacks string disposal");
                                       case IROpcode::StringClear:
-                                          oss << "    /* string.clear: requires exclusive/owned string authority; rich portable runtime legalization required */\n"; break;
+                                          throw std::runtime_error("C++20 exporter: owned-string mutation requires runtime legalization");
                                       case IROpcode::ResultOk: case IROpcode::ResultErr: case IROpcode::ResultIsErr: case IROpcode::ResultTry: case IROpcode::OptionSome: case IROpcode::OptionNone:
                                       case IROpcode::MakeAggregate: case IROpcode::ExtractField: case IROpcode::MakeClosure:
-                                          oss << "    /* semantic PCIR op " << static_cast<int>(inst.op) << " requires portable aggregate runtime legalization */\n"; break;
+                                          throw std::runtime_error("C++20 exporter: aggregate/result/option/closure layout not implemented");
                                       case IROpcode::Return:
                                           if (!inst.args.empty()) oss << "    return v" << reg(inst.args[0]) << ";\n";
                                           else oss << "    return;\n";
@@ -8453,7 +9154,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   }
                                   void emitCall(std::ostringstream& oss, const IRInstruction& inst) const {
                                       const bool isPrint = inst.callee == "print";
-                                      if (isPrint) { oss << "    /* builtin print is runtime-bound in native Paracine; portability shim omitted */\n"; return; }
+                                      if (isPrint) throw std::runtime_error("C++20 exporter: print runtime requires explicit interop binding");
                                       if (inst.returnType != "void") oss << "    v" << reg(inst.dest) << " = "; else oss << "    ";
                                       oss << cppFunctionName(inst.callee) << '(';
                                       for (std::size_t i = 0; i < inst.args.size(); ++i) { if (i) oss << ", "; oss << "v" << reg(inst.args[i]); }
@@ -8612,7 +9313,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   };
                                   static ImportLayout describeImports(const std::vector<MachineProgram::ImportCall>& calls) {
                                       ImportLayout imp;
-                                      const std::vector<std::string> canonical = { "GetProcessHeap","HeapAlloc","HeapFree" };
+                                      const std::vector<std::string> canonical = { "GetProcessHeap","HeapAlloc","HeapFree","GetStdHandle","WriteFile" };
                                       std::set<std::string> used;
                                       for (const auto& c : calls) { if (std::find(canonical.begin(), canonical.end(), c.symbol) == canonical.end())throw std::runtime_error("unsupported Win32 import: " + c.symbol); used.insert(c.symbol); }
                                       for (const auto& c : canonical)if (used.contains(c))imp.names.push_back(c);
@@ -8628,8 +9329,10 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       if (imp.names.empty())return {};
                                       out.writeU32(baseRva + imp.ilt); out.writeU32(0); out.writeU32(0); out.writeU32(baseRva + imp.dll); out.writeU32(baseRva + imp.iat);
                                       for (int j = 0; j < 20; ++j)out.writeU8(0);
-                                      for (const auto& name : imp.names)out.writeU64(baseRva + imp.hintNames.at(name)); out.writeU64(0);
-                                      for (const auto& name : imp.names)out.writeU64(baseRva + imp.hintNames.at(name)); out.writeU64(0);
+                                      for (const auto& name : imp.names)out.writeU64(baseRva + imp.hintNames.at(name));
+                                      out.writeU64(0);
+                                      for (const auto& name : imp.names)out.writeU64(baseRva + imp.hintNames.at(name));
+                                      out.writeU64(0);
                                       for (const auto& name : imp.names) { out.align(2); out.writeU16(0); out.writeStringZ(name); }
                                       if (out.size() != imp.dll)throw std::runtime_error("internal PE import layout mismatch");
                                       out.writeStringZ("KERNEL32.dll");
@@ -8637,24 +9340,34 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       return out.release();
                                   }
                               public:
+                                  // The compiler has already verified PMIR and machine bytes. Reuse those
+                                  // exact artifacts: re-lowering previously doubled native backend work.
                                   std::vector<std::uint8_t> emitObject(const IRProgram& program, const std::string& entry = {}) const {
-                                      const auto image = buildImage(program, false, entry);
-                                      return emitCOFFObject(image);
+                                      return emitCOFFObject(buildImage(program, false, entry));
                                   }
-
                                   std::vector<std::uint8_t> emitExecutable(const IRProgram& program, const std::string& entry = {}) const {
-                                      const auto image = buildImage(program, true, entry);
-                                      return emitPEImage(image);
+                                      return emitPEImage(buildImage(program, true, entry));
                                   }
-
+                                  std::vector<std::uint8_t> emitObject(const IRProgram& program,
+                                      const PMIRProgram& pmir, const MachineProgram& machine) const {
+                                      return emitCOFFObject(buildImage(program, false, {}, &pmir, &machine));
+                                  }
+                                  std::vector<std::uint8_t> emitExecutable(const IRProgram& program,
+                                      const PMIRProgram& pmir, const MachineProgram& machine) const {
+                                      return emitPEImage(buildImage(program, true, {}, &pmir, &machine));
+                                  }
                               private:
-                                  PECOFFImage buildImage(const IRProgram& program, bool includeUnwind, const std::string& entry) const {
+                                  PECOFFImage buildImage(const IRProgram& program, bool includeUnwind,
+                                      const std::string& entry,
+                                      const PMIRProgram* reusedPmir = nullptr,
+                                      const MachineProgram* reusedMachine = nullptr) const {
                                       PECOFFImage image;
-
-                                      PMIRLowerer pmirLowerer;
-                                      auto pmir = pmirLowerer.lower(program);
-                                      X64Encoder encoder;
-                                      auto machine = encoder.encode(pmir, entry);
+                                      std::optional<PMIRProgram> generatedPmir;
+                                      if (!reusedPmir) generatedPmir.emplace(PMIRLowerer{}.lower(program));
+                                      const PMIRProgram& pmir = reusedPmir ? *reusedPmir : *generatedPmir;
+                                      std::optional<MachineProgram> generatedMachine;
+                                      if (!reusedMachine) generatedMachine.emplace(X64Encoder{}.encode(pmir, entry));
+                                      const MachineProgram& machine = reusedMachine ? *reusedMachine : *generatedMachine;
 
                                       PECOFFSection text;
                                       text.name = ".text";
@@ -9086,7 +9799,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   case IROpcode::Gt: return "gt"; case IROpcode::Ge: return "ge"; case IROpcode::And: return "and";
                                   case IROpcode::Or: return "or"; case IROpcode::Phi: return "phi"; case IROpcode::Branch: return "br";
                                   case IROpcode::BranchIf: return "br.if"; case IROpcode::Call: return "call"; case IROpcode::CallClosure: return "call.closure";
-                                  case IROpcode::TextToString: return "text.to_string"; case IROpcode::StringToText: return "string.to_text"; case IROpcode::StringClear: return "string.clear"; case IROpcode::StringDispose: return "string.dispose"; case IROpcode::StringMove:return "string.move"; case IROpcode::ByteCount: return "text.count"; case IROpcode::TextEquals: return "text.equals"; case IROpcode::TextByteAt:return "text.byte_at"; case IROpcode::TextFindByte:return "text.find_byte"; case IROpcode::TextStartsWith:return "text.starts_with"; case IROpcode::NumericCheckedCast:return "numeric.checked_cast";
+                                  case IROpcode::TextToString: return "text.to_string"; case IROpcode::StringToText: return "string.to_text"; case IROpcode::StringClear: return "string.clear"; case IROpcode::StringDispose: return "string.dispose"; case IROpcode::StringMove:return "string.move"; case IROpcode::ByteCount: return "text.count"; case IROpcode::TextEquals: return "text.equals"; case IROpcode::TextByteAt:return "text.byte_at"; case IROpcode::TextFindByte:return "text.find_byte"; case IROpcode::TextStartsWith:return "text.starts_with"; case IROpcode::TextEndsWith:return "text.ends_with"; case IROpcode::TextSlice:return "text.slice"; case IROpcode::TextHash64:return "text.hash64"; case IROpcode::TextCodepointAt:return "text.codepoint_at"; case IROpcode::TextCodepointCount:return "text.codepoint_count"; case IROpcode::TextIsAscii:return "text.is_ascii"; case IROpcode::TextFindText:return "text.find"; case IROpcode::TextCompare:return "text.compare"; case IROpcode::TextRFindText:return "text.rfind"; case IROpcode::TextStreamWrite:return "text.stream_write"; case IROpcode::StringAppend:return "string.append"; case IROpcode::NumericCheckedCast:return "numeric.checked_cast";
                                   case IROpcode::MakeAggregate: return "aggregate.make"; case IROpcode::ExtractField: return "aggregate.field"; case IROpcode::ArrayIndex:return "array.index"; case IROpcode::StoreField:return "aggregate.store.field"; case IROpcode::ArrayStore:return "array.store";
                                   case IROpcode::ResultOk: return "result.ok"; case IROpcode::ResultErr: return "result.err"; case IROpcode::ResultIsErr: return "result.is_err"; case IROpcode::ResultTry: return "result.try";
                                   case IROpcode::OptionSome: return "option.some"; case IROpcode::OptionNone: return "option.none"; case IROpcode::MakeClosure: return "closure.make";
@@ -9177,8 +9890,382 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
                               }
 
+                              // Deterministic, cycle-checked local source imports. This is a flat import
+                              // subset: `use math` resolves sibling math.pcn. It does not implement
+                              // namespace aliases, package resolution, visibility rules or module coherence.
+                              static void resolveSourceImports(Program& root, const std::filesystem::path& sourceFile) {
+                                  if (sourceFile.empty())return;
+                                  namespace fs = std::filesystem;
+                                  const auto canonicalRoot = fs::weakly_canonical(sourceFile);
+                                  std::set<fs::path> visited, active;
+                                  visited.insert(canonicalRoot);
+                                  std::vector<Routine> loadedRoutines;
+                                  std::vector<Declaration> loadedDeclarations;
+                                  std::function<void(const Program&, const fs::path&, std::size_t)> walk;
+                                  walk = [&](const Program& p, const fs::path& file, std::size_t depth) {
+                                      if (depth > 64)throw std::runtime_error("E0520 import nesting exceeds 64 files");
+                                      for (const auto& decl : p.declarations) {
+                                          const auto* u = std::get_if<UseDecl>(&decl.node);
+                                          if (!u)continue;
+                                          if (!u->alias.empty())throw std::runtime_error("E0521 import aliases require namespace-aware module lowering");
+                                          if (u->path.size() != 1 || u->path[0].empty())throw std::runtime_error("E0522 malformed source import");
+                                          const auto& name = u->path[0];
+                                          fs::path relative;
+                                          std::size_t start = 0;
+                                          while (start < name.size()) {
+                                              auto end = name.find("::", start);
+                                              auto component = name.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                                              if (component.empty() || component == "." || component == "..")throw std::runtime_error("E0522 invalid import component");
+                                              relative /= component;
+                                              if (end == std::string::npos)break;
+                                              start = end + 2;
+                                          }
+                                          auto target = fs::weakly_canonical(file.parent_path() / (relative.string() + ".pcn"));
+                                          if (active.contains(target) || target == canonicalRoot)
+                                              throw std::runtime_error("E0523 import cycle involving: " + target.string());
+                                          if (visited.contains(target))continue;
+                                          if (visited.size() >= 1024)throw std::runtime_error("E0524 source import graph exceeds file limit");
+                                          std::error_code ec;
+                                          if (!fs::is_regular_file(target, ec))throw std::runtime_error("E0525 missing local source import: " + target.string());
+                                          if (fs::file_size(target, ec) > 8 * 1024 * 1024 || ec)throw std::runtime_error("E0526 import source size/metadata rejected: " + target.string());
+                                          visited.insert(target); active.insert(target);
+                                          auto parsed = Parser(Lexer(readSourceFile(target)).tokenize()).parse();
+                                          walk(parsed, target, depth + 1);
+                                          loadedRoutines.insert(loadedRoutines.end(), parsed.routines.begin(), parsed.routines.end());
+                                          for (const auto& d : parsed.declarations)
+                                              if (!std::holds_alternative<UseDecl>(d.node))loadedDeclarations.push_back(d);
+                                          active.erase(target);
+                                      }
+                                      };
+                                  active.insert(canonicalRoot);
+                                  walk(root, canonicalRoot, 0);
+                                  root.routines.insert(root.routines.end(), loadedRoutines.begin(), loadedRoutines.end());
+                                  root.declarations.insert(root.declarations.end(), loadedDeclarations.begin(), loadedDeclarations.end());
+                              }
+
+
+                              // --- Fast artifact cache and reproducible, dependency-aware builds ----------
+                              // Cache validation uses SHA-256 for compiler identity, each source dependency,
+                              // key derivation, and cached payload corruption detection. No timestamps are
+                              // trusted as content identity; malformed cache entries are cache misses.
+                              class SHA256 {
+                              public:
+                                  void update(const void* data, std::size_t length) {
+                                      const auto* p = static_cast<const std::uint8_t*>(data);
+                                      length_ += static_cast<std::uint64_t>(length);
+                                      if (used_) {
+                                          const auto n = std::min<std::size_t>(64 - used_, length);
+                                          std::memcpy(buf_.data() + used_, p, n); used_ += n; p += n; length -= n;
+                                          if (used_ == 64) { block(buf_.data()); used_ = 0; }
+                                      }
+                                      while (length >= 64) { block(p); p += 64; length -= 64; }
+                                      if (length) { std::memcpy(buf_.data(), p, length); used_ = length; }
+                                  }
+                                  void update(std::string_view v) { update(v.data(), v.size()); }
+                                  std::array<std::uint8_t, 32> finish() {
+                                      const std::uint64_t bits = length_ * 8;
+                                      buf_[used_++] = 0x80;
+                                      if (used_ > 56) { while (used_ < 64)buf_[used_++] = 0; block(buf_.data()); used_ = 0; }
+                                      while (used_ < 56)buf_[used_++] = 0;
+                                      for (int i = 7; i >= 0; --i)buf_[used_++] = static_cast<std::uint8_t>(bits >> (i * 8));
+                                      block(buf_.data());
+                                      std::array<std::uint8_t, 32> result{};
+                                      for (std::size_t i = 0; i < 8; ++i)for (int j = 0; j < 4; ++j)
+                                          result[i * 4 + j] = static_cast<std::uint8_t>(h_[i] >> (24 - 8 * j));
+                                      return result;
+                                  }
+                                  static std::array<std::uint8_t, 32> digest(std::string_view v) { SHA256 sha; sha.update(v); return sha.finish(); }
+                                  static std::string hex(const std::array<std::uint8_t, 32>& d) {
+                                      static constexpr char alphabet[] = "0123456789abcdef";
+                                      std::string out; out.reserve(64);
+                                      for (auto b : d) { out.push_back(alphabet[b >> 4]); out.push_back(alphabet[b & 15]); }return out;
+                                  }
+                              private:
+                                  static std::uint32_t rotr(std::uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+                                  void block(const std::uint8_t* p) {
+                                      static constexpr std::uint32_t k[64] = {
+                                        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+                                        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+                                        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+                                        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+                                        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+                                        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+                                        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+                                        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+                                      std::uint32_t w[64]{};
+                                      for (int i = 0; i < 16; ++i)w[i] = (static_cast<std::uint32_t>(p[i * 4]) << 24) |
+                                          (static_cast<std::uint32_t>(p[i * 4 + 1]) << 16) | (static_cast<std::uint32_t>(p[i * 4 + 2]) << 8) | p[i * 4 + 3];
+                                      for (int i = 16; i < 64; ++i) {
+                                          const auto x = w[i - 15], y = w[i - 2];
+                                          w[i] = (rotr(y, 17) ^ rotr(y, 19) ^ (y >> 10)) + w[i - 7] +
+                                              (rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3)) + w[i - 16];
+                                      }
+                                      auto a = h_[0], b = h_[1], c = h_[2], d = h_[3], e = h_[4], f = h_[5], g = h_[6], h = h_[7];
+                                      for (int i = 0; i < 64; ++i) {
+                                          const auto s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+                                          const auto t1 = h + s1 + ((e & f) ^ (~e & g)) + k[i] + w[i];
+                                          const auto s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+                                          const auto t2 = s0 + ((a & b) ^ (a & c) ^ (b & c));
+                                          h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+                                      }
+                                      h_[0] += a; h_[1] += b; h_[2] += c; h_[3] += d; h_[4] += e; h_[5] += f; h_[6] += g; h_[7] += h;
+                                  }
+                                  std::uint32_t h_[8] = { 0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                                                          0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19 };
+                                  std::array<std::uint8_t, 64> buf_{};
+                                  std::size_t used_ = 0;
+                                  std::uint64_t length_ = 0;
+                              };
+
+                              static std::string sha256File(const std::filesystem::path& file) {
+                                  std::ifstream input(file, std::ios::binary);
+                                  if (!input)throw std::runtime_error("cannot hash file: " + file.string());
+                                  SHA256 sha;
+                                  std::array<char, 65536> chunk{};
+                                  while (input) {
+                                      input.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+                                      const auto n = input.gcount();
+                                      if (n > 0)sha.update(chunk.data(), static_cast<std::size_t>(n));
+                                  }
+                                  if (input.bad())throw std::runtime_error("file hash failed: " + file.string());
+                                  return SHA256::hex(sha.finish());
+                              }
+
+                              static std::optional<std::filesystem::path> runningCompilerPath() {
+#ifdef _WIN32
+                                  std::wstring buffer(32768, L'\0');
+                                  const DWORD n = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+                                  if (n > 0 && n < buffer.size()) { buffer.resize(n); return std::filesystem::path(buffer); }
+#elif defined(__linux__)
+                                  std::error_code ec;
+                                  auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+                                  if (!ec)return exe;
+#endif
+                                  return std::nullopt;
+                              }
+
+                              // SHA-256 hash the compiler binary when it changes, and remember the digest
+                              // on disk. A warm cache checks only executable size + high-resolution mtime.
+                              // This assumes normal build tools update executable metadata on replacement;
+                              // deliberate timestamp/size spoofing requires deleting the stamp directory.
+                              static std::string compilerIdentityHash(const std::filesystem::path& cacheRoot) {
+                                  namespace fs = std::filesystem;
+                                  const auto exe = runningCompilerPath();
+                                  if (!exe)return {};
+                                  try {
+                                      std::error_code ec;
+                                      const auto path = fs::weakly_canonical(*exe, ec);
+                                      if (ec)return {};
+                                      const auto size = fs::file_size(path, ec);
+                                      if (ec)return {};
+                                      const auto time = fs::last_write_time(path, ec);
+                                      if (ec)return {};
+                                      const auto pathText = path.generic_string();
+                                      const auto stampId = SHA256::hex(SHA256::digest(pathText)).substr(0, 20);
+                                      const auto stamp = cacheRoot / (".compiler-" + stampId + ".stamp");
+                                      const std::string metadata = std::to_string(size) + "\n" +
+                                          std::to_string(time.time_since_epoch().count()) + "\n" + pathText + "\n";
+                                      {
+                                          std::ifstream saved(stamp, std::ios::binary);
+                                          if (saved) {
+                                              std::string header(metadata.size(), '\0');
+                                              if (saved.read(header.data(), static_cast<std::streamsize>(header.size())) &&
+                                                  header == metadata) {
+                                                  std::string digest(64, '\0');
+                                                  if (saved.read(digest.data(), 64) &&
+                                                      std::all_of(digest.begin(), digest.end(), [](char c) {
+                                                          return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+                                                          })) return digest;
+                                              }
+                                          }
+                                      }
+                                      // Compiler binary changed (or no stamp): pay the full hash once.
+                                      const auto binary = readSourceFile(path);
+                                      const auto digest = SHA256::hex(SHA256::digest(binary));
+                                      fs::create_directories(cacheRoot);
+                                      const auto tmp = fs::path(stamp.string() + ".new");
+                                      {
+                                          std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+                                          if (out) {
+                                              out << metadata << digest; out.close();
+                                              if (out) {
+                                                  std::error_code renameError; fs::rename(tmp, stamp, renameError);
+                                                  if (renameError) {
+                                                      std::error_code removeError; fs::remove(stamp, removeError);
+                                                      fs::rename(tmp, stamp, renameError);
+                                                  }
+                                              }
+                                          }
+                                      }
+                                      return digest;
+                                  }
+                                  catch (...) { return {}; }
+                              }
+
+                              static std::optional<std::string> dependencyContentHash(const std::filesystem::path& root,
+                                  const std::string& source,
+                                  std::vector<std::pair<std::filesystem::path, std::string>>* list = nullptr) {
+                                  namespace fs = std::filesystem;
+                                  try {
+                                      const auto canonicalRoot = fs::weakly_canonical(root);
+                                      std::set<fs::path> seen, active;
+                                      std::vector<std::pair<fs::path, std::string>> contents;
+                                      std::function<void(const fs::path&, const std::string&, std::size_t)> walk;
+                                      walk = [&](const fs::path& file, const std::string& data, std::size_t depth) {
+                                          if (depth > 64 || seen.size() >= 1024)throw std::runtime_error("dependency limits exceeded");
+                                          if (active.contains(file))throw std::runtime_error("import cycle");
+                                          if (!seen.insert(file).second)return;
+                                          active.insert(file);
+                                          contents.emplace_back(file, data);
+                                          const auto tree = Parser(Lexer(data).tokenize()).parse();
+                                          for (const auto& decl : tree.declarations) {
+                                              const auto* u = std::get_if<UseDecl>(&decl.node);
+                                              if (!u)continue;
+                                              if (!u->alias.empty() || u->path.size() != 1 || u->path[0].empty())
+                                                  throw std::runtime_error("unsupported import");
+                                              fs::path relative;
+                                              const std::string& name = u->path[0];
+                                              for (std::size_t start = 0; start < name.size();) {
+                                                  auto end = name.find("::", start);
+                                                  auto component = name.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                                                  if (component.empty() || component == "." || component == "..")throw std::runtime_error("invalid import");
+                                                  relative /= component;
+                                                  if (end == std::string::npos)break;
+                                                  start = end + 2;
+                                              }
+                                              const auto target = fs::weakly_canonical(file.parent_path() / (relative.string() + ".pcn"));
+                                              if (active.contains(target))throw std::runtime_error("import cycle");
+                                              if (seen.contains(target))continue;
+                                              std::error_code ec;
+                                              if (!fs::is_regular_file(target, ec) || ec || fs::file_size(target, ec) > 8 * 1024 * 1024 || ec)
+                                                  throw std::runtime_error("unavailable import");
+                                              walk(target, readSourceFile(target), depth + 1);
+                                          }
+                                          active.erase(file);
+                                          };
+                                      walk(canonicalRoot, source, 0);
+                                      std::sort(contents.begin(), contents.end(), [](const auto& a, const auto& b) {return a.first < b.first; });
+                                      if (list) {
+                                          for (const auto& [path, data] : contents)
+                                              list->emplace_back(path, SHA256::hex(SHA256::digest(data)));
+                                      }
+                                      SHA256 key;
+                                      for (const auto& [file, data] : contents) {
+                                          const auto path = file.generic_string();
+                                          key.update(std::to_string(path.size()) + ":"); key.update(path);
+                                          key.update(std::to_string(data.size()) + ":"); key.update(data);
+                                      }
+                                      return SHA256::hex(key.finish());
+                                  }
+                                  catch (...) { return std::nullopt; } // ordinary compiler will show real error
+                              }
+
+                              static std::optional<std::string> nativeArtifactCacheKey(const std::filesystem::path& root,
+                                  const std::string& source,
+                                  const std::string& kind,
+                                  const CompilerOptions& options,
+                                  const std::filesystem::path& cacheRoot) {
+                                  const auto compiler = compilerIdentityHash(cacheRoot);
+                                  if (compiler.empty())return std::nullopt;
+                                  const auto dependencies = dependencyContentHash(root, source);
+                                  if (!dependencies)return std::nullopt;
+                                  const std::string material = "paracine-fast-cache-v1\n" + compiler + "\n" + *dependencies + "\n" +
+                                      kind + "\n" + options.entry + "\n" + std::to_string(options.optimizationLevel) + "\n";
+                                  return SHA256::hex(SHA256::digest(material));
+                              }
+
+                              // A cache entry contains a magic header and SHA-256 of the complete artifact.
+                              // Invalid/truncated/tampered artifacts are rebuilt, never passed to the user.
+                              static std::optional<std::vector<std::uint8_t>> loadNativeArtifactCache(const std::filesystem::path& file) {
+                                  std::error_code ec;
+                                  if (!std::filesystem::is_regular_file(file, ec) || ec)return std::nullopt;
+                                  const auto size = std::filesystem::file_size(file, ec);
+                                  if (ec || size < 41 || size>256ull * 1024 * 1024)return std::nullopt;
+                                  std::ifstream in(file, std::ios::binary);
+                                  if (!in)return std::nullopt;
+                                  std::vector<std::uint8_t> data(static_cast<std::size_t>(size));
+                                  if (!in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size())))return std::nullopt;
+                                  static constexpr char magic[] = "PCNCACHE2";
+                                  if (!std::equal(magic, magic + 9, data.begin()))return std::nullopt;
+                                  const auto actual = SHA256::digest(std::string_view(reinterpret_cast<const char*>(data.data() + 41), data.size() - 41));
+                                  if (!std::equal(actual.begin(), actual.end(), data.begin() + 9))return std::nullopt;
+                                  return std::vector<std::uint8_t>(data.begin() + 41, data.end());
+                              }
+                              static bool saveNativeArtifactCache(const std::filesystem::path& file,
+                                  const std::vector<std::uint8_t>& bytes) {
+                                  namespace fs = std::filesystem;
+                                  try {
+                                      fs::create_directories(file.parent_path());
+                                      std::vector<std::uint8_t> data;
+                                      data.reserve(41 + bytes.size());
+                                      constexpr char magic[] = "PCNCACHE2";
+                                      data.insert(data.end(), magic, magic + 9);
+                                      const auto sha = SHA256::digest(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+                                      data.insert(data.end(), sha.begin(), sha.end());
+                                      data.insert(data.end(), bytes.begin(), bytes.end());
+                                      // Unique temporary file, renamed after complete write; concurrent
+                                      // processes cannot observe partially written cache artifacts.
+                                      std::random_device rng;
+                                      const auto tmp = fs::path(file.string() + ".tmp." + std::to_string(rng()) + "." +
+                                          std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+                                      struct RemoveTemporary { fs::path name; ~RemoveTemporary() { std::error_code ec; fs::remove(name, ec); } } remove{ tmp };
+                                      writeBinaryFile(tmp, data);
+                                      std::error_code ec;
+                                      fs::rename(tmp, file, ec);
+                                      if (ec) { if (fs::exists(file))return true; return false; }
+                                      return true;
+                                  }
+                                  catch (...) { return false; }
+                              }
+                              static bool writeArtifactIfDifferent(const std::filesystem::path& file,
+                                  const std::vector<std::uint8_t>& bytes) {
+                                  std::error_code ec;
+                                  if (std::filesystem::is_regular_file(file, ec) && !ec &&
+                                      std::filesystem::file_size(file, ec) == bytes.size() && !ec) {
+                                      std::ifstream input(file, std::ios::binary);
+                                      if (input) {
+                                          std::array<char, 65536> buffer{};
+                                          std::size_t offset = 0; bool equal = true;
+                                          while (offset < bytes.size()) {
+                                              const std::size_t n = std::min(buffer.size(), bytes.size() - offset);
+                                              if (!input.read(buffer.data(), static_cast<std::streamsize>(n)) ||
+                                                  std::memcmp(buffer.data(), bytes.data() + offset, n) != 0) {
+                                                  equal = false; break;
+                                              }
+                                              offset += n;
+                                          }
+                                          if (equal)return false;
+                                      }
+                                  }
+                                  writeBinaryFile(file, bytes);
+                                  return true;
+                              }
+
+                              static std::string nativeSizeReport(const MachineProgram& machine, const IRProgram& ir) {
+                                  std::vector<std::pair<std::string, std::uint32_t>> functions(machine.functionSizes.begin(), machine.functionSizes.end());
+                                  std::sort(functions.begin(), functions.end(), [](const auto& a, const auto& b) {
+                                      return a.second == b.second ? a.first<b.first : a.second>b.second; });
+                                  std::size_t instructions = 0, blocks = 0;
+                                  for (const auto& f : ir.functions) {
+                                      blocks += f.blocks.size(); for (const auto& b : f.blocks)
+                                          instructions += b.instructions.size() + b.phiNodes.size();
+                                  }
+                                  std::ostringstream out;
+                                  out << "Paracine native code-size analysis\n"
+                                      << "  .text: " << machine.text.size() << " bytes\n"
+                                      << "  functions: " << functions.size() << "\n"
+                                      << "  PCIR blocks: " << blocks << "\n"
+                                      << "  PCIR instructions: " << instructions << "\n"
+                                      << "  imports: " << machine.imports.size() << "\n"
+                                      << "Largest functions (x86-64 bytes):\n";
+                                  for (std::size_t i = 0; i < std::min<std::size_t>(20, functions.size()); ++i)
+                                      out << "  " << functions[i].second << "  " << functions[i].first << "\n";
+                                  return out.str();
+                              }
+
                               static CompilationArtifacts compileAll(const std::string& source, const CompilerOptions& options, bool needMachine = true,
-                                  std::vector<std::pair<std::string, double>>* phaseTimings = nullptr) {
+                                  std::vector<std::pair<std::string, double>>* phaseTimings = nullptr,
+                                  const std::filesystem::path& sourcePath = {}) {
                                   auto phaseStart = std::chrono::steady_clock::now();
                                   auto markPhase = [&](const char* name) {
                                       if (phaseTimings) {
@@ -9193,7 +10280,8 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   markPhase("lex");
                                   Parser parser(std::move(tokens));
                                   out.program = parser.parse();
-                                  markPhase("parse");
+                                  resolveSourceImports(out.program, sourcePath);
+                                  markPhase("parse + imports");
                                   TopLevelConstantResolver{}.resolveProgram(out.program);
                                   markPhase("constants");
 
@@ -9302,10 +10390,27 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   if (!pointer || pcn_test_live_heap.erase(pointer) != 1)return 0;
                                   std::free(pointer); ++pcn_test_heap_frees; return 1;
                               }
+                              extern "C" __attribute__((ms_abi)) void* pcn_test_GetStdHandle(std::uint32_t which) {
+                                  if (which == static_cast<std::uint32_t>(-11))return reinterpret_cast<void*>(1);
+                                  if (which == static_cast<std::uint32_t>(-12))return reinterpret_cast<void*>(2);
+                                  return reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1));
+                              }
+                              extern "C" __attribute__((ms_abi)) int pcn_test_WriteFile(void* handle, const void* data, std::uint32_t amount,
+                                  std::uint32_t* written, void*) {
+                                  if (written)*written = 0;
+                                  const int fd = static_cast<int>(reinterpret_cast<std::uintptr_t>(handle));
+                                  if ((fd != 1 && fd != 2) || (!data && amount))return 0;
+                                  const ssize_t count = ::write(fd, data, amount);
+                                  if (count < 0)return 0;
+                                  if (written)*written = static_cast<std::uint32_t>(count);
+                                  return 1;
+                              }
                               static void* hostImport(const std::string& name) {
                                   if (name == "GetProcessHeap")return reinterpret_cast<void*>(&pcn_test_GetProcessHeap);
                                   if (name == "HeapAlloc")return reinterpret_cast<void*>(&pcn_test_HeapAlloc);
                                   if (name == "HeapFree")return reinterpret_cast<void*>(&pcn_test_HeapFree);
+                                  if (name == "GetStdHandle")return reinterpret_cast<void*>(&pcn_test_GetStdHandle);
+                                  if (name == "WriteFile")return reinterpret_cast<void*>(&pcn_test_WriteFile);
                                   throw std::runtime_error("no host-side Win64 ABI shim for " + name);
                               }
                               static std::int64_t executeEmittedMachineText(const MachineProgram& machine) {
@@ -9456,7 +10561,8 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   if (pid < 0)throw std::runtime_error("failed to create external linker process");
                                   if (pid == 0) {
                                       std::vector<char*> raw; raw.reserve(argv.size() + 1);
-                                      for (const auto& a : argv)raw.push_back(const_cast<char*>(a.c_str())); raw.push_back(nullptr);
+                                      for (const auto& a : argv)raw.push_back(const_cast<char*>(a.c_str()));
+                                      raw.push_back(nullptr);
                                       execvp(raw.front(), raw.data()); _exit(127);
                                   }
                                   int status = 0;
@@ -9499,7 +10605,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   struct Scratch { std::filesystem::path filename; ~Scratch() { std::error_code ec; if (!filename.empty())std::filesystem::remove(filename, ec); } } scratch;
                                   if (!source.empty()) {
                                       auto options = CompilerOptions{};
-                                      const auto artifacts = compileAll(readSourceFile(source), options, false);
+                                      const auto artifacts = compileAll(readSourceFile(source), options, false, nullptr, source);
                                       if (!artifacts.analysis.succeeded()) { printSemanticDiagnostics(artifacts.analysis); return 1; }
                                       const auto obj = PECOFFGenerator{}.emitObject(artifacts.pcir, entry);
                                       scratch.filename = std::filesystem::path(output);
@@ -9627,10 +10733,14 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                               static std::vector<std::uint8_t> buildDistribution(const std::string& source,
                                   const std::filesystem::path& sourcePath,
                                   const IRProgram& pcir,
-                                  const std::string& entry) {
+                                  const std::string& entry,
+                                  const PMIRProgram* pmir = nullptr,
+                                  const MachineProgram* machine = nullptr) {
                                   PECOFFGenerator generator;
-                                  auto executable = generator.emitExecutable(pcir, entry);
-                                  auto object = generator.emitObject(pcir, entry);
+                                  auto executable = (pmir && machine) ? generator.emitExecutable(pcir, *pmir, *machine)
+                                      : generator.emitExecutable(pcir, entry);
+                                  auto object = (pmir && machine) ? generator.emitObject(pcir, *pmir, *machine)
+                                      : generator.emitObject(pcir, entry);
                                   const auto original = sourcePath.filename().string();
                                   std::ostringstream manifest;
                                   manifest << "{\n  \"format\": \"paracine-development-bundle-v1\",\n"
@@ -9747,12 +10857,178 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       "  paracine fmt <file.pcn> [--check|--write|-o formatted.pcn]\n"
                                       "  paracine package <file.pcn> [-o release.zip] [-O0..-O3]\n"
                                       "  paracine profile <file.pcn> [-o report.txt] [-O0..-O3]\n"
+                                      "  paracine size <file.pcn> [--json] [-o report.txt] [-O0..-O3]\n"
+                                      "  paracine audit <file.pcn> [--json] [-o report.json]\n"
+                                      "  paracine deps <file.pcn> [-o dependencies.txt]\n"
+                                      "  paracine hash <file> [files...]\n"
+                                      "  paracine build|pe|obj <file.pcn> --cache [--cache-dir PATH] [-O0..-O3]\n"
                                       "  paracine bench <file.pcn> [--iterations N] [-O0..-O3]\n"
                                       "  paracine init <empty-directory>\n"
                                       "  paracine doctor | version\n"
+                                      "  paracine selftest\n"
+                                      "  paracine verify-bin <file.obj|file.exe> [...]\n"
                                       "  paracine clean <file.pcn>\n\n"
                                       "Legacy compatibility:\n"
                                       "  paracine <file.pcn> [--check|--ast|--ir|--mir|--asm|--pe|--coff|--cpp] [--out file]\n";
+                              }
+
+
+                              // Hardened, standalone structural inspection of native output. This is not
+                              // an OS loader, a signature verification, or a claim that a binary is safe.
+                              struct NativeFileReport {
+                                  std::string format;
+                                  std::uint16_t machine = 0;
+                                  std::uint16_t sectionCount = 0;
+                                  std::uint64_t imageBase = 0;
+                                  std::uint32_t entryRVA = 0;
+                                  std::uint32_t imageSize = 0;
+                                  std::vector<std::string> sections;
+                              };
+                              static NativeFileReport verifyNativeArtifact(const std::vector<std::uint8_t>& b) {
+                                  auto require = [&](std::uint64_t off, std::uint64_t n, const char* message) {
+                                      if (off > b.size() || n > b.size() - off)
+                                          throw std::runtime_error(std::string("E0910 invalid native artifact: ") + message);
+                                      };
+                                  auto u16 = [&](std::uint64_t i)->std::uint16_t {
+                                      require(i, 2, "truncated 16-bit field");
+                                      return std::uint16_t(b[std::size_t(i)]) | (std::uint16_t(b[std::size_t(i + 1)]) << 8);
+                                      };
+                                  auto u32 = [&](std::uint64_t i)->std::uint32_t {
+                                      return std::uint32_t(u16(i)) | (std::uint32_t(u16(i + 2)) << 16);
+                                      };
+                                  auto u64 = [&](std::uint64_t i)->std::uint64_t {
+                                      return std::uint64_t(u32(i)) | (std::uint64_t(u32(i + 4)) << 32);
+                                      };
+                                  NativeFileReport result;
+                                  std::uint64_t coff = 0;
+                                  bool pe = b.size() >= 2 && b[0] == 'M' && b[1] == 'Z';
+                                  if (pe) {
+                                      require(0x3c, 4, "DOS header");
+                                      coff = u32(0x3c);
+                                      require(coff, 24, "PE signature / COFF header");
+                                      if (u32(coff) != 0x00004550u)
+                                          throw std::runtime_error("E0910 invalid PE signature");
+                                      coff += 4;
+                                      result.format = "PE32+ executable";
+                                  }
+                                  else {
+                                      require(0, 20, "COFF header");
+                                      result.format = "COFF object";
+                                  }
+                                  result.machine = u16(coff);
+                                  if (result.machine != 0x8664)
+                                      throw std::runtime_error("E0910 target is not AMD64 COFF");
+                                  result.sectionCount = u16(coff + 2);
+                                  if (result.sectionCount == 0 || result.sectionCount > 96)
+                                      throw std::runtime_error("E0910 implausible section count");
+                                  auto symbolOffset = u32(coff + 8);
+                                  auto symbolCount = u32(coff + 12);
+                                  auto optionalSize = u16(coff + 16);
+                                  const std::uint64_t optional = coff + 20;
+                                  require(optional, optionalSize, "optional header");
+                                  if (pe) {
+                                      if (optionalSize < 112 || u16(optional) != 0x20b)
+                                          throw std::runtime_error("E0910 expected PE32+ optional header");
+                                      result.entryRVA = u32(optional + 16);
+                                      result.imageBase = u64(optional + 24);
+                                      result.imageSize = u32(optional + 56);
+                                      auto sectionAlignment = u32(optional + 32);
+                                      auto fileAlignment = u32(optional + 36);
+                                      if (!sectionAlignment || !fileAlignment || (fileAlignment & (fileAlignment - 1)) != 0 ||
+                                          (sectionAlignment & (sectionAlignment - 1)) != 0)
+                                          throw std::runtime_error("E0910 invalid section/file alignment");
+                                      if (!result.imageSize || result.entryRVA >= result.imageSize)
+                                          throw std::runtime_error("E0910 entry RVA outside image");
+                                  }
+                                  else if (optionalSize != 0) {
+                                      throw std::runtime_error("E0910 relocatable COFF object has optional header");
+                                  }
+                                  if (symbolCount) {
+                                      require(symbolOffset, std::uint64_t(symbolCount) * 18 + 4, "symbol table");
+                                      auto strSize = u32(std::uint64_t(symbolOffset) + std::uint64_t(symbolCount) * 18);
+                                      if (strSize < 4) throw std::runtime_error("E0910 invalid string table");
+                                      require(std::uint64_t(symbolOffset) + std::uint64_t(symbolCount) * 18, strSize, "COFF string table");
+                                  }
+                                  auto sectionTable = optional + optionalSize;
+                                  require(sectionTable, std::uint64_t(result.sectionCount) * 40, "section table");
+                                  bool executableEntry = !pe;
+                                  for (unsigned i = 0; i < result.sectionCount; ++i) {
+                                      auto sh = sectionTable + i * 40ull;
+                                      std::string name;
+                                      for (unsigned j = 0; j < 8 && b[std::size_t(sh + j)]; ++j)
+                                          name.push_back(char(b[std::size_t(sh + j)]));
+                                      auto virtualSize = u32(sh + 8);
+                                      auto virtualAddress = u32(sh + 12);
+                                      auto rawSize = u32(sh + 16);
+                                      auto rawOffset = u32(sh + 20);
+                                      auto relocOffset = u32(sh + 24);
+                                      auto relocCount = u16(sh + 32);
+                                      auto flags = u32(sh + 36);
+                                      if (rawSize) require(rawOffset, rawSize, "section raw bytes out of file");
+                                      if (relocCount) require(relocOffset, std::uint64_t(relocCount) * 10, "COFF relocations out of file");
+                                      if (pe) {
+                                          if (std::uint64_t(virtualAddress) + std::max(virtualSize, rawSize) > result.imageSize)
+                                              throw std::runtime_error("E0910 section extends beyond SizeOfImage");
+                                          if ((flags & 0x20000000u) && result.entryRVA >= virtualAddress &&
+                                              std::uint64_t(result.entryRVA) < std::uint64_t(virtualAddress) + std::max(virtualSize, rawSize))
+                                              executableEntry = true;
+                                      }
+                                      result.sections.push_back(name);
+                                  }
+                                  if (!executableEntry)throw std::runtime_error("E0910 entry point is not in executable section");
+                                  return result;
+                              }
+                              static int runCompilerSelfTests(std::ostream& out) {
+                                  int passed = 0, failed = 0;
+                                  auto test = [&](const char* name, const std::function<void()>& run) {
+                                      try { run(); out << "PASS " << name << "\n"; ++passed; }
+                                      catch (const std::exception& ex) { out << "FAIL " << name << ": " << ex.what() << "\n"; ++failed; }
+                                      };
+                                  auto reject = [](const std::string& src) {
+                                      bool rejected = false;
+                                      try { (void)Lexer(src).tokenize(); }
+                                      catch (const std::exception&) { rejected = true; }
+                                      if (!rejected)throw std::runtime_error("invalid source unexpectedly accepted");
+                                      };
+                                  test("UTF-8 source acceptance", [&] { (void)Lexer("# caf\xc3\xa9\n").tokenize(); });
+                                  test("invalid UTF-8 rejection", [&] { reject(std::string("# ") + char(0xc0) + "\n"); });
+                                  test("mismatched delimiters rejection", [&] { reject("routine main() gives int\n    give ([)]\n"); });
+                                  test("inconsistent indentation rejection", [&] { reject("routine main() gives int\n   give 1\n"); });
+                                  test("numeric underscore rejection", [&] { reject("routine main() gives int\n    give 1__2\n"); });
+                                  test("integer overflow rejection", [&] {
+                                      bool rejected = false;
+                                      try { (void)parseParacineInteger("9223372036854775808"); }
+                                      catch (...) { rejected = true; }
+                                      if (!rejected)throw std::runtime_error("overflow accepted");
+                                      });
+                                  test("wrapping integer boundary", [&] {
+                                      if (parseParacineInteger("0x7fff_ffff_ffff_ffff") != INT64_MAX)
+                                          throw std::runtime_error("incorrect hexadecimal conversion");
+                                      });
+                                  test("native COFF and PE generation + verification", [&] {
+                                      auto artifacts = compileAll("routine main() gives int\n    give 7\n", CompilerOptions{});
+                                      if (!artifacts.analysis.succeeded())throw std::runtime_error("semantic diagnostics");
+                                      PECOFFGenerator generator;
+                                      auto obj = generator.emitObject(artifacts.pcir, artifacts.pmir, artifacts.machine);
+                                      auto exe = generator.emitExecutable(artifacts.pcir, artifacts.pmir, artifacts.machine);
+                                      if (verifyNativeArtifact(obj).format != "COFF object" ||
+                                          verifyNativeArtifact(exe).format != "PE32+ executable")
+                                          throw std::runtime_error("unexpected artifact type");
+                                      if (PCIRInterpreter(artifacts.pcir).run("") != 7)
+                                          throw std::runtime_error("PCIR execution mismatch");
+#if defined(__linux__) && defined(__x86_64__)
+                                      if (executeEmittedMachineTextIsolated(artifacts.machine) != 7)
+                                          throw std::runtime_error("native execution mismatch");
+#endif
+                                      auto damaged = exe;
+                                      damaged[0] = 0;
+                                      bool rejected = false;
+                                      try { (void)verifyNativeArtifact(damaged); }
+                                      catch (...) { rejected = true; }
+                                      if (!rejected)throw std::runtime_error("corrupted header accepted");
+                                      });
+                                  out << "Selftests: " << passed << " passed, " << failed << " failed\n";
+                                  return failed ? 2 : 0;
                               }
 
 }  // namespace pcn
@@ -9762,6 +11038,28 @@ int main(int argc, char** argv) {
     bool diagnosticJSON = false;
     try {
         std::vector<std::string> args; for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
+        if (args[0] == "selftest") {
+            if (args.size() != 1)throw std::runtime_error("selftest takes no arguments");
+            return pcn::runCompilerSelfTests(std::cout);
+        }
+        if (args[0] == "verify-bin") {
+            if (args.size() < 2)throw std::runtime_error("usage: paracine verify-bin <file.obj|file.exe> [...]");
+            for (std::size_t i = 1; i < args.size(); ++i) {
+                std::ifstream f(args[i], std::ios::binary);
+                if (!f)throw std::runtime_error("cannot read native artifact: " + args[i]);
+                std::vector<std::uint8_t> data(std::istreambuf_iterator<char>{f}, {});
+                const auto r = pcn::verifyNativeArtifact(data);
+                std::cout << args[i] << ": " << r.format << ", AMD64, " << r.sectionCount
+                    << " section(s), entry RVA 0x" << std::hex << r.entryRVA << std::dec << "\n";
+            }
+            return 0;
+        }
+        if (args[0] == "hash") {
+            if (args.size() < 2)throw std::runtime_error("usage: paracine hash <file> [files...]");
+            for (std::size_t i = 1; i < args.size(); ++i)
+                std::cout << pcn::sha256File(args[i]) << "  " << args[i] << "\n";
+            return 0;
+        }
         if (args[0] == "link")return pcn::runExternalCOFFLink(args);
         if (args[0] == "version" || args[0] == "--version") {
             std::cout << pcn::kCompilerBuild << "\n"; return 0;
@@ -9777,6 +11075,8 @@ int main(int argc, char** argv) {
         auto isSource = [](const std::string& s) { return std::filesystem::path(s).extension() == ".pcn"; };
         std::string command, emitKind, sourceArg, outputArg, legacyMode;
         bool formatCheck = false, formatWrite = false;
+        bool useCache = false, metricsJson = false;
+        std::string cacheDir;
         int iterations = 5;
         pcn::CompilerOptions options;
 
@@ -9790,6 +11090,8 @@ int main(int argc, char** argv) {
                 else if ((a == "--out" || a == "-o") && i + 1 < args.size()) outputArg = args[++i];
                 else if (a.rfind("-O", 0) == 0 && a.size() == 3 && a[2] >= '0' && a[2] <= '3') options.optimizationLevel = a[2] - '0';
                 else if (a == "--entry" && i + 1 < args.size()) options.entry = args[++i];
+                else if (a == "--cache")useCache = true;
+                else if (a == "--cache-dir" && i + 1 < args.size()) { useCache = true; cacheDir = args[++i]; }
                 else throw std::runtime_error("unknown option: " + a);
             }
             command = legacyMode;
@@ -9804,7 +11106,10 @@ int main(int argc, char** argv) {
                 const auto& a = args[i]; if ((a == "-o" || a == "--out") && i + 1 < args.size())outputArg = args[++i];
                 else if (a.rfind("-O", 0) == 0 && a.size() == 3 && a[2] >= '0' && a[2] <= '3')options.optimizationLevel = a[2] - '0';
                 else if (a == "--entry" && i + 1 < args.size())options.entry = args[++i];
+                else if (a == "--cache")useCache = true;
+                else if (a == "--cache-dir" && i + 1 < args.size()) { useCache = true; cacheDir = args[++i]; }
                 else if (a == "--json" && command == "check")diagnosticJSON = true;
+                else if (a == "--json" && (command == "audit" || command == "size"))metricsJson = true;
                 else if (a == "--check" && command == "fmt")formatCheck = true;
                 else if (a == "--write" && command == "fmt")formatWrite = true;
                 else if (a == "--iterations" && command == "bench" && i + 1 < args.size()) {
@@ -9828,6 +11133,18 @@ int main(int argc, char** argv) {
         if (sourceArg.empty()) throw std::runtime_error("command requires a .pcn source file");
         std::filesystem::path sourcePath = sourceArg;
         std::string source = pcn::readSourceFile(sourcePath);
+        if (command == "deps") {
+            std::vector<std::pair<std::filesystem::path, std::string>> inputs;
+            const auto digest = pcn::dependencyContentHash(sourcePath, source, &inputs);
+            if (!digest)throw std::runtime_error("could not resolve source dependencies");
+            std::ostringstream report;
+            report << "Paracine local source dependency graph: " << inputs.size() << " file(s)\n"
+                << "Graph SHA-256: " << *digest << "\n";
+            for (const auto& [file, sha] : inputs)report << sha << "  " << file.string() << "\n";
+            if (outputArg.empty())std::cout << report.str();
+            else { pcn::writeTextFile(outputArg, report.str()); std::cout << "wrote dependencies " << outputArg << "\n"; }
+            return 0;
+        }
         if (command == "fmt") {
             if (formatCheck && (formatWrite || !outputArg.empty()))
                 throw std::runtime_error("fmt --check cannot be combined with --write or -o");
@@ -9849,12 +11166,87 @@ int main(int argc, char** argv) {
             else std::cout << formatted;
             return 0;
         }
+        if (useCache && command != "build" && command != "obj" && command != "pe")
+            throw std::runtime_error("--cache is supported for build, pe and obj (native artifacts) only");
+        std::optional<std::string> nativeCacheKey;
+        std::filesystem::path nativeCacheFile;
+        const std::filesystem::path cacheRoot = cacheDir.empty() ? sourcePath.parent_path() / ".paracine-cache"
+            : std::filesystem::path(cacheDir);
+        if (useCache) {
+            const std::string kind = command == "obj" ? "obj" : "exe";
+            nativeCacheKey = pcn::nativeArtifactCacheKey(sourcePath, source, kind, options, cacheRoot);
+            if (nativeCacheKey) {
+                nativeCacheFile = cacheRoot / (*nativeCacheKey + "." + kind + ".pcnc");
+                if (auto cached = pcn::loadNativeArtifactCache(nativeCacheFile)) {
+                    const auto output = outputArg.empty() ? pcn::withExtension(sourcePath, kind == "obj" ? ".obj" : ".exe")
+                        : std::filesystem::path(outputArg);
+                    const bool updated = pcn::writeArtifactIfDifferent(output, *cached);
+                    std::cout << "Paracine cache hit: " << output.string() << " (" << cached->size()
+                        << " bytes, " << (updated ? "written" : "unchanged") << ")\n";
+                    return 0;
+                }
+                std::cout << "Paracine cache miss: compiling dependencies and native code\n";
+            }
+            else std::cerr << "Paracine cache unavailable; compiling normally\n";
+        }
+        if (command == "audit") {
+            struct Metric { int level; double elapsed; std::size_t code, blocks, ops; };
+            std::vector<Metric> metrics;
+            for (int level = 0; level <= 3; ++level) {
+                auto variation = options; variation.optimizationLevel = level;
+                const auto start = std::chrono::steady_clock::now();
+                auto result = pcn::compileAll(source, variation, true, nullptr, sourcePath);
+                if (!result.analysis.succeeded()) {
+                    pcn::printSemanticDiagnostics(result.analysis); return 1;
+                }
+                std::size_t blocks = 0, ops = 0;
+                for (const auto& function : result.pcir.functions) {
+                    blocks += function.blocks.size();
+                    for (const auto& block : function.blocks)
+                        ops += block.instructions.size() + block.phiNodes.size();
+                }
+                const auto elapsed = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start).count();
+                metrics.push_back({ level,elapsed,result.machine.text.size(),blocks,ops });
+            }
+            std::ostringstream report;
+            if (metricsJson) {
+                report << "{\"target\":\"windows-x86_64\",\"results\":[";
+                for (std::size_t i = 0; i < metrics.size(); ++i) {
+                    if (i)report << ",";
+                    const auto& m = metrics[i];
+                    report << "{\"level\":" << m.level << ",\"compile_ms\":" << std::fixed
+                        << std::setprecision(3) << m.elapsed << ",\"text_bytes\":" << m.code
+                        << ",\"pcir_blocks\":" << m.blocks << ",\"pcir_instructions\":" << m.ops << "}";
+                }
+                report << "]}\n";
+            }
+            else {
+                report << "Paracine native optimization audit (compilation time, not runtime)\n"
+                    << "Level    compile_ms   .text_bytes   PCIR_blocks   PCIR_instructions\n";
+                for (const auto& m : metrics) {
+                    report << "  -O" << m.level << "      " << std::fixed << std::setprecision(3)
+                        << m.elapsed << "        " << m.code << "         " << m.blocks << "          " << m.ops << "\n";
+                }
+                const auto original = metrics[0].code;
+                const auto optimized = metrics[3].code;
+                report << "-O3 vs -O0 machine-byte change: "
+                    << static_cast<std::int64_t>(optimized) - static_cast<std::int64_t>(original)
+                    << " bytes (negative means smaller)\n";
+            }
+            if (outputArg.empty())std::cout << report.str();
+            else {
+                pcn::writeTextFile(outputArg, report.str());
+                std::cout << "wrote optimization audit " << outputArg << "\n";
+            }
+            return 0;
+        }
         if (command == "bench") {
             std::vector<double> times;
             times.reserve(static_cast<std::size_t>(iterations));
             for (int n = 0; n < iterations; ++n) {
                 const auto begin = std::chrono::steady_clock::now();
-                auto trial = pcn::compileAll(source, options, true);
+                auto trial = pcn::compileAll(source, options, true, nullptr, sourcePath);
                 if (!trial.analysis.succeeded()) {
                     pcn::printSemanticDiagnostics(trial.analysis); return 1;
                 }
@@ -9871,7 +11263,7 @@ int main(int argc, char** argv) {
         }
         std::vector<std::pair<std::string, double>> phaseTimings;
         const bool needMachine = command != "check" && command != "ast" && command != "cpp" && command != "ir" && command != "explain" && command != "sage";
-        auto artifacts = pcn::compileAll(source, options, needMachine, command == "profile" ? &phaseTimings : nullptr);
+        auto artifacts = pcn::compileAll(source, options, needMachine, command == "profile" ? &phaseTimings : nullptr, sourcePath);
         if (!artifacts.analysis.succeeded()) {
             if (diagnosticJSON) {
                 std::cout << "{\"ok\":false,\"diagnostics\":[";
@@ -9889,6 +11281,26 @@ int main(int argc, char** argv) {
 
         auto writeOrPrint = [&](const std::string& text, const std::string& defaultExt) {if (outputArg.empty() && defaultExt.empty())std::cout << text; else { std::filesystem::path p = outputArg.empty() ? pcn::withExtension(sourcePath, defaultExt.c_str()) : std::filesystem::path(outputArg); pcn::writeTextFile(p, text); std::cout << "wrote " << p.string() << "\n"; }};
 
+        if (command == "size") {
+            auto report = pcn::nativeSizeReport(artifacts.machine, artifacts.pcir);
+            if (metricsJson) {
+                std::ostringstream json;
+                json << "{\"target\":\"windows-x86_64\",\"text_bytes\":"
+                    << artifacts.machine.text.size() << ",\"functions\":{";
+                bool first = true;
+                std::map<std::string, std::uint32_t> sizes(artifacts.machine.functionSizes.begin(),
+                    artifacts.machine.functionSizes.end());
+                for (const auto& [name, size] : sizes) {
+                    if (!first)json << ",";
+                    first = false;
+                    json << "\"" << pcn::jsonEscape(name) << "\":" << size;
+                }
+                json << "}}\n"; report = json.str();
+            }
+            if (outputArg.empty())std::cout << report;
+            else { pcn::writeTextFile(outputArg, report); std::cout << "wrote code-size report " << outputArg << "\n"; }
+            return 0;
+        }
         if (command == "profile") {
             auto report = pcn::formatPhaseTimings(phaseTimings);
             report += "PCIR functions=" + std::to_string(artifacts.pcir.functions.size()) +
@@ -9899,7 +11311,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (command == "package") {
-            auto archive = pcn::buildDistribution(source, sourcePath, artifacts.pcir, options.entry);
+            auto archive = pcn::buildDistribution(source, sourcePath, artifacts.pcir, options.entry, &artifacts.pmir, &artifacts.machine);
             auto path = outputArg.empty() ? pcn::withExtension(sourcePath, ".zip") : std::filesystem::path(outputArg);
             pcn::writeBinaryFile(path, archive);
             std::cout << "wrote deterministic development bundle " << path.string()
@@ -9942,7 +11354,7 @@ int main(int argc, char** argv) {
         if (command == "run") {
             // `run` executes native output once. The independent `test` command
             // performs oracle/native differential execution.
-            pcn::PECOFFGenerator generator; auto bytes = generator.emitExecutable(artifacts.pcir, options.entry);
+            pcn::PECOFFGenerator generator; auto bytes = generator.emitExecutable(artifacts.pcir, artifacts.pmir, artifacts.machine);
             auto exe = pcn::withExtension(sourcePath, ".exe"); pcn::writeBinaryFile(exe, bytes);
 #ifdef _WIN32
             int nativeResult = pcn::runNativeExecutable(exe);
@@ -9957,7 +11369,7 @@ int main(int argc, char** argv) {
         }
         if (command == "test") {
             pcn::PCIRInterpreter oracle(artifacts.pcir); auto value = oracle.run(options.entry);
-            pcn::PECOFFGenerator generator; auto obj = generator.emitObject(artifacts.pcir, options.entry); auto pe = generator.emitExecutable(artifacts.pcir, options.entry);
+            pcn::PECOFFGenerator generator; auto obj = generator.emitObject(artifacts.pcir, artifacts.pmir, artifacts.machine); auto pe = generator.emitExecutable(artifacts.pcir, artifacts.pmir, artifacts.machine);
             if (obj.empty() || pe.empty())throw std::runtime_error("native backend emitted empty artifact");
 #if defined(__linux__) && defined(__x86_64__)
             const auto native = pcn::executeEmittedMachineTextIsolated(artifacts.machine);
@@ -9981,8 +11393,24 @@ int main(int argc, char** argv) {
         }
 
         pcn::PECOFFGenerator generator;
-        if (command == "obj") { auto bytes = generator.emitObject(artifacts.pcir, options.entry); auto p = outputArg.empty() ? pcn::withExtension(sourcePath, ".obj") : std::filesystem::path(outputArg); pcn::writeBinaryFile(p, bytes); std::cout << "wrote COFF object " << p.string() << " (" << bytes.size() << " bytes)\n"; return 0; }
-        if (command == "pe" || command == "build") { auto bytes = generator.emitExecutable(artifacts.pcir, options.entry); auto p = outputArg.empty() ? pcn::withExtension(sourcePath, ".exe") : std::filesystem::path(outputArg); pcn::writeBinaryFile(p, bytes); std::cout << "wrote PE32+ executable " << p.string() << " (" << bytes.size() << " bytes)\n"; return 0; }
+        if (command == "obj" || command == "pe" || command == "build") {
+            auto bytes = (command == "obj") ? generator.emitObject(artifacts.pcir, artifacts.pmir, artifacts.machine)
+                : generator.emitExecutable(artifacts.pcir, artifacts.pmir, artifacts.machine);
+            auto p = outputArg.empty() ? pcn::withExtension(sourcePath, command == "obj" ? ".obj" : ".exe")
+                : std::filesystem::path(outputArg);
+            // Never cache a result if a source dependency changed during this build.
+            if (nativeCacheKey) {
+                auto current = pcn::nativeArtifactCacheKey(sourcePath, pcn::readSourceFile(sourcePath),
+                    command == "obj" ? "obj" : "exe", options, cacheRoot);
+                if (current != nativeCacheKey)throw std::runtime_error("source dependencies changed during compilation; retry");
+            }
+            const bool changed = pcn::writeArtifactIfDifferent(p, bytes);
+            if (nativeCacheKey && !pcn::saveNativeArtifactCache(nativeCacheFile, bytes))
+                std::cerr << "warning: cache file could not be written; output was still generated\n";
+            std::cout << "wrote " << (command == "obj" ? "COFF object " : "PE32+ executable ") << p.string()
+                << " (" << bytes.size() << " bytes, " << (changed ? "updated" : "unchanged") << ")\n";
+            return 0;
+        }
 
         throw std::runtime_error("unknown command: " + command);
     }
