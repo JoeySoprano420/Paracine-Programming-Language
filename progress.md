@@ -1,25 +1,29 @@
-Paracine Enhanced — tested compiler implementation
-Baseline
-This is a source-preserving expansion of the user-supplied corrected Paracine_Ultimate.cpp (10,708 physical lines), not a new compiler written from scratch. The updated implementation is 10,832 lines of C++23. The bundled CMake project preserves the existing Paracine architecture, runtime, examples, and tests.
-New executable features
-text.compare(other: text) -> int
-Lexicographic ordering by unsigned UTF-8 bytes. Returns -1 if less, 0 if equal, and 1 if greater. This is bytewise ordering, not locale-sensitive/collation or Unicode normalization. Implemented in semantic analysis, source/IR type inference, PCIR, PCIR verification and oracle, PMIR, native Win64 x86-64 instruction encoder, optimizer classification and IR listings. It works with empty strings and multibyte UTF-8 data.
-text.rfind(needle: text) -> int
-Reverse substring search. Returns the last matching byte offset, or -1 if absent. For empty needle, returns the haystack byte length. Full semantic → PCIR → PMIR → native execution path. Native encoder performs a reverse candidate-offset search without calling the host standard library. PCIR oracle uses std::string::rfind as an independent reference.
-text.contains(needle: text) -> bool
-Lowers to the existing executable TextFindText PCIR search followed by an integer comparison against -1. No added runtime dependency or handwaved native opcode. The return value is type-checked Boolean.
-Test evidence (this environment)
-- Clean CMake project configured and built under Clang C++23.
-- ctest -j4: 18/18 CTest suites passed (17 existing + 1 new suite).
-- New regression suite calculates 660 expected results independently in Python (300 fixed cross-product cases + 360 deterministic randomized cases) and exercises generated x86-64 against the reference at -O0 and -O3.
-- Additional dedicated source programs pass at -O0, -O1, -O2, -O3 (PCIR oracle and generated x64 values match).
-- New suite also verifies three incorrectly typed method calls are rejected.
-- GCC and Clang pass -std=c++23 -Wall -Wextra -Wpedantic -Werror -fsyntax-only.
-- Unified source patch tested against the exact uploaded baseline.
-Build and test
-cmake -S Paracine_Project -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build -j 4
-ctest --test-dir build -j 4 --output-on-failure
-Native execution checks on this Linux/x86-64 host use the compiler's Microsoft-x64-ABI test facility. Windows PE loading and direct MSVC compilation were not run here. The user previously encountered a C3530 error in a different local main.cpp; the corrected uploaded baseline did not reproduce it under the available compilers. Use the included full replacement source rather than mixing sections from older editions.
-Known limits
-This is a tested incremental expansion, not proof of complete language conformance, complete automatic recursive cleanup, full linker functionality, or self-hosting. Those major requirements remain outstanding in the underlying compiler. The three new text primitives do not change that status.
+Paracine native compiler — expanded development implementation
+Scope and fidelity
+This directory contains the extended C++23 Paracine compiler from the attached compiler source, retaining the native-first .pcn → SAGE → PCIR → PMIR → x86-64 → COFF → PE32+ toolchain. The normative document describes the target Paracine 1.0 language, not the achieved conformance of this implementation. In particular, native source imports remain a flattened subset, some closure and aggregate operations remain unimplemented, and the production security, complete Windows x64 unwind support, full standard library, and self-hosted Paracine compiler are not certified or complete.
+Added in this revision
+- Structural delimiter matching rejects mixed pairs such as ([)], rather than accepting balanced counts alone.
+- paracine verify-bin file.obj file.exe parses generated or external AMD64 COFF/PE32+ binaries with bounds-checked reads and validates signatures, section tables, raw section byte ranges, relocation bounds, required header fields and executable entry placement. This is a structural consistency check, not an authenticode/security check, OS loader or full PE/COFF conformance proof.
+- paracine selftest exercises UTF-8, negative lexical cases, integer boundaries, COFF/PE32+ generation, structural corruption detection, the PCIR reference interpreter, and — on Linux x86-64 — the isolated emitted-machine-code executor.
+- CMake project with CTest integration, plus a native/reference loop smoke program.
+Build
+Windows (Visual Studio 2022 or later)
+cmake -S . -B build -A x64
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+.\build\Release\paracine.exe build smoke.pcn -o smoke.exe
+.\build\Release\paracine.exe verify-bin smoke.exe
+Linux x86-64 (development host)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+./build/paracine emit obj smoke.pcn -o smoke.obj
+./build/paracine emit exe smoke.pcn -o smoke.exe
+./build/paracine verify-bin smoke.obj smoke.exe
+Linux host paracine run and paracine test can execute the emitted Microsoft-x64-ABI machine-code entry in an isolated process, but do not launch Windows PE files through the Windows loader. The generated .exe requires Windows x86-64 for ordinary execution. The shipped prebuilt paracine is a Linux x86-64 development binary; Windows users should build from source.
+CLI
+In addition to existing build, check, sage, test, run, emit, ir, mir, asm, explain, inspect, fmt, deps, hash, audit, bench, link, package, doctor, and init commands:
+paracine selftest
+paracine verify-bin path/to/file.obj path/to/file.exe
+Known gaps before a conforming final native compiler
+Complete edition-2026 module resolution and visibility, capabilities, monomorphization/closures, full borrow and lifetime analysis, native aggregate lowering, broad standard-library/runtime coverage, executable/DLL and archive link completeness, PDB and Windows unwinding completeness, rigorous machine-code validation and fuzzing, runtime resource constraints, cross-platform CI, and a genuine self-hosting bootstrap remain substantial independent milestones. Do not treat passing these tests as evidence that these are finished.
