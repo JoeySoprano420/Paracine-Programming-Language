@@ -1451,6 +1451,15 @@ namespace pcn {
         return type.kind == SemanticTypeKind::Number;
     }
 
+    inline bool isTextLikeType(const SemanticType& type) {
+        return type.kind == SemanticTypeKind::Text || type.kind == SemanticTypeKind::String;
+    }
+
+    inline bool isIntegerLikeNumericType(const SemanticType& type) {
+        if (type.kind != SemanticTypeKind::Number) return false;
+        return type.name != "float" && type.name != "double";
+    }
+
     inline bool isAssignableTo(const SemanticType& target, const SemanticType& value) {
         if (target.kind == SemanticTypeKind::Unknown || value.kind == SemanticTypeKind::Unknown) {
             return true;
@@ -4034,10 +4043,12 @@ namespace pcn {
         }
 
         SemanticType analyzeComparisonBinary(const BinaryExpr& node, const SemanticType& leftType, const SemanticType& rightType) {
-            if ((!isNumericType(leftType) || !isNumericType(rightType)) && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
-                report(node.location, "comparison operator '" + node.op + "' requires numbers");
+            const bool numericCompare = isNumericType(leftType) && isNumericType(rightType);
+            const bool textCompare = isTextLikeType(leftType) && isTextLikeType(rightType);
+            if (!numericCompare && !textCompare && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
+                report(node.location, "comparison operator '" + node.op + "' requires numbers or text/string operands");
             }
-            checkNumericCompatibility(node, leftType, rightType);
+            if (numericCompare) checkNumericCompatibility(node, leftType, rightType);
             return makeBoolType();
         }
 
@@ -4123,9 +4134,26 @@ namespace pcn {
                     return makeUnknownType();
                 }
                 else if constexpr (std::is_same_v<T, RangeExpr>) {
-                    if (node.start) analyzeExpr(node.start);
-                    if (node.end) analyzeExpr(node.end);
-                    if (node.step) analyzeExpr(node.step);
+                    const auto startType = node.start ? analyzeExpr(node.start) : makeUnknownType();
+                    const auto endType = node.end ? analyzeExpr(node.end) : makeUnknownType();
+                    const auto stepType = node.step ? analyzeExpr(node.step) : makeUnknownType();
+                    if (node.start && !isIntegerLikeNumericType(startType) && startType.kind != SemanticTypeKind::Unknown) {
+                        report(node.location, "range start must be an integer-compatible numeric value");
+                    }
+                    if (node.end && !isIntegerLikeNumericType(endType) && endType.kind != SemanticTypeKind::Unknown) {
+                        report(node.location, "range end must be an integer-compatible numeric value");
+                    }
+                    if (node.step && !isIntegerLikeNumericType(stepType) && stepType.kind != SemanticTypeKind::Unknown) {
+                        report(node.location, "range step must be an integer-compatible numeric value");
+                    }
+                    if (isNumericType(startType) && isNumericType(endType)) {
+                        if (startType.name != "number" && endType.name != "number" &&
+                            !startType.name.empty() && !endType.name.empty() && startType.name != endType.name)
+                            report(node.location, "range start and end must use compatible integer numeric types");
+                    }
+                    if (isNumericType(stepType) && isNumericType(startType) && stepType.name != "number" && startType.name != "number" &&
+                        !stepType.name.empty() && !startType.name.empty() && stepType.name != startType.name)
+                        report(node.location, "range step must match the range bound numeric type");
                     return makeCustomType("range");
                 }
                 else if constexpr (std::is_same_v<T, ChooseExpr>) {
@@ -5070,6 +5098,7 @@ namespace pcn {
                     }
                     else if constexpr (std::is_same_v<T, FailStmt>) {
                         collectExprEffects(node.expression, facts);
+                        facts.direct.insert("trap");
                     }
                     else if constexpr (std::is_same_v<T, IfStmt>) {
                         collectExprEffects(node.condition, facts);
@@ -5186,6 +5215,10 @@ namespace pcn {
                 "float","double","bool","char","raw","text","view","span","ref","mut"
             };
             return copy.contains(t);
+        }
+
+        static bool isMoveTrackedType(const std::string& typeName) {
+            return !typeName.empty() && !isCopyType(typeName);
         }
 
         std::string inferBorrowType(const ExprPtr& e, BorrowState& state) {
@@ -5323,7 +5356,7 @@ namespace pcn {
                         analyzeBorrowExpr(node.initializer, state);
                         if (node.initializer) if (const auto* source = std::get_if<VariableExpr>(&node.initializer->node)) {
                             if (auto* original = lookup(state, source->name))
-                                if (original->typeName == "string") original->ownership = OwnershipState::Moved;
+                                if (isMoveTrackedType(original->typeName)) original->ownership = OwnershipState::Moved;
                         }
                         state.scopes.back()[node.name] = BorrowSymbol{ node.typeName.empty() ? inferBorrowType(node.initializer, state) : node.typeName, false, false, "shared", OwnershipState::Available };
                     }
@@ -5331,7 +5364,7 @@ namespace pcn {
                         analyzeBorrowExpr(node.initializer, state);
                         if (node.initializer) if (const auto* source = std::get_if<VariableExpr>(&node.initializer->node)) {
                             if (auto* original = lookup(state, source->name))
-                                if (original->typeName == "string") original->ownership = OwnershipState::Moved;
+                                if (isMoveTrackedType(original->typeName)) original->ownership = OwnershipState::Moved;
                         }
                         state.scopes.back()[node.name] = BorrowSymbol{ node.typeName.empty() ? inferBorrowType(node.initializer, state) : node.typeName, true, false, "shared", OwnershipState::Available };
                     }
@@ -5339,7 +5372,7 @@ namespace pcn {
                         analyzeBorrowExpr(node.value, state);
                         if (node.value) if (const auto* v = std::get_if<VariableExpr>(&node.value->node)) {
                             if (v->name != node.name) if (auto* prior = lookup(state, v->name))
-                                if (prior->typeName == "string") prior->ownership = OwnershipState::Moved;
+                                if (isMoveTrackedType(prior->typeName)) prior->ownership = OwnershipState::Moved;
                         }
                         if (auto* dst = lookup(state, node.name)) dst->ownership = OwnershipState::Available;
                     }
@@ -9467,7 +9500,10 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   };
                                   static ImportLayout describeImports(const std::vector<MachineProgram::ImportCall>& calls) {
                                       ImportLayout imp;
-                                      const std::vector<std::string> canonical = { "GetProcessHeap","HeapAlloc","HeapFree","GetStdHandle","WriteFile" };
+                                      const std::vector<std::string> canonical = {
+                                          "GetProcessHeap","HeapAlloc","HeapFree","GetStdHandle","WriteFile",
+                                          "ReadFile","CloseHandle","GetLastError","ExitProcess"
+                                      };
                                       std::set<std::string> used;
                                       for (const auto& c : calls) { if (std::find(canonical.begin(), canonical.end(), c.symbol) == canonical.end())throw std::runtime_error("unsupported Win32 import: " + c.symbol); used.insert(c.symbol); }
                                       for (const auto& c : canonical)if (used.contains(c))imp.names.push_back(c);
@@ -10728,7 +10764,8 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                               }
 
                               static int runExternalCOFFLink(const std::vector<std::string>& args) {
-                                  std::string source, output, entry = "main", executable = "lld-link", subsystem = "console";
+                                  std::vector<std::string> sources;
+                                  std::string output, entry = "main", executable = "lld-link", subsystem = "console";
                                   std::vector<std::string> otherInputs, searchPaths;
                                   bool dll = false;
                                   for (std::size_t i = 1; i < args.size(); ++i) {
@@ -10741,8 +10778,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       else if (a == "--dll")dll = true;
                                       else if (a.size() && a[0] == '-')throw std::runtime_error("unsupported link argument: " + a);
                                       else if (std::filesystem::path(a).extension() == ".pcn") {
-                                          if (!source.empty())throw std::runtime_error("link currently accepts one .pcn compilation unit; additional input must be COFF .obj/.lib");
-                                          source = a;
+                                          sources.push_back(a);
                                       }
                                       else {
                                           auto ext = std::filesystem::path(a).extension().string();
@@ -10751,28 +10787,33 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           otherInputs.push_back(a);
                                       }
                                   }
-                                  if (source.empty() && otherInputs.empty())throw std::runtime_error("link requires .pcn or COFF objects/libraries");
+                                  if (sources.empty() && otherInputs.empty())throw std::runtime_error("link requires .pcn or COFF objects/libraries");
                                   if (subsystem != "console" && subsystem != "windows")throw std::runtime_error("link subsystem must be console or windows");
                                   if (output.empty()) {
-                                      std::filesystem::path sample = source.empty() ? std::filesystem::path(otherInputs.front()) : std::filesystem::path(source);
+                                      std::filesystem::path sample = sources.empty() ? std::filesystem::path(otherInputs.front()) : std::filesystem::path(sources.front());
                                       sample.replace_extension(dll ? ".dll" : ".exe"); output = sample.string();
                                   }
-                                  struct Scratch { std::filesystem::path filename; ~Scratch() { std::error_code ec; if (!filename.empty())std::filesystem::remove(filename, ec); } } scratch;
-                                  if (!source.empty()) {
+                                  struct Scratch {
+                                      std::vector<std::filesystem::path> files;
+                                      ~Scratch() { std::error_code ec; for (const auto& file : files)std::filesystem::remove(file, ec); }
+                                  } scratch;
+                                  for (std::size_t i = 0; i < sources.size(); ++i) {
+                                      const auto& source = sources[i];
                                       auto options = CompilerOptions{};
                                       const auto artifacts = compileAll(readSourceFile(source), options, false, nullptr, source);
                                       if (!artifacts.analysis.succeeded()) { printSemanticDiagnostics(artifacts.analysis); return 1; }
                                       const auto obj = PECOFFGenerator{}.emitObject(artifacts.pcir, entry);
-                                      scratch.filename = std::filesystem::path(output);
-                                      scratch.filename += ".paracine-link-temp.obj";
-                                      writeBinaryFile(scratch.filename, obj);
+                                      auto temp = std::filesystem::path(output);
+                                      temp += ".paracine-link-temp-" + std::to_string(i) + ".obj";
+                                      writeBinaryFile(temp, obj);
+                                      scratch.files.push_back(std::move(temp));
                                   }
                                   std::vector<std::string> invocation = { executable,"/nologo","/machine:x64","/nodefaultlib","/out:" + output };
                                   invocation.push_back("/subsystem:" + subsystem);
                                   if (dll) { invocation.push_back("/dll"); invocation.push_back("/noentry"); }
                                   else invocation.push_back("/entry:" + entry);
                                   for (const auto& dir : searchPaths)invocation.push_back("/libpath:" + dir);
-                                  if (!scratch.filename.empty())invocation.push_back(scratch.filename.string());
+                                  for (const auto& file : scratch.files)invocation.push_back(file.string());
                                   for (const auto& arg : otherInputs)invocation.push_back(arg);
                                   const int result = executeArgv(invocation);
                                   if (result)throw std::runtime_error("external COFF link failed with exit code " + std::to_string(result));
@@ -11074,7 +11115,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   if (result.machine != 0x8664)
                                       throw std::runtime_error("E0910 target is not AMD64 COFF");
                                   result.sectionCount = u16(coff + 2);
-                                  if (result.sectionCount == 0 || result.sectionCount > 96)
+                                  if (result.sectionCount == 0 || result.sectionCount > 256)
                                       throw std::runtime_error("E0910 implausible section count");
                                   auto symbolOffset = u32(coff + 8);
                                   auto symbolCount = u32(coff + 12);
@@ -11145,6 +11186,11 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       catch (const std::exception&) { rejected = true; }
                                       if (!rejected)throw std::runtime_error("invalid source unexpectedly accepted");
                                       };
+                                  auto hasDiagnostic = [](const SemanticAnalysisResult& analysis, std::string_view fragment) {
+                                      return std::any_of(analysis.diagnostics.begin(), analysis.diagnostics.end(), [&](const SemanticDiagnostic& d) {
+                                          return d.message.find(fragment) != std::string::npos;
+                                          });
+                                      };
                                   test("UTF-8 source acceptance", [&] { (void)Lexer("# caf\xc3\xa9\n").tokenize(); });
                                   test("invalid UTF-8 rejection", [&] { reject(std::string("# ") + char(0xc0) + "\n"); });
                                   test("mismatched delimiters rejection", [&] { reject("routine main() gives int\n    give ([)]\n"); });
@@ -11159,6 +11205,79 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   test("wrapping integer boundary", [&] {
                                       if (parseParacineInteger("0x7fff_ffff_ffff_ffff") != INT64_MAX)
                                           throw std::runtime_error("incorrect hexadecimal conversion");
+                                      });
+                                  test("type checker accepts text ordering comparisons", [&] {
+                                      const auto artifacts = compileAll(
+                                          "routine main() gives int\n"
+                                          "    let a: text = \"a\"\n"
+                                          "    let b: text = \"b\"\n"
+                                          "    if a < b\n"
+                                          "        give 1\n"
+                                          "    give 0\n",
+                                          CompilerOptions{});
+                                      if (!artifacts.analysis.succeeded())throw std::runtime_error("text comparison rejected");
+                                      });
+                                  test("type checker rejects floating range bounds", [&] {
+                                      const auto artifacts = compileAll(
+                                          "routine main() gives int\n"
+                                          "    let start: float = 0.5\n"
+                                          "    each i in start..10\n"
+                                          "        give i\n"
+                                          "    give 0\n",
+                                          CompilerOptions{}, false);
+                                      if (!hasDiagnostic(artifacts.analysis, "range start must be an integer-compatible numeric value"))
+                                          throw std::runtime_error("missing floating range diagnostic");
+                                      });
+                                  test("SAGE fail contributes trap effect", [&] {
+                                      const auto artifacts = compileAll(
+                                          "routine main() gives int\n"
+                                          "    fail \"boom\"\n",
+                                          CompilerOptions{}, false);
+                                      if (!hasDiagnostic(artifacts.analysis, "undeclared effect 'trap'"))
+                                          throw std::runtime_error("missing trap effect diagnostic");
+                                      auto it = artifacts.analysis.resolvedEffects.find("main#0");
+                                      if (it == artifacts.analysis.resolvedEffects.end() || !it->second.contains("trap"))
+                                          throw std::runtime_error("missing trap effect inference");
+                                      });
+                                  test("ownership tracks non-copy moves in bindings", [&] {
+                                      const auto artifacts = compileAll(
+                                          "record Token\n"
+                                          "    id: int\n"
+                                          "routine main(own input: Token) gives int\n"
+                                          "    let moved: Token = input\n"
+                                          "    give input.id\n",
+                                          CompilerOptions{}, false);
+                                      if (!hasDiagnostic(artifacts.analysis, "use after move: 'input'"))
+                                          throw std::runtime_error("missing non-copy move diagnostic");
+                                      });
+                                  test("external linker accepts multiple .pcn inputs", [&] {
+                                      namespace fs = std::filesystem;
+                                      const auto root = fs::temp_directory_path() / ("paracine-link-selftest-" + std::to_string(std::uint64_t(std::chrono::steady_clock::now().time_since_epoch().count())));
+                                      fs::create_directories(root);
+                                      writeTextFile(root / "a.pcn", "routine main() gives int\n    give 0\n");
+                                      writeTextFile(root / "b.pcn", "routine aux() gives int\n    give 1\n");
+                                      bool acceptedMultipleUnits = true;
+                                      bool failedAsExpected = false;
+                                      try {
+                                          (void)runExternalCOFFLink({ "link", (root / "a.pcn").string(), (root / "b.pcn").string(), "--linker", "paracine-no-such-linker" });
+                                      }
+                                      catch (const std::exception& ex) {
+                                          const std::string message = ex.what();
+                                          if (message.find("one .pcn compilation unit") != std::string::npos)acceptedMultipleUnits = false;
+                                          else failedAsExpected = true;
+                                      }
+                                      std::error_code ec;
+                                      fs::remove_all(root, ec);
+                                      if (!acceptedMultipleUnits)throw std::runtime_error("multi-unit .pcn link still rejected");
+                                      if (!failedAsExpected)throw std::runtime_error("link test did not reach external linker stage");
+                                      });
+                                  test("native verifier accepts broader section-count range", [&] {
+                                      std::vector<std::uint8_t> obj(20 + 100 * 40, 0);
+                                      obj[0] = 0x64; obj[1] = 0x86; // AMD64
+                                      obj[2] = 100; obj[3] = 0;     // NumberOfSections
+                                      const auto report = verifyNativeArtifact(obj);
+                                      if (report.format != "COFF object" || report.sectionCount != 100)
+                                          throw std::runtime_error("unexpected COFF verification result");
                                       });
                                   test("native COFF and PE generation + verification", [&] {
                                       auto artifacts = compileAll("routine main() gives int\n    give 7\n", CompilerOptions{});
