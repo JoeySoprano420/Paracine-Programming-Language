@@ -1114,6 +1114,16 @@ namespace pcn {
         std::size_t alignment = 1;
         bool nicheOptimized = false;
         std::vector<std::pair<std::string, std::size_t>> fieldOffsets;
+        // Stable, explicit discriminant metadata shared by SAGE, PCIR and PMIR.
+        std::string tagStorageType;
+        std::size_t tagOffset = 0;
+        std::size_t tagSize = 0;
+        std::size_t payloadOffset = 0;
+        std::size_t payloadSize = 0;
+        std::vector<std::pair<std::string, std::uint64_t>> tagConstants;
+        // Each entry: case name, field name, absolute byte offset, field type.
+        struct CaseField { std::string caseName, fieldName, typeName; std::size_t offset = 0; };
+        std::vector<CaseField> caseFields;
     };
 
     struct SKMAliasFact {
@@ -3138,6 +3148,9 @@ namespace pcn {
                     info.isPublic = node.isPublic;
                     for (const auto& c : node.cases) {
                         info.tags.push_back(c.name);
+                        if (c.fields.empty()) info.members.emplace_back(c.name, "void");
+                        else if (c.fields.size() == 1) info.members.emplace_back(c.name, c.fields.front().typeName);
+                        else info.members.emplace_back(c.name, "tuple");
                     }
                     result_.nominalTypes[node.name] = std::move(info);
                 }
@@ -4202,9 +4215,19 @@ namespace pcn {
             auto objectType = analyzeExpr(node.object);
             if (objectType.kind == SemanticTypeKind::Custom) {
                 if (const auto* nominal = findNominalType(objectType.name)) {
+                    for (const auto& member : nominal->members) {
+                        if (member.first == node.member) {
+                            return semanticTypeFromName(member.second);
+                        }
+                    }
                     for (const auto& field : nominal->fields) {
                         if (field.first == node.member) {
                             return semanticTypeFromName(field.second);
+                        }
+                    }
+                    if (nominal->kind == "variant") {
+                        if (std::find(nominal->tags.begin(), nominal->tags.end(), node.member) != nominal->tags.end()) {
+                            return makeBoolType();
                         }
                     }
                 }
@@ -4246,10 +4269,42 @@ namespace pcn {
                 if (node.fields.size() > 1) {
                     report(node.location, "enum construction accepts at most one value");
                 }
+                if (node.fields.size() != 1 || node.fields.front().name.empty()) {
+                    report(node.location, "enum construction requires exactly one member selector");
+                }
+                else {
+                    const auto& selected = node.fields.front();
+                    auto it = std::find_if(nominal->members.begin(), nominal->members.end(), [&](const auto& m) { return m.first == selected.name; });
+                    if (it == nominal->members.end()) {
+                        report(selected.location, "unknown enum member '" + selected.name + "' for " + node.typeName);
+                    }
+                    else if (selected.value) {
+                        auto valueType = analyzeExpr(selected.value);
+                        if (!isAssignableTo(semanticTypeFromName(it->second), valueType)) {
+                            report(selected.location, "enum member payload type mismatch for '" + selected.name + "'");
+                        }
+                    }
+                }
             }
             else if (nominal->kind == "variant") {
                 if (node.fields.size() > 1) {
                     report(node.location, "variant construction accepts at most one payload field");
+                }
+                if (node.fields.size() != 1) {
+                    report(node.location, "variant construction requires exactly one case selector");
+                }
+                else {
+                    const auto& selected = node.fields.front();
+                    auto it = std::find_if(nominal->members.begin(), nominal->members.end(), [&](const auto& m) { return m.first == selected.name; });
+                    if (it == nominal->members.end()) {
+                        report(selected.location, "unknown variant case '" + selected.name + "' for " + node.typeName);
+                    }
+                    else if (selected.value) {
+                        auto valueType = analyzeExpr(selected.value);
+                        if (it->second != "void" && !isAssignableTo(semanticTypeFromName(it->second), valueType)) {
+                            report(selected.location, "variant payload type mismatch for case '" + selected.name + "'");
+                        }
+                    }
                 }
             }
             return makeCustomType(node.typeName);
@@ -4499,6 +4554,72 @@ namespace pcn {
                 }, d.node);
         }
 
+        static std::size_t checkedTagWidth(std::size_t cases) {
+            if (cases <= 0x100ull) return 1;
+            if (cases <= 0x10000ull) return 2;
+            if (cases <= 0x100000000ull) return 4;
+            return 8;
+        }
+        static std::string tagTypeForWidth(std::size_t width) {
+            return width == 1 ? "ubyte" : width == 2 ? "ushort" : width == 4 ? "uint" : "ulong";
+        }
+        static std::uint64_t explicitEnumValue(const std::string& raw) {
+            if (raw.empty() || raw == "unknown") throw std::runtime_error("missing enum discriminant");
+            if (raw[0] == '-') throw std::runtime_error("negative enum tags are unsupported in unsigned tag storage");
+            std::string digits; for (char c : raw) if (c != '_') digits.push_back(c);
+            int base = 10;
+            if (digits.size() >= 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X' || digits[1] == 'b' || digits[1] == 'B')) {
+                base = digits[1] == 'x' || digits[1] == 'X' ? 16 : 2; digits.erase(0, 2);
+            }
+            std::uint64_t v{};
+            auto r = std::from_chars(digits.data(), digits.data() + digits.size(), v, base);
+            if (r.ec != std::errc{} || r.ptr != digits.data() + digits.size())
+                throw std::runtime_error("invalid explicit enum tag: " + raw);
+            return v;
+        }
+        std::vector<std::pair<std::string, std::uint64_t>> nominalTags(const NominalTypeInfo& n) const {
+            std::vector<std::pair<std::string, std::uint64_t>> out;
+            std::unordered_set<std::string> names;
+            std::unordered_set<std::uint64_t> values;
+            std::uint64_t next = 0;
+            if (n.kind == "enum") {
+                for (const auto& m : n.members) {
+                    if (!names.insert(m.first).second) throw std::runtime_error("duplicate enum member " + n.name + "." + m.first);
+                    const auto v = m.second == "unknown" ? next : explicitEnumValue(m.second);
+                    if (!values.insert(v).second) throw std::runtime_error("duplicate enum discriminant in " + n.name);
+                    out.emplace_back(m.first, v);
+                    if (v == UINT64_MAX && &m != &n.members.back()) throw std::runtime_error("enum discriminant overflow");
+                    next = v == UINT64_MAX ? v : v + 1;
+                }
+            }
+            else {
+                for (const auto& name : n.tags) {
+                    if (!names.insert(name).second) throw std::runtime_error("duplicate variant case " + n.name + "." + name);
+                    out.emplace_back(name, static_cast<std::uint64_t>(out.size()));
+                }
+            }
+            return out;
+        }
+        std::size_t nominalTagWidth(const NominalTypeInfo& n) const {
+            if (n.kind == "variant") return checkedTagWidth(n.tags.size());
+            std::uint64_t mx = 0; for (const auto& x : nominalTags(n)) mx = std::max(mx, x.second);
+            std::size_t minimum = mx <= 255 ? 1 : mx <= 65535 ? 2 : mx <= UINT32_MAX ? 4 : 8;
+            const std::string& t = n.layout;
+            const std::size_t requested = t == "byte" || t == "ubyte" ? 1 : t == "short" || t == "ushort" ? 2 : t == "int" || t == "uint" ? 4 : t == "long" || t == "ulong" ? 8 : 0;
+            if (requested && requested < minimum) throw std::runtime_error("enum tag exceeds declared storage width: " + n.name);
+            return requested ? requested : minimum;
+        }
+        std::pair<std::size_t, std::size_t> variantPayload(const NominalTypeInfo& n, std::unordered_set<std::string>* stack) const {
+            std::size_t maxSize = 0, maxAlign = 1;
+            for (const auto& c : n.members) {
+                if (c.second == "void") continue;
+                if (c.second == "tuple") throw std::runtime_error("variant multi-field payload metadata missing: " + n.name);
+                auto l = layoutOf(c.second, stack);
+                maxSize = std::max(maxSize, l.first);
+                maxAlign = std::max(maxAlign, l.second);
+            }
+            return { maxSize, maxAlign };
+        }
         std::pair<std::size_t, std::size_t> layoutOf(const std::string& type, std::unordered_set<std::string>* stack = nullptr) const {
             static const std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> primitive = {
                 { "byte",{ 1,1 } },{ "ubyte",{ 1,1 } },{ "bool",{ 1,1 } },{ "short",{ 2,2 } },{ "ushort",{ 2,2 } },
@@ -4526,8 +4647,13 @@ namespace pcn {
                     for (const auto& f : n.fields) { auto l = layoutOf(f.second, stack); al = std::max(al, l.second); off = alignUpSize(off, l.second) + l.first; }off = alignUpSize(off, al);
                 }
             }
-            else if (n.kind == "enum") { off = 4; al = 4; }
-            else if (n.kind == "variant") { off = 16; al = 8; }
+            else if (n.kind == "enum") { al = nominalTagWidth(n); off = al; }
+            else if (n.kind == "variant") {
+                const auto width = nominalTagWidth(n);
+                auto payload = variantPayload(n, stack);
+                al = std::max(width, payload.second);
+                off = alignUpSize(alignUpSize(width, payload.second) + payload.first, al);
+            }
             stack->erase(type); return { off,al };
         }
         static std::size_t alignUpSize(std::size_t v, std::size_t a) { return a ? ((v + a - 1) / a) * a : v; }
@@ -4536,6 +4662,21 @@ namespace pcn {
             for (const auto& [name, n] : result_->nominalTypes) {
                 auto [size, align] = layoutOf(name); SKMLayoutFact f; f.typeName = name; f.size = size; f.alignment = align;
                 if (n.kind == "record") { std::size_t off = 0; for (const auto& field : n.fields) { auto l = layoutOf(field.second); off = alignUpSize(off, l.second); f.fieldOffsets.push_back({ field.first,off }); off += l.first; } }
+                if (n.kind == "enum" || n.kind == "variant") {
+                    f.tagConstants = nominalTags(n);
+                    f.tagSize = nominalTagWidth(n);
+                    f.tagStorageType = tagTypeForWidth(f.tagSize);
+                    f.tagOffset = 0;
+                    f.fieldOffsets.emplace_back("$tag", 0);
+                    if (n.kind == "variant") {
+                        auto payload = variantPayload(n, nullptr);
+                        f.payloadSize = payload.first;
+                        f.payloadOffset = alignUpSize(f.tagSize, payload.second);
+                        f.fieldOffsets.emplace_back("$payload", f.payloadOffset);
+                        for (const auto& c : n.members) if (c.second != "void" && c.second != "tuple")
+                            f.caseFields.push_back({ c.first, "$0", c.second, f.payloadOffset });
+                    }
+                }
                 result_->skm.layouts.push_back(std::move(f));
             }
             std::unordered_set<std::string> seen; for (const auto& f : result_->skm.layouts)seen.insert(f.typeName);
@@ -5625,6 +5766,12 @@ namespace pcn {
                     if constexpr (std::is_same_v<T, RecordDecl> || std::is_same_v<T, UnionDecl>) {
                         for (const auto& f : n.fields) nominalFieldTypes_[n.name][f.name] = f.typeName;
                     }
+                    else if constexpr (std::is_same_v<T, EnumDecl>) {
+                        for (const auto& m : n.members) nominalFieldTypes_[n.name][m.first] = m.second.value_or("int");
+                    }
+                    else if constexpr (std::is_same_v<T, VariantDecl>) {
+                        for (const auto& c : n.cases) nominalFieldTypes_[n.name][c.name] = c.fields.empty() ? "void" : (c.fields.size() == 1 ? c.fields.front().typeName : "tuple");
+                    }
                 }
                 else if constexpr (std::is_same_v<T, ModuleDecl>) collectNominalNames(n.declarations);
                 }, d.node);
@@ -6489,6 +6636,12 @@ namespace pcn {
                 else if constexpr (std::is_same_v<T, ConstructExpr>) {
                     IRInstruction inst; inst.op = IROpcode::MakeAggregate; inst.dest = allocateVReg(); inst.typeName = node.typeName; inst.valueType = { IRValueKind::Aggregate, node.typeName };
                     for (const auto& f : node.fields) { auto v = lowerExpr(f.value); inst.args.push_back(v); inst.argumentTypes.push_back(f.name); inst.argumentValueTypes.push_back(lastValueType_); }
+                    for (const auto& f : node.fields) {
+                        auto v = lowerExpr(f.value);
+                        inst.args.push_back(v);
+                        inst.argumentTypes.push_back(f.name);
+                        inst.argumentValueTypes.push_back(lastValueType_);
+                    }
                     emit(inst); lastValueType_ = inst.valueType; return inst.dest;
                 }
                 else if constexpr (std::is_same_v<T, MemberExpr>) {
@@ -7560,7 +7713,7 @@ namespace pcn {
             catch (...) {}
             if (auto ni = nominals_.find(name); ni != nominals_.end()) {
                 const auto& n = ni->second; ABITypeLayout x; x.kind = ABIRepresentationKind::Aggregate; x.typeName = name; x.rich = true;
-                if (const auto* sl = skmLayout(name)) { x.size = sl->size; x.alignment = sl->alignment; for (const auto& f : n.fields) { std::size_t off = 0; for (const auto& sf : sl->fieldOffsets)if (sf.first == f.first) { off = sf.second; break; }x.fields.push_back({ f.first,f.second,off,false }); } }
+                if (const auto* sl = skmLayout(name)) { x.size = sl->size; x.alignment = sl->alignment; for (const auto& f : n.fields) { std::size_t off = 0; for (const auto& sf : sl->fieldOffsets)if (sf.first == f.first) { off = sf.second; break; }x.fields.push_back({ f.first,f.second,off,false }); } if (n.kind == "enum" || n.kind == "variant") { x.fields.push_back({ "$tag",sl->tagStorageType,sl->tagOffset,false }); if (n.kind == "variant") { for (const auto& f : sl->caseFields) x.fields.push_back({ f.caseName + "." + f.fieldName,f.typeName,f.offset,false }); } } }
                 else { std::size_t off = 0, al = 1; for (const auto& f : n.fields) { auto fl = layout(f.second); off = alignUp(off, fl.alignment); x.fields.push_back({ f.first,f.second,off,false }); off += fl.size; al = std::max(al, fl.alignment); }x.alignment = al; x.size = alignUp(off, al); }
                 if (x.size == 0)x.size = 1;
                 return x;
@@ -8376,10 +8529,11 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                                               // DWORD count = min(remaining, 0xFFFFFFFF); write all bytes in chunks.
                                                               movReg(b, 8, 0);
                                                               movImm(b, 10, 0xFFFFFFFFu);
+                                                              b.insert(b.end(), { 0x4D,0x39,0xD0 }); auto jccSmall = emitLocalJcc(b, 0x86); // jbe (r8<=r10)
+                                                              movReg(b, 8, 10); patchLocal(b, jccSmall, b.size());
                                                               b.insert(b.end(), { 0x4D,0x39,0xD0 });
                                                               const std::size_t jccChunkFits = emitLocalJcc(b, 0x86); // jbe (r8<=r10)
-                                                              movReg(b, 8, 10);
-                                                              patchLocal(b, jccChunkFits, b.size());
+                                                              movReg(b, 8, 10); patchLocal(b, jccChunkFits, b.size());
                                                               movImm(b, 0, 0); storeRspRax(b, 40); storeRspRax(b, 32);
                                                               loadSlot(b, 1, fn, i.destSlot); // RCX handle
                                                               b.insert(b.end(), { 0x48,0x8B,0x94,0x24 }); put32(b, 48); // RDX cursor
@@ -9852,7 +10006,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   oss << "effect edges: " << analysis.skm.effectEdges.size() << "\n";
                                   for (const auto& e : analysis.skm.effectEdges) { oss << "  " << e.caller << " -> " << e.callee << " ["; if (e.effects.empty())oss << "pure"; else { bool first = true; for (const auto& x : e.effects) { if (!first)oss << ','; first = false; oss << x; } } oss << "]\n"; }
                                   oss << "layouts: " << analysis.skm.layouts.size() << "\n";
-                                  for (const auto& l : analysis.skm.layouts) { oss << "  " << l.typeName << " size=" << l.size << " align=" << l.alignment << (l.nicheOptimized ? " niche" : "") << "\n"; for (const auto& f : l.fieldOffsets)oss << "    +" << f.second << " " << f.first << "\n"; }
+                                  for (const auto& l : analysis.skm.layouts) { oss << "  " << l.typeName << " size=" << l.size << " align=" << l.alignment << (l.nicheOptimized ? " niche" : "") << "\n"; for (const auto& f : l.fieldOffsets)oss << "    +" << f.second << " " << f.first << "\n"; for (const auto& tag : l.tagConstants) oss << "    tag " << tag.first << "=" << tag.second << " storage=" << l.tagStorageType << " offset=" << l.tagOffset << " bytes=" << l.tagSize << "\n"; if (l.tagSize && l.payloadSize) oss << "    payload offset=" << l.payloadOffset << " size=" << l.payloadSize << "\n"; for (const auto& cf : l.caseFields)oss << "    case " << cf.caseName << "." << cf.fieldName << " +" << cf.offset << " : " << cf.typeName << "\n"; }
                                   oss << "structural facts: " << analysis.skm.structuralFacts.size() << "\n";
                                   for (const auto& f : analysis.skm.structuralFacts) oss << "  " << f << "\n";
                                   return oss.str();
@@ -10063,8 +10217,9 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       const auto pathText = path.generic_string();
                                       const auto stampId = SHA256::hex(SHA256::digest(pathText)).substr(0, 20);
                                       const auto stamp = cacheRoot / (".compiler-" + stampId + ".stamp");
+                                      const auto ticks = static_cast<long long>(time.time_since_epoch().count());
                                       const std::string metadata = std::to_string(size) + "\n" +
-                                          std::to_string(time.time_since_epoch().count()) + "\n" + pathText + "\n";
+                                          std::to_string(ticks) + "\n" + pathText + "\n";
                                       {
                                           std::ifstream saved(stamp, std::ios::binary);
                                           if (saved) {
