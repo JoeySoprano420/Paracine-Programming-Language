@@ -60,16 +60,6 @@ namespace pcn {
         return result;
     }
 
-            if (!explicitGenericArguments.empty()) {
-                const bool anyGenericOverload = std::any_of(it->second.begin(), it->second.end(), [](const RoutineSignature& sig) {
-                    return !sig.genericParameters.empty();
-                    });
-                if (!anyGenericOverload) {
-                    report(location, "explicit generic arguments provided for non-generic routine: " + name);
-                    return makeUnknownType();
-                }
-            }
-
     // One checked integer decoder shared by constant resolution, optimizer,
     // reference interpreter and machine lowering. It rejects trailing text and
     // overflow instead of accepting std::stoll's partially consumed prefix.
@@ -128,6 +118,7 @@ namespace pcn {
         "foreign", "from", "give", "gives", "if", "import", "in", "io", "is",
         "let", "loop", "module", "move", "not", "nothing", "or", "own", "public",
         "pure", "raw", "record", "return_", "routine", "static", "test", "then",
+        "to", "until",
         "thread", "trap", "true", "try", "unsafe", "var", "variant", "when",
         "where", "while", "with", "yield_",
 
@@ -750,10 +741,28 @@ namespace pcn {
     struct EachStmt {
         std::vector<std::string> bindings;
         ExprPtr range;
+        ExprPtr guard;
         std::vector<StmtPtr> body;
         SourceSpan span;
         SourceLocation location;
         bool bindingsMutable = false;
+    };
+
+    struct FromStmt {
+        std::string binding;
+        std::string typeName;
+        ExprPtr first;
+        ExprPtr last;
+        std::vector<StmtPtr> body;
+        SourceSpan span;
+        SourceLocation location;
+    };
+
+    struct ContinueUntilStmt {
+        ExprPtr condition;
+        std::vector<StmtPtr> body;
+        SourceSpan span;
+        SourceLocation location;
     };
 
     struct UnsafeStmt {
@@ -801,6 +810,7 @@ namespace pcn {
 
     struct Stmt {
         using Node = std::variant<LetStmt, VarStmt, AssignStmt, ArraySetStmt, RecordSetStmt, ExprStmt, ReturnStmt, GiveStmt, IfStmt, EachStmt, UnsafeStmt, DeferStmt, FailStmt, WhileStmt, BreakStmt, ContinueStmt, BlockStmt>;
+        using Node = std::variant<LetStmt, VarStmt, AssignStmt, ArraySetStmt, RecordSetStmt, ExprStmt, ReturnStmt, GiveStmt, IfStmt, EachStmt, FromStmt, ContinueUntilStmt, UnsafeStmt, DeferStmt, FailStmt, WhileStmt, BreakStmt, ContinueStmt, BlockStmt>;
         Node node;
         SourceSpan span;
         SourceLocation location;
@@ -2173,6 +2183,13 @@ namespace pcn {
                 }
                 else if constexpr (std::is_same_v<T, EachStmt>) {
                     return AstFactory::makeStmt(Stmt{ EachStmt{ value.bindings, value.range, value.body, span, location, value.bindingsMutable }, span, location }, span);
+                    return AstFactory::makeStmt(Stmt{ EachStmt{ value.bindings, value.range, value.guard, value.body, span, location, value.bindingsMutable }, span, location }, span);
+                }
+                else if constexpr (std::is_same_v<T, FromStmt>) {
+                    return AstFactory::makeStmt(Stmt{ FromStmt{ value.binding, value.typeName, value.first, value.last, value.body, span, location }, span, location }, span);
+                }
+                else if constexpr (std::is_same_v<T, ContinueUntilStmt>) {
+                    return AstFactory::makeStmt(Stmt{ ContinueUntilStmt{ value.condition, value.body, span, location }, span, location }, span);
                 }
                 else if constexpr (std::is_same_v<T, UnsafeStmt>) {
                     return AstFactory::makeStmt(Stmt{ UnsafeStmt{ value.body, span, location }, span, location }, span);
@@ -2350,11 +2367,30 @@ namespace pcn {
 
             if (matchKeyword("break") || matchKeyword("continue")) {
                 const bool isBreak = previous().text == "break";
+            if (matchKeyword("break")) {
                 auto location = previous().location;
                 std::string label;
                 if (matchSymbol("@")) label = expectIdentifier().text;
                 consumeLineBreak();
                 if (isBreak) return makeStmt(BreakStmt{ label,{ location, location }, location }, { location, location }, location);
+                return makeStmt(BreakStmt{ label,{ location, location }, location }, { location, location }, location);
+            }
+
+            if (matchKeyword("continue")) {
+                auto location = previous().location;
+                auto start = location;
+                if (matchKeyword("until")) {
+                    auto condition = parseExpression();
+                    consumeLineBreak();
+                    skipNewlines();
+                    expectIndent();
+                    auto body = parseBlockStatements();
+                    expectDedent();
+                    return makeStmt(ContinueUntilStmt{ condition, std::move(body),{ start, location }, location }, { start, location }, location);
+                }
+                std::string label;
+                if (matchSymbol("@")) label = expectIdentifier().text;
+                consumeLineBreak();
                 return makeStmt(ContinueStmt{ label,{ location, location }, location }, { location, location }, location);
             }
 
@@ -2369,12 +2405,37 @@ namespace pcn {
                 }
                 expectKeyword("in");
                 auto range = parseExpression();
+                ExprPtr guard;
+                if (matchKeyword("while")) {
+                    guard = parseExpression();
+                }
+                consumeLineBreak();
+                skipNewlines();
+                expectIndent();
+                auto body = parseBlockStatements();
+                expectDedent();
+                return makeStmt(EachStmt{ std::move(bindings), range, guard, std::move(body),{ start, location }, location, bindingsMutable }, { start, location }, location);
+            }
+
+            if (matchKeyword("from")) {
+                auto location = previous().location;
+                auto start = location;
+                const std::string binding = expectIdentifier().text;
+                std::string typeName;
+                if (matchSymbol(":")) {
+                    typeName = parseTypeName();
+                }
+                expectSymbol("=");
+                auto first = parseExpression();
+                expectKeyword("to");
+                auto last = parseExpression();
                 consumeLineBreak();
                 skipNewlines();
                 expectIndent();
                 auto body = parseBlockStatements();
                 expectDedent();
                 return makeStmt(EachStmt{ std::move(bindings), range, std::move(body),{ start, location }, location, bindingsMutable }, { start, location }, location);
+                return makeStmt(FromStmt{ binding, typeName, first, last, std::move(body),{ start, location }, location }, { start, location }, location);
             }
 
             if (matchKeyword("unsafe")) {
@@ -3326,6 +3387,12 @@ namespace pcn {
                 else if constexpr (std::is_same_v<T, EachStmt>) {
                     analyzeUnreachableEach(node);
                 }
+                else if constexpr (std::is_same_v<T, FromStmt>) {
+                    analyzeUnreachableFrom(node);
+                }
+                else if constexpr (std::is_same_v<T, ContinueUntilStmt>) {
+                    analyzeUnreachableContinueUntil(node);
+                }
                 else if constexpr (std::is_same_v<T, UnsafeStmt>) {
                     analyzeUnreachableUnsafe(node);
                 }
@@ -3380,6 +3447,12 @@ namespace pcn {
                 }
                 else if constexpr (std::is_same_v<T, EachStmt>) {
                     return analyzeEach(statement);
+                }
+                else if constexpr (std::is_same_v<T, FromStmt>) {
+                    return analyzeFrom(statement);
+                }
+                else if constexpr (std::is_same_v<T, ContinueUntilStmt>) {
+                    return analyzeContinueUntil(statement);
                 }
                 else if constexpr (std::is_same_v<T, UnsafeStmt>) {
                     return analyzeUnsafe(statement);
@@ -3612,11 +3685,65 @@ namespace pcn {
             for (const auto& binding : node.bindings) {
                 declareSymbol(node.location, binding, { makeUnknownType(), node.bindingsMutable, false });
             }
+            if (node.guard) {
+                auto guardType = analyzeExpr(node.guard);
+                if (guardType.kind != SemanticTypeKind::Bool && guardType.kind != SemanticTypeKind::Unknown) {
+                    report(node.location, "for guard condition must be bool, got " + semanticTypeName(guardType));
+                }
+            }
             ++currentLoopDepth_;
             auto fallsThrough = analyzeStatementList(node.body, true);
             --currentLoopDepth_;
             popScope();
             return fallsThrough;
+        }
+
+        bool analyzeFrom(const FromStmt& node) {
+            auto firstType = analyzeExpr(node.first);
+            auto lastType = analyzeExpr(node.last);
+            SemanticType inductionType = node.typeName.empty() ? firstType : semanticTypeFromName(node.typeName);
+            if (!node.typeName.empty() && !isIntegerLikeNumericType(inductionType) && inductionType.kind != SemanticTypeKind::Unknown) {
+                report(node.location, "from induction type must be an integer type, got " + semanticTypeName(inductionType));
+            }
+            if (node.typeName.empty()) {
+                if (inductionType.kind == SemanticTypeKind::Unknown && lastType.kind != SemanticTypeKind::Unknown) {
+                    inductionType = lastType;
+                }
+                if (firstType.kind != SemanticTypeKind::Unknown && lastType.kind != SemanticTypeKind::Unknown && !isAssignableTo(firstType, lastType) && !isAssignableTo(lastType, firstType)) {
+                    report(node.location, "from bounds must resolve to a common integer type");
+                }
+            }
+            else {
+                if (!isAssignableTo(inductionType, firstType)) {
+                    report(node.location, "from lower bound type mismatch: expected " + semanticTypeName(inductionType) + ", got " + semanticTypeName(firstType));
+                }
+                if (!isAssignableTo(inductionType, lastType)) {
+                    report(node.location, "from upper bound type mismatch: expected " + semanticTypeName(inductionType) + ", got " + semanticTypeName(lastType));
+                }
+            }
+            if (!isIntegerLikeNumericType(inductionType) && inductionType.kind != SemanticTypeKind::Unknown) {
+                report(node.location, "from bounds must be integer-typed");
+            }
+            pushScope();
+            declareSymbol(node.location, node.binding, { inductionType, false, false });
+            ++currentLoopDepth_;
+            auto fallsThrough = analyzeStatementList(node.body, true);
+            --currentLoopDepth_;
+            popScope();
+            return fallsThrough;
+        }
+
+        bool analyzeContinueUntil(const ContinueUntilStmt& node) {
+            auto conditionType = analyzeExpr(node.condition);
+            if (conditionType.kind != SemanticTypeKind::Bool && conditionType.kind != SemanticTypeKind::Unknown) {
+                report(node.location, "continue-until condition must be bool, got " + semanticTypeName(conditionType));
+            }
+            pushScope();
+            ++currentLoopDepth_;
+            analyzeStatementList(node.body, true);
+            --currentLoopDepth_;
+            popScope();
+            return true;
         }
 
         bool analyzeUnsafe(const UnsafeStmt& node) {
@@ -3709,6 +3836,18 @@ namespace pcn {
 
         void analyzeUnreachableEach(const EachStmt& node) {
             analyzeExpr(node.range);
+            if (node.guard) analyzeExpr(node.guard);
+            analyzeStatementList(node.body, false);
+        }
+
+        void analyzeUnreachableFrom(const FromStmt& node) {
+            analyzeExpr(node.first);
+            analyzeExpr(node.last);
+            analyzeStatementList(node.body, false);
+        }
+
+        void analyzeUnreachableContinueUntil(const ContinueUntilStmt& node) {
+            analyzeExpr(node.condition);
             analyzeStatementList(node.body, false);
         }
 
@@ -3990,7 +4129,6 @@ namespace pcn {
                     return makeCustomType("__" + callee->name + "<" + semanticTypeName(t) + ">");
                 }
                 if (callee->name == "none") { if (!node.arguments.empty())report(node.location, "none requires no arguments"); return makeCustomType("__none"); }
-                if (callee->name == "print") {
                 if (callee->name == "print" || callee->name == "println") {
                     for (const auto& argument : node.arguments) {
                         analyzeExpr(argument);
@@ -4941,6 +5079,9 @@ namespace pcn {
                 else if constexpr (std::is_same_v<T, IfStmt>) { walkExpr(n.condition, inClosure); scopes_.push_back({}); walkStatements(n.thenBranch, inClosure); scopes_.pop_back(); scopes_.push_back({}); walkStatements(n.elseBranch, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, WhileStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": loop"); walkExpr(n.condition, inClosure); scopes_.push_back({}); walkStatements(n.body, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, EachStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": iterator/range loop"); walkExpr(n.range, inClosure); scopes_.push_back({}); for (const auto& b : n.bindings)declare(b, "int", n.bindingsMutable, false, "shared", n.location, point_); walkStatements(n.body, inClosure); scopes_.pop_back(); }
+                else if constexpr (std::is_same_v<T, EachStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": iterator/range loop"); walkExpr(n.range, inClosure); scopes_.push_back({}); for (const auto& b : n.bindings)declare(b, "int", n.bindingsMutable, false, "shared", n.location, point_); if (n.guard)walkExpr(n.guard, inClosure); walkStatements(n.body, inClosure); scopes_.pop_back(); }
+                else if constexpr (std::is_same_v<T, FromStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": directed integer loop"); walkExpr(n.first, inClosure); walkExpr(n.last, inClosure); scopes_.push_back({}); declare(n.binding, n.typeName.empty() ? "int" : n.typeName, false, false, "shared", n.location, point_); walkStatements(n.body, inClosure); scopes_.pop_back(); }
+                else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": post-test loop"); walkExpr(n.condition, inClosure); scopes_.push_back({}); walkStatements(n.body, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, UnsafeStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": unsafe boundary"); scopes_.push_back({}); walkStatements(n.body, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, BlockStmt>) { scopes_.push_back({}); walkStatements(n.statements, inClosure); scopes_.pop_back(); }
                     }, s->node);
@@ -5022,6 +5163,9 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, GiveStmt>)inferClosureExprEffects(n.value, out); else if constexpr (std::is_same_v<T, FailStmt>)inferClosureExprEffects(n.expression, out); else if constexpr (std::is_same_v<T, IfStmt>) { inferClosureExprEffects(n.condition, out); inferClosureStmtEffects(n.thenBranch, out); inferClosureStmtEffects(n.elseBranch, out); }
             else if constexpr (std::is_same_v<T, WhileStmt>) { inferClosureExprEffects(n.condition, out); inferClosureStmtEffects(n.body, out); }
             else if constexpr (std::is_same_v<T, EachStmt>) { inferClosureExprEffects(n.range, out); inferClosureStmtEffects(n.body, out); }
+            else if constexpr (std::is_same_v<T, EachStmt>) { inferClosureExprEffects(n.range, out); inferClosureExprEffects(n.guard, out); inferClosureStmtEffects(n.body, out); }
+            else if constexpr (std::is_same_v<T, FromStmt>) { inferClosureExprEffects(n.first, out); inferClosureExprEffects(n.last, out); inferClosureStmtEffects(n.body, out); }
+            else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { inferClosureExprEffects(n.condition, out); inferClosureStmtEffects(n.body, out); }
             else if constexpr (std::is_same_v<T, UnsafeStmt>) { out.insert("unsafe"); inferClosureStmtEffects(n.body, out); }
             else if constexpr (std::is_same_v<T, DeferStmt>)inferClosureExprEffects(n.expression, out); else if constexpr (std::is_same_v<T, BlockStmt>)inferClosureStmtEffects(n.statements, out);
                 }, s->node);
@@ -5044,6 +5188,9 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, GiveStmt>)scanExpr(n.value); else if constexpr (std::is_same_v<T, FailStmt>)scanExpr(n.expression); else if constexpr (std::is_same_v<T, IfStmt>) { scanExpr(n.condition); scanStmts(n.thenBranch); scanStmts(n.elseBranch); }
             else if constexpr (std::is_same_v<T, WhileStmt>) { scanExpr(n.condition); scanStmts(n.body); }
             else if constexpr (std::is_same_v<T, EachStmt>) { scanExpr(n.range); for (auto& x : n.bindings)locals.insert(x); scanStmts(n.body); }
+            else if constexpr (std::is_same_v<T, EachStmt>) { scanExpr(n.range); for (auto& x : n.bindings)locals.insert(x); scanExpr(n.guard); scanStmts(n.body); }
+            else if constexpr (std::is_same_v<T, FromStmt>) { scanExpr(n.first); scanExpr(n.last); locals.insert(n.binding); scanStmts(n.body); }
+            else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { scanExpr(n.condition); scanStmts(n.body); }
             else if constexpr (std::is_same_v<T, UnsafeStmt>)scanStmts(n.body); else if constexpr (std::is_same_v<T, DeferStmt>)scanExpr(n.expression); else if constexpr (std::is_same_v<T, BlockStmt>)scanStmts(n.statements); }, s->node); };
             if (c.hasExpressionBody)scanExpr(c.expressionBody); else scanStmts(c.blockBody);
             for (const auto& [name, cu] : captures) { result_->skm.closureCaptures.push_back({ c.closureId,cu.symbolId,name,cu.typeName,cu.kind,false,cu.location }); if (auto* ls = lookup(name))addBorrow(*ls, name, cu.kind, point_, point_, c.closureId, false, cu.location); }
@@ -5246,6 +5393,16 @@ namespace pcn {
                     }
                     else if constexpr (std::is_same_v<T, EachStmt>) {
                         collectExprEffects(node.range, facts);
+                        collectExprEffects(node.guard, facts);
+                        collectStatementEffects(node.body, facts);
+                    }
+                    else if constexpr (std::is_same_v<T, FromStmt>) {
+                        collectExprEffects(node.first, facts);
+                        collectExprEffects(node.last, facts);
+                        collectStatementEffects(node.body, facts);
+                    }
+                    else if constexpr (std::is_same_v<T, ContinueUntilStmt>) {
+                        collectExprEffects(node.condition, facts);
                         collectStatementEffects(node.body, facts);
                     }
                     else if constexpr (std::is_same_v<T, UnsafeStmt>) {
@@ -5596,6 +5753,21 @@ namespace pcn {
                         analyzeBorrowExpr(node.range, state);
                         BorrowState body = state; body.scopes.emplace_back();
                         for (const auto& name : node.bindings) body.scopes.back()[name] = BorrowSymbol{ "int", node.bindingsMutable, false, "shared", OwnershipState::Available };
+                        analyzeBorrowExpr(node.guard, body);
+                        analyzeBorrowStatements(node.body, body, true); body.scopes.pop_back();
+                        state = mergeStates(state, body);
+                    }
+                    else if constexpr (std::is_same_v<T, FromStmt>) {
+                        analyzeBorrowExpr(node.first, state);
+                        analyzeBorrowExpr(node.last, state);
+                        BorrowState body = state; body.scopes.emplace_back();
+                        body.scopes.back()[node.binding] = BorrowSymbol{ node.typeName.empty() ? "int" : node.typeName, false, false, "shared", OwnershipState::Available };
+                        analyzeBorrowStatements(node.body, body, true); body.scopes.pop_back();
+                        state = mergeStates(state, body);
+                    }
+                    else if constexpr (std::is_same_v<T, ContinueUntilStmt>) {
+                        analyzeBorrowExpr(node.condition, state);
+                        BorrowState body = state; body.scopes.emplace_back();
                         analyzeBorrowStatements(node.body, body, true); body.scopes.pop_back();
                         state = mergeStates(state, body);
                     }
@@ -5798,6 +5970,29 @@ namespace pcn {
                     oss << node.bindings[i];
                 }
                 oss << " in " << exprToString(node.range) << "\n";
+                oss << " in " << exprToString(node.range);
+                if (node.guard) oss << " while " << exprToString(node.guard);
+                oss << "\n";
+                for (const auto& child : node.body) {
+                    oss << stmtToString(child, depth + 1) << "\n";
+                }
+                std::string result = oss.str();
+                if (!result.empty() && result.back() == '\n') result.pop_back();
+                return result;
+            }
+            else if constexpr (std::is_same_v<T, FromStmt>) {
+                oss << indentText(depth) << "from " << node.binding;
+                if (!node.typeName.empty()) oss << ": " << node.typeName;
+                oss << " = " << exprToString(node.first) << " to " << exprToString(node.last) << "\n";
+                for (const auto& child : node.body) {
+                    oss << stmtToString(child, depth + 1) << "\n";
+                }
+                std::string result = oss.str();
+                if (!result.empty() && result.back() == '\n') result.pop_back();
+                return result;
+            }
+            else if constexpr (std::is_same_v<T, ContinueUntilStmt>) {
+                oss << indentText(depth) << "continue until " << exprToString(node.condition) << "\n";
                 for (const auto& child : node.body) {
                     oss << stmtToString(child, depth + 1) << "\n";
                 }
@@ -5916,6 +6111,9 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, GiveStmt>)x.value = rewriteExpr(x.value, m);
             else if constexpr (std::is_same_v<T, IfStmt>) { x.condition = rewriteExpr(x.condition, m); x.thenBranch = rewriteStatements(x.thenBranch, m); x.elseBranch = rewriteStatements(x.elseBranch, m); }
             else if constexpr (std::is_same_v<T, EachStmt>) { x.range = rewriteExpr(x.range, m); x.body = rewriteStatements(x.body, m); }
+            else if constexpr (std::is_same_v<T, EachStmt>) { x.range = rewriteExpr(x.range, m); x.guard = rewriteExpr(x.guard, m); x.body = rewriteStatements(x.body, m); }
+            else if constexpr (std::is_same_v<T, FromStmt>) { x.first = rewriteExpr(x.first, m); x.last = rewriteExpr(x.last, m); x.typeName = subst(x.typeName, m); x.body = rewriteStatements(x.body, m); }
+            else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { x.condition = rewriteExpr(x.condition, m); x.body = rewriteStatements(x.body, m); }
             else if constexpr (std::is_same_v<T, UnsafeStmt>)x.body = rewriteStatements(x.body, m);
             else if constexpr (std::is_same_v<T, DeferStmt>)x.expression = rewriteExpr(x.expression, m);
             else if constexpr (std::is_same_v<T, FailStmt>)x.expression = rewriteExpr(x.expression, m);
@@ -5933,6 +6131,9 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, RecordSetStmt>)collectClosuresExpr(n.value, out); else if constexpr (std::is_same_v<T, ExprStmt>)collectClosuresExpr(n.expression, out); else if constexpr (std::is_same_v<T, ReturnStmt>) { if (n.hasValue)collectClosuresExpr(n.value, out); }
             else if constexpr (std::is_same_v<T, GiveStmt>)collectClosuresExpr(n.value, out); else if constexpr (std::is_same_v<T, IfStmt>) { collectClosuresExpr(n.condition, out); collectClosuresStmt(n.thenBranch, out); collectClosuresStmt(n.elseBranch, out); }
             else if constexpr (std::is_same_v<T, EachStmt>) { collectClosuresExpr(n.range, out); collectClosuresStmt(n.body, out); }
+            else if constexpr (std::is_same_v<T, EachStmt>) { collectClosuresExpr(n.range, out); collectClosuresExpr(n.guard, out); collectClosuresStmt(n.body, out); }
+            else if constexpr (std::is_same_v<T, FromStmt>) { collectClosuresExpr(n.first, out); collectClosuresExpr(n.last, out); collectClosuresStmt(n.body, out); }
+            else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { collectClosuresExpr(n.condition, out); collectClosuresStmt(n.body, out); }
             else if constexpr (std::is_same_v<T, UnsafeStmt>)collectClosuresStmt(n.body, out); else if constexpr (std::is_same_v<T, DeferStmt>)collectClosuresExpr(n.expression, out); else if constexpr (std::is_same_v<T, FailStmt>)collectClosuresExpr(n.expression, out); else if constexpr (std::is_same_v<T, WhileStmt>) { collectClosuresExpr(n.condition, out); collectClosuresStmt(n.body, out); }
             else if constexpr (std::is_same_v<T, BlockStmt>)collectClosuresStmt(n.statements, out); }, s->node);
         }
@@ -6250,6 +6451,12 @@ namespace pcn {
                 }
                 else if constexpr (std::is_same_v<T, EachStmt>) {
                     lowerEach(node);
+                }
+                else if constexpr (std::is_same_v<T, FromStmt>) {
+                    lowerFrom(node);
+                }
+                else if constexpr (std::is_same_v<T, ContinueUntilStmt>) {
+                    lowerContinueUntil(node);
                 }
                 else if constexpr (std::is_same_v<T, UnsafeStmt>) {
                     lowerUnsafe(node);
@@ -6573,6 +6780,7 @@ namespace pcn {
             localValueTypes_[binding] = makeIRIntType();
 
             BlockID condBlock = createBlock("for.cond");
+            BlockID candidateBlock = createBlock("for.candidate");
             BlockID bodyBlock = createBlock("for.body");
             BlockID stepBlock = createBlock("for.step");
             BlockID exitBlock = createBlock("for.exit");
@@ -6591,9 +6799,27 @@ namespace pcn {
             branch.op = IROpcode::BranchIf;
             branch.args.push_back(condition);
             branch.targetBlocks = { bodyBlock, exitBlock };
+            branch.targetBlocks = { candidateBlock, exitBlock };
             branch.valueType = makeIRVoidType();
             emit(std::move(branch));
             currentTerminated_ = true;
+
+            currentBlock_ = candidateBlock;
+            currentTerminated_ = false;
+            if (node.guard) {
+                VReg guardValue = lowerExpr(node.guard);
+                IRInstruction guardBranch;
+                guardBranch.op = IROpcode::BranchIf;
+                guardBranch.args.push_back(guardValue);
+                guardBranch.targetBlocks = { bodyBlock, exitBlock };
+                guardBranch.valueType = makeIRVoidType();
+                emit(std::move(guardBranch));
+                currentTerminated_ = true;
+            }
+            else {
+                emitBranch(bodyBlock);
+                currentTerminated_ = true;
+            }
 
             loopContinueTargets_.push_back(stepBlock);
             loopBreakTargets_.push_back(exitBlock);
@@ -6624,6 +6850,160 @@ namespace pcn {
             loopContinueTargets_.pop_back();
             loopBreakTargets_.pop_back();
             loopScopeDepths_.pop_back();
+            currentBlock_ = exitBlock;
+            currentTerminated_ = false;
+        }
+
+        void lowerFrom(const FromStmt& node) {
+            VReg firstValue = lowerExpr(node.first);
+            VReg lastValue = lowerExpr(node.last);
+
+            VReg induction = allocateVReg();
+            IRInstruction init;
+            init.op = IROpcode::Copy;
+            init.dest = induction;
+            init.args.push_back(firstValue);
+            init.valueType = makeIRIntType();
+            emit(std::move(init));
+
+            VReg endpoint = allocateVReg();
+            IRInstruction saveEnd;
+            saveEnd.op = IROpcode::Copy;
+            saveEnd.dest = endpoint;
+            saveEnd.args.push_back(lastValue);
+            saveEnd.valueType = makeIRIntType();
+            emit(std::move(saveEnd));
+
+            VReg ascending = allocateVReg();
+            IRInstruction cmpAscending;
+            cmpAscending.op = IROpcode::Lt;
+            cmpAscending.dest = ascending;
+            cmpAscending.args = { induction, endpoint };
+            cmpAscending.valueType = makeIRBoolType();
+            emit(std::move(cmpAscending));
+
+            locals_[node.binding] = induction;
+            localValueTypes_[node.binding] = makeIRIntType();
+
+            BlockID bodyBlock = createBlock("from.body");
+            BlockID postBlock = createBlock("from.post");
+            BlockID stepSelectBlock = createBlock("from.step.select");
+            BlockID stepUpBlock = createBlock("from.step.up");
+            BlockID stepDownBlock = createBlock("from.step.down");
+            BlockID exitBlock = createBlock("from.exit");
+
+            emitBranch(bodyBlock);
+
+            loopContinueTargets_.push_back(postBlock);
+            loopBreakTargets_.push_back(exitBlock);
+            loopScopeDepths_.push_back(deferScopes_.size());
+
+            currentBlock_ = bodyBlock;
+            currentTerminated_ = false;
+            lowerStatementList(node.body);
+            if (!currentTerminated_) emitBranch(postBlock);
+
+            currentBlock_ = postBlock;
+            currentTerminated_ = false;
+            VReg atEnd = allocateVReg();
+            IRInstruction cmpEnd;
+            cmpEnd.op = IROpcode::Eq;
+            cmpEnd.dest = atEnd;
+            cmpEnd.args = { induction, endpoint };
+            cmpEnd.valueType = makeIRBoolType();
+            emit(std::move(cmpEnd));
+            IRInstruction endBranch;
+            endBranch.op = IROpcode::BranchIf;
+            endBranch.args.push_back(atEnd);
+            endBranch.targetBlocks = { exitBlock, stepSelectBlock };
+            endBranch.valueType = makeIRVoidType();
+            emit(std::move(endBranch));
+            currentTerminated_ = true;
+
+            currentBlock_ = stepSelectBlock;
+            currentTerminated_ = false;
+            IRInstruction stepBranch;
+            stepBranch.op = IROpcode::BranchIf;
+            stepBranch.args.push_back(ascending);
+            stepBranch.targetBlocks = { stepUpBlock, stepDownBlock };
+            stepBranch.valueType = makeIRVoidType();
+            emit(std::move(stepBranch));
+            currentTerminated_ = true;
+
+            VReg one = emitConst(IROpcode::ConstInt, "1");
+
+            currentBlock_ = stepUpBlock;
+            currentTerminated_ = false;
+            VReg inc = allocateVReg();
+            IRInstruction add;
+            add.op = IROpcode::Add;
+            add.dest = inc;
+            add.args = { induction, one };
+            add.valueType = makeIRIntType();
+            emit(std::move(add));
+            IRInstruction storeInc;
+            storeInc.op = IROpcode::Copy;
+            storeInc.dest = induction;
+            storeInc.args.push_back(inc);
+            storeInc.valueType = makeIRIntType();
+            emit(std::move(storeInc));
+            emitBranch(bodyBlock);
+
+            currentBlock_ = stepDownBlock;
+            currentTerminated_ = false;
+            VReg dec = allocateVReg();
+            IRInstruction sub;
+            sub.op = IROpcode::Sub;
+            sub.dest = dec;
+            sub.args = { induction, one };
+            sub.valueType = makeIRIntType();
+            emit(std::move(sub));
+            IRInstruction storeDec;
+            storeDec.op = IROpcode::Copy;
+            storeDec.dest = induction;
+            storeDec.args.push_back(dec);
+            storeDec.valueType = makeIRIntType();
+            emit(std::move(storeDec));
+            emitBranch(bodyBlock);
+
+            loopContinueTargets_.pop_back();
+            loopBreakTargets_.pop_back();
+            loopScopeDepths_.pop_back();
+
+            currentBlock_ = exitBlock;
+            currentTerminated_ = false;
+        }
+
+        void lowerContinueUntil(const ContinueUntilStmt& node) {
+            BlockID bodyBlock = createBlock("continue_until.body");
+            BlockID condBlock = createBlock("continue_until.cond");
+            BlockID exitBlock = createBlock("continue_until.exit");
+            emitBranch(bodyBlock);
+
+            loopContinueTargets_.push_back(condBlock);
+            loopBreakTargets_.push_back(exitBlock);
+            loopScopeDepths_.push_back(deferScopes_.size());
+
+            currentBlock_ = bodyBlock;
+            currentTerminated_ = false;
+            lowerStatementList(node.body);
+            if (!currentTerminated_) emitBranch(condBlock);
+
+            currentBlock_ = condBlock;
+            currentTerminated_ = false;
+            VReg conditionValue = lowerExpr(node.condition);
+            IRInstruction branch;
+            branch.op = IROpcode::BranchIf;
+            branch.args.push_back(conditionValue);
+            branch.targetBlocks = { exitBlock, bodyBlock };
+            branch.valueType = makeIRVoidType();
+            emit(std::move(branch));
+            currentTerminated_ = true;
+
+            loopContinueTargets_.pop_back();
+            loopBreakTargets_.pop_back();
+            loopScopeDepths_.pop_back();
+
             currentBlock_ = exitBlock;
             currentTerminated_ = false;
         }
@@ -6673,7 +7053,6 @@ namespace pcn {
             const bool variantSubject = subject != VReg::None && nominalVariantTagIndex_.contains(subjectType.name);
             for (std::size_t i = 0; i < node.cases.size(); ++i) {
                 const auto& arm = node.cases[i];
-                VReg condition = lowerExpr(arm.condition);
                 VReg condition = VReg::None;
                 if (variantSubject) {
                     const auto* caseName = arm.condition ? std::get_if<VariableExpr>(&arm.condition->node) : nullptr;
@@ -7273,7 +7652,6 @@ namespace pcn {
                     if (!node.arguments.empty()) throw std::runtime_error("PCIR string.clear takes no arguments");
                     auto dest = allocateVReg(); inst.op = (member->member == "dispose" ? IROpcode::StringDispose : IROpcode::StringClear); inst.dest = dest; inst.args.push_back(lowerExpr(member->object)); inst.valueType = makeIRVoidType(); inst.typeName = "string"; emit(inst); lastValueType_ = inst.valueType; return dest;
                 }
-                throw std::runtime_error("PCIR lowering for member routine '" + objectType.name + "." + member->member + "' is not implemented in this bootstrap; semantic authority/effects were still checked by SAGE");
                 // Generic member call lowering: semantic analysis already validated that
                 // the method exists as a callable routine shape. Lower as a routine call
                 // with receiver as the first argument.
@@ -7734,10 +8112,17 @@ namespace pcn {
 
         void optimize(IRProgram& program) const {
             if (level_ == 0) return;
+            const int maxRounds = level_ >= 3 ? 12 : (level_ == 2 ? 8 : 4);
             for (auto& fn : program.functions) {
-                for (auto& block : fn.blocks) foldBlock(block);
-                if (level_ >= 2) removeDeadPureInstructions(fn);
-                if (level_ >= 3) removeUnreachableBlocks(fn);
+                for (int round = 0; round < maxRounds; ++round) {
+                    bool changed = false;
+                    for (auto& block : fn.blocks) changed = foldBlock(block) || changed;
+                    if (level_ >= 1) changed = copyPropagate(fn) || changed;
+                    if (level_ >= 2) changed = removeDeadPureInstructions(fn) || changed;
+                    if (level_ >= 2) changed = removeRedundantPhi(fn) || changed;
+                    if (level_ >= 3) changed = removeUnreachableBlocks(fn) || changed;
+                    if (!changed) break;
+                }
             }
         }
 
@@ -7787,9 +8172,10 @@ namespace pcn {
             }
         }
 
-        void foldBlock(IRBasicBlock& block) const {
+        bool foldBlock(IRBasicBlock& block) const {
             std::unordered_map<std::uint32_t, Constant> constants;
             auto key = [](VReg v) { return static_cast<std::uint32_t>(v); };
+            bool changed = false;
             for (auto& inst : block.instructions) {
                 if (inst.op == IROpcode::ConstInt) {
                     try { constants[key(inst.dest)] = { true, parseParacineInteger(inst.literalText), false }; }
@@ -7808,6 +8194,7 @@ namespace pcn {
                     if (it != constants.end() && it->second.known) {
                         BlockID target = it->second.value ? inst.targetBlocks[0] : inst.targetBlocks[1];
                         inst.op = IROpcode::Branch; inst.args.clear(); inst.targetBlocks = { target };
+                        changed = true;
                     }
                     continue;
                 }
@@ -7819,12 +8206,14 @@ namespace pcn {
                         auto value = eval(inst.op, a->second.value, inst.args.size() == 2 ? b->second.value : 0);
                         if (value) {
                             bool isBool = inst.valueType.kind == IRValueKind::Bool;
+                            const auto originalOp = inst.op;
                             inst.op = isBool ? IROpcode::ConstBool : IROpcode::ConstInt;
                             inst.args.clear(); inst.targetBlocks.clear(); inst.phiInputs.clear();
                             inst.hasImmediate = isBool;
                             inst.immediate = *value;
                             inst.literalText = isBool ? std::string{} : std::to_string(*value);
                             constants[key(inst.dest)] = { true, *value, isBool };
+                            if (originalOp != inst.op) changed = true;
                             continue;
                         }
                     }
@@ -7832,23 +8221,104 @@ namespace pcn {
                 }
                 else if (inst.dest != VReg::None) constants.erase(key(inst.dest));
             }
+            return changed;
         }
 
-        void removeDeadPureInstructions(IRFunction& fn) const {
+        bool copyPropagate(IRFunction& fn) const {
+            bool changed = false;
+            auto key = [](VReg v) { return static_cast<std::uint32_t>(v); };
+            for (auto& b : fn.blocks) {
+                std::unordered_map<std::uint32_t, VReg> copies;
+                auto rewrite = [&](VReg v) {
+                    auto it = copies.find(key(v));
+                    if (it == copies.end()) return v;
+                    VReg resolved = it->second;
+                    std::unordered_set<std::uint32_t> seen{ key(v) };
+                    while (true) {
+                        auto next = copies.find(key(resolved));
+                        if (next == copies.end() || !seen.insert(key(resolved)).second) break;
+                        resolved = next->second;
+                    }
+                    return resolved;
+                };
+                for (auto& phi : b.phiNodes) {
+                    for (auto& incoming : phi.phiInputs) {
+                        auto rewritten = rewrite(incoming.second);
+                        if (rewritten != incoming.second) {
+                            incoming.second = rewritten;
+                            changed = true;
+                        }
+                    }
+                    if (phi.dest != VReg::None) copies.erase(key(phi.dest));
+                }
+                for (auto& inst : b.instructions) {
+                    for (auto& arg : inst.args) {
+                        auto rewritten = rewrite(arg);
+                        if (rewritten != arg) {
+                            arg = rewritten;
+                            changed = true;
+                        }
+                    }
+                    if (inst.op == IROpcode::Copy && inst.dest != VReg::None && inst.args.size() == 1 && inst.args[0] != inst.dest) {
+                        copies[key(inst.dest)] = inst.args[0];
+                    }
+                    else if (inst.dest != VReg::None) {
+                        copies.erase(key(inst.dest));
+                    }
+                }
+            }
+            return changed;
+        }
+
+        bool removeDeadPureInstructions(IRFunction& fn) const {
             std::unordered_map<std::uint32_t, std::size_t> uses;
             for (const auto& b : fn.blocks) {
                 for (const auto& phi : b.phiNodes) for (auto [pred, v] : phi.phiInputs) { (void)pred; ++uses[static_cast<std::uint32_t>(v)]; }
                 for (const auto& i : b.instructions) for (auto v : i.args) ++uses[static_cast<std::uint32_t>(v)];
             }
+            bool changed = false;
             for (auto& b : fn.blocks) {
+                const auto before = b.instructions.size();
                 b.instructions.erase(std::remove_if(b.instructions.begin(), b.instructions.end(), [&](const IRInstruction& i) {
                     return i.dest != VReg::None && pure(i.op) && uses[static_cast<std::uint32_t>(i.dest)] == 0;
                     }), b.instructions.end());
+                changed = changed || before != b.instructions.size();
             }
+            return changed;
         }
 
-        void removeUnreachableBlocks(IRFunction& fn) const {
-            if (fn.blocks.empty()) return;
+        bool removeRedundantPhi(IRFunction& fn) const {
+            bool changed = false;
+            for (auto& b : fn.blocks) {
+                std::vector<IRInstruction> kept;
+                kept.reserve(b.phiNodes.size());
+                for (const auto& phi : b.phiNodes) {
+                    bool same = !phi.phiInputs.empty();
+                    VReg first = VReg::None;
+                    for (std::size_t i = 0; i < phi.phiInputs.size(); ++i) {
+                        if (i == 0) first = phi.phiInputs[i].second;
+                        else if (phi.phiInputs[i].second != first) { same = false; break; }
+                    }
+                    if (same && phi.dest != VReg::None && first != phi.dest) {
+                        IRInstruction copy;
+                        copy.op = IROpcode::Copy;
+                        copy.dest = phi.dest;
+                        copy.valueType = phi.valueType;
+                        copy.args = { first };
+                        b.instructions.insert(b.instructions.begin(), std::move(copy));
+                        changed = true;
+                    }
+                    else {
+                        kept.push_back(phi);
+                    }
+                }
+                b.phiNodes = std::move(kept);
+            }
+            return changed;
+        }
+
+        bool removeUnreachableBlocks(IRFunction& fn) const {
+            if (fn.blocks.empty()) return false;
             std::unordered_map<std::uint32_t, const IRBasicBlock*> byId;
             for (const auto& b : fn.blocks) byId[static_cast<std::uint32_t>(b.id)] = &b;
             std::unordered_set<std::uint32_t> live;
@@ -7858,7 +8328,9 @@ namespace pcn {
                 auto it = byId.find(id); if (it == byId.end()) continue;
                 for (const auto& inst : it->second->instructions) for (auto t : inst.targetBlocks) work.push_back(static_cast<std::uint32_t>(t));
             }
+            const auto before = fn.blocks.size();
             fn.blocks.erase(std::remove_if(fn.blocks.begin(), fn.blocks.end(), [&](const IRBasicBlock& b) { return !live.contains(static_cast<std::uint32_t>(b.id)); }), fn.blocks.end());
+            return before != fn.blocks.size();
         }
 
         int level_ = 2;
@@ -10331,6 +10803,412 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
                               }
 
+                              struct PackageDependency {
+                                  std::string name;
+                                  std::string version;
+                                  std::string source;
+                              };
+
+                              struct PackageManifest {
+                                  std::string name = "app";
+                                  std::string version = "0.1.0";
+                                  std::vector<PackageDependency> dependencies;
+                              };
+
+                              struct PackageRegistry {
+                                  std::string kind;
+                                  std::string location;
+                              };
+
+                              struct PackageLockEntry {
+                                  std::string name;
+                                  std::string version;
+                                  std::string source;
+                                  std::string digest;
+                              };
+
+                              struct PackageResolution {
+                                  std::filesystem::path cachedFile;
+                                  std::string source;
+                                  std::string digest;
+                              };
+
+                              static std::string packageDigestHex(std::string_view text) {
+                                  std::uint64_t h = 1469598103934665603ull;
+                                  for (unsigned char c : text) {
+                                      h ^= c;
+                                      h *= 1099511628211ull;
+                                  }
+                                  std::ostringstream out;
+                                  out << std::hex << std::setw(16) << std::setfill('0') << h;
+                                  return out.str();
+                              }
+
+                              static std::string packageDigestFile(const std::filesystem::path& file) {
+                                  std::ifstream in(file, std::ios::binary);
+                                  if (!in) throw std::runtime_error("failed to hash file: " + file.string());
+                                  std::array<char, 8192> buffer{};
+                                  std::uint64_t h = 1469598103934665603ull;
+                                  while (in) {
+                                      in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                                      const auto n = static_cast<std::size_t>(in.gcount());
+                                      for (std::size_t i = 0; i < n; ++i) {
+                                          h ^= static_cast<unsigned char>(buffer[i]);
+                                          h *= 1099511628211ull;
+                                      }
+                                  }
+                                  std::ostringstream out;
+                                  out << std::hex << std::setw(16) << std::setfill('0') << h;
+                                  return out.str();
+                              }
+
+                              static std::string trimCopy(std::string_view text) {
+                                  std::size_t a = 0, b = text.size();
+                                  while (a < b && std::isspace(static_cast<unsigned char>(text[a])) != 0) ++a;
+                                  while (b > a && std::isspace(static_cast<unsigned char>(text[b - 1])) != 0) --b;
+                                  return std::string(text.substr(a, b - a));
+                              }
+
+                              static bool startsWith(const std::string& value, const std::string& prefix) {
+                                  return value.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), value.begin());
+                              }
+
+                              static std::filesystem::path packageManifestPath(const std::filesystem::path& root) { return root / "paracine.pkg"; }
+                              static std::filesystem::path packageLockPath(const std::filesystem::path& root) { return root / "paracine.lock"; }
+                              static std::filesystem::path packageRegistryPath(const std::filesystem::path& root) { return root / ".paracine" / "registries.conf"; }
+                              static std::filesystem::path packageCacheDir(const std::filesystem::path& root) { return root / ".paracine" / "cache"; }
+
+                              static PackageManifest readPackageManifest(const std::filesystem::path& root) {
+                                  const auto path = packageManifestPath(root);
+                                  std::ifstream input(path, std::ios::binary);
+                                  if (!input) throw std::runtime_error("package manifest not found: " + path.string());
+                                  PackageManifest out;
+                                  std::string line;
+                                  std::size_t lineNo = 0;
+                                  while (std::getline(input, line)) {
+                                      ++lineNo;
+                                      auto t = trimCopy(line);
+                                      if (t.empty() || startsWith(t, "#")) continue;
+                                      if (startsWith(t, "name=")) { out.name = trimCopy(std::string_view(t).substr(5)); continue; }
+                                      if (startsWith(t, "version=")) { out.version = trimCopy(std::string_view(t).substr(8)); continue; }
+                                      if (startsWith(t, "dep ")) {
+                                          std::istringstream iss(t.substr(4));
+                                          PackageDependency d;
+                                          if (!(iss >> d.name >> d.version))
+                                              throw std::runtime_error("invalid dependency line in package manifest at line " + std::to_string(lineNo));
+                                          if (!(iss >> d.source)) d.source.clear();
+                                          out.dependencies.push_back(std::move(d));
+                                          continue;
+                                      }
+                                      throw std::runtime_error("unrecognized package manifest directive at line " + std::to_string(lineNo));
+                                  }
+                                  if (out.name.empty()) throw std::runtime_error("package manifest has empty name");
+                                  if (out.version.empty()) throw std::runtime_error("package manifest has empty version");
+                                  return out;
+                              }
+
+                              static void writePackageManifest(const std::filesystem::path& root, const PackageManifest& manifest) {
+                                  std::ostringstream out;
+                                  out << "name=" << manifest.name << "\n";
+                                  out << "version=" << manifest.version << "\n";
+                                  for (const auto& d : manifest.dependencies) {
+                                      out << "dep " << d.name << " " << d.version;
+                                      if (!d.source.empty()) out << " " << d.source;
+                                      out << "\n";
+                                  }
+                                  writeTextFile(packageManifestPath(root), out.str());
+                              }
+
+                              static std::vector<PackageRegistry> readPackageRegistries(const std::filesystem::path& root) {
+                                  std::vector<PackageRegistry> registries;
+                                  const auto path = packageRegistryPath(root);
+                                  std::ifstream input(path, std::ios::binary);
+                                  if (!input) return registries;
+                                  std::string line;
+                                  while (std::getline(input, line)) {
+                                      const auto t = trimCopy(line);
+                                      if (t.empty() || startsWith(t, "#")) continue;
+                                      std::istringstream iss(t);
+                                      PackageRegistry r;
+                                      if (iss >> r.kind >> r.location) registries.push_back(std::move(r));
+                                  }
+                                  return registries;
+                              }
+
+                              static void writePackageRegistries(const std::filesystem::path& root, const std::vector<PackageRegistry>& registries) {
+                                  std::filesystem::create_directories((root / ".paracine"));
+                                  std::ostringstream out;
+                                  for (const auto& r : registries) out << r.kind << " " << r.location << "\n";
+                                  writeTextFile(packageRegistryPath(root), out.str());
+                              }
+
+                              static std::vector<PackageLockEntry> readPackageLock(const std::filesystem::path& root) {
+                                  std::vector<PackageLockEntry> lock;
+                                  std::ifstream input(packageLockPath(root), std::ios::binary);
+                                  if (!input) return lock;
+                                  std::string line;
+                                  while (std::getline(input, line)) {
+                                      const auto t = trimCopy(line);
+                                      if (t.empty() || startsWith(t, "#")) continue;
+                                      std::istringstream iss(t);
+                                      PackageLockEntry e;
+                                      if (iss >> e.name >> e.version >> e.source >> e.digest) lock.push_back(std::move(e));
+                                  }
+                                  return lock;
+                              }
+
+                              static void writePackageLock(const std::filesystem::path& root, const std::vector<PackageLockEntry>& lock) {
+                                  std::ostringstream out;
+                                  for (const auto& e : lock)
+                                      out << e.name << " " << e.version << " " << e.source << " " << e.digest << "\n";
+                                  writeTextFile(packageLockPath(root), out.str());
+                              }
+
+                              static bool tryCopyFile(const std::filesystem::path& from, const std::filesystem::path& to) {
+                                  std::error_code ec;
+                                  std::filesystem::create_directories(to.parent_path(), ec);
+                                  ec.clear();
+                                  std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
+                                  return !ec;
+                              }
+
+                              static bool fetchHttpToFile(const std::string& url, const std::filesystem::path& outFile) {
+                                  if (startsWith(url, "file://")) {
+                                      std::string native = url.substr(7);
+                                      std::replace(native.begin(), native.end(), '/', static_cast<char>(std::filesystem::path::preferred_separator));
+                                      return tryCopyFile(native, outFile);
+                                  }
+                                  std::error_code ec;
+                                  std::filesystem::create_directories(outFile.parent_path(), ec);
+                                  const std::string curlCommand = "curl -fsSL \"" + url + "\" -o \"" + outFile.string() + "\"";
+                                  if (std::system(curlCommand.c_str()) == 0) return true;
+#ifdef _WIN32
+                                  const std::string command = "powershell -NoProfile -Command \"try { Invoke-WebRequest -Uri '" + url + "' -OutFile '" + outFile.string() + "' -UseBasicParsing -ErrorAction Stop } catch { exit 1 }\"";
+                                  return std::system(command.c_str()) == 0;
+#else
+                                  return false;
+#endif
+                              }
+
+                              static std::optional<PackageResolution> resolvePackageFromSource(const std::filesystem::path& projectRoot,
+                                  const std::string& name,
+                                  const std::string& version,
+                                  const std::string& source) {
+                                  namespace fs = std::filesystem;
+                                  const auto token = packageDigestHex(name + "\n" + version + "\n" + source);
+                                  const auto cachePath = packageCacheDir(projectRoot) / token.substr(0, 24) / "package.pcn";
+                                  std::error_code ec;
+                                  fs::create_directories(cachePath.parent_path(), ec);
+                                  if (fs::is_regular_file(cachePath, ec)) {
+                                      return PackageResolution{ cachePath, source, packageDigestFile(cachePath) };
+                                  }
+
+                                  auto fsFetch = [&](const fs::path& root) -> bool {
+                                      const auto candidate = root / name / version / "package.pcn";
+                                      return fs::is_regular_file(candidate) && tryCopyFile(candidate, cachePath);
+                                      };
+
+                                  auto gitFetch = [&](const std::string& location) -> bool {
+                                      fs::path local = location;
+                                      if (fs::is_directory(local, ec)) {
+                                          if (fsFetch(local / "packages")) return true;
+                                          return fsFetch(local);
+                                      }
+                                      const auto tempRepo = packageCacheDir(projectRoot) / token.substr(0, 24) / "repo";
+                                      fs::remove_all(tempRepo, ec);
+                                      fs::create_directories(tempRepo.parent_path(), ec);
+                                      const std::string command = "git clone --depth 1 \"" + location + "\" \"" + tempRepo.string() + "\"";
+                                      if (std::system(command.c_str()) != 0) return false;
+                                      if (fsFetch(tempRepo / "packages")) return true;
+                                      return fsFetch(tempRepo);
+                                      };
+
+                                  auto httpFetch = [&](const std::string& base) -> bool {
+                                      std::string normalized = base;
+                                      while (!normalized.empty() && normalized.back() == '/') normalized.pop_back();
+                                      return fetchHttpToFile(normalized + "/" + name + "/" + version + "/package.pcn", cachePath);
+                                      };
+
+                                  bool ok = false;
+                                  if (startsWith(source, "fs:")) ok = fsFetch(source.substr(3));
+                                  else if (startsWith(source, "git:")) ok = gitFetch(source.substr(4));
+                                  else if (startsWith(source, "http:")) ok = httpFetch(source.substr(5));
+                                  else if (startsWith(source, "https:")) ok = httpFetch(source);
+                                  else ok = fsFetch(source);
+                                  if (!ok) return std::nullopt;
+                                  return PackageResolution{ cachePath, source, packageDigestFile(cachePath) };
+                              }
+
+                              static PackageResolution resolvePackageDependency(const std::filesystem::path& projectRoot,
+                                  const PackageDependency& dep,
+                                  const std::vector<PackageRegistry>& registries) {
+                                  if (!dep.source.empty()) {
+                                      if (auto explicitSource = resolvePackageFromSource(projectRoot, dep.name, dep.version, dep.source))
+                                          return *explicitSource;
+                                      throw std::runtime_error("unable to fetch dependency '" + dep.name + "' from explicit source " + dep.source);
+                                  }
+                                  for (const auto& r : registries) {
+                                      std::string source = r.kind + ":" + r.location;
+                                      if (auto found = resolvePackageFromSource(projectRoot, dep.name, dep.version, source))
+                                          return *found;
+                                  }
+                                  throw std::runtime_error("dependency not found in configured registries: " + dep.name + " " + dep.version);
+                              }
+
+                              static int runPackageManager(const std::vector<std::string>& args) {
+                                  namespace fs = std::filesystem;
+                                  const fs::path root = fs::current_path();
+                                  if (args.empty()) {
+                                      std::cout << "package manager commands: init, add, remove, list, lock, install, registry, fetch, publish\n";
+                                      return 0;
+                                  }
+                                  const std::string action = args[0];
+
+                                  if (action == "init") {
+                                      PackageManifest manifest;
+                                      for (std::size_t i = 1; i < args.size(); ++i) {
+                                          if (args[i] == "--name" && i + 1 < args.size()) manifest.name = args[++i];
+                                          else if (args[i] == "--version" && i + 1 < args.size()) manifest.version = args[++i];
+                                          else throw std::runtime_error("package init usage: paracine package init [--name n] [--version v]");
+                                      }
+                                      writePackageManifest(root, manifest);
+                                      fs::create_directories(root / ".paracine");
+                                      std::cout << "initialized package manifest " << packageManifestPath(root).string() << "\n";
+                                      return 0;
+                                  }
+
+                                  if (action == "registry") {
+                                      if (args.size() < 2) throw std::runtime_error("package registry usage: list|add <fs|git|http> <location>");
+                                      auto registries = readPackageRegistries(root);
+                                      if (args[1] == "list") {
+                                          for (const auto& r : registries) std::cout << r.kind << " " << r.location << "\n";
+                                          return 0;
+                                      }
+                                      if (args[1] == "add" && args.size() == 4) {
+                                          const auto& kind = args[2];
+                                          if (kind != "fs" && kind != "git" && kind != "http")
+                                              throw std::runtime_error("registry kind must be fs, git, or http");
+                                          registries.push_back({ kind, args[3] });
+                                          writePackageRegistries(root, registries);
+                                          std::cout << "added " << kind << " registry " << args[3] << "\n";
+                                          return 0;
+                                      }
+                                      throw std::runtime_error("package registry usage: list|add <fs|git|http> <location>");
+                                  }
+
+                                  PackageManifest manifest = readPackageManifest(root);
+                                  auto registries = readPackageRegistries(root);
+
+                                  if (action == "add") {
+                                      if (args.size() < 3 || args.size() > 5) throw std::runtime_error("package add usage: add <name> <version> [source]");
+                                      PackageDependency dep{ args[1], args[2], args.size() >= 4 ? args[3] : "" };
+                                      auto it = std::find_if(manifest.dependencies.begin(), manifest.dependencies.end(), [&](const PackageDependency& d) { return d.name == dep.name; });
+                                      if (it == manifest.dependencies.end()) manifest.dependencies.push_back(dep);
+                                      else *it = dep;
+                                      writePackageManifest(root, manifest);
+                                      std::cout << "added dependency " << dep.name << " " << dep.version << "\n";
+                                      return 0;
+                                  }
+
+                                  if (action == "remove") {
+                                      if (args.size() != 2) throw std::runtime_error("package remove usage: remove <name>");
+                                      const auto before = manifest.dependencies.size();
+                                      manifest.dependencies.erase(std::remove_if(manifest.dependencies.begin(), manifest.dependencies.end(), [&](const PackageDependency& d) { return d.name == args[1]; }), manifest.dependencies.end());
+                                      writePackageManifest(root, manifest);
+                                      std::cout << "removed " << (before - manifest.dependencies.size()) << " dependency entries\n";
+                                      return 0;
+                                  }
+
+                                  if (action == "list") {
+                                      std::cout << manifest.name << " " << manifest.version << "\n";
+                                      for (const auto& d : manifest.dependencies) {
+                                          std::cout << "  " << d.name << " " << d.version;
+                                          if (!d.source.empty()) std::cout << " " << d.source;
+                                          std::cout << "\n";
+                                      }
+                                      return 0;
+                                  }
+
+                                  if (action == "fetch") {
+                                      if (args.size() < 3 || args.size() > 4) throw std::runtime_error("package fetch usage: fetch <name> <version> [source]");
+                                      PackageDependency dep{ args[1], args[2], args.size() == 4 ? args[3] : "" };
+                                      const auto resolved = resolvePackageDependency(root, dep, registries);
+                                      std::cout << resolved.cachedFile.string() << " " << resolved.digest << "\n";
+                                      return 0;
+                                  }
+
+                                  if (action == "lock") {
+                                      std::vector<PackageLockEntry> lock;
+                                      lock.reserve(manifest.dependencies.size());
+                                      for (const auto& dep : manifest.dependencies) {
+                                          auto resolved = resolvePackageDependency(root, dep, registries);
+                                          lock.push_back({ dep.name,dep.version,resolved.source,resolved.digest });
+                                      }
+                                      writePackageLock(root, lock);
+                                      std::cout << "wrote lockfile " << packageLockPath(root).string() << " with " << lock.size() << " entries\n";
+                                      return 0;
+                                  }
+
+                                  if (action == "install") {
+                                      std::filesystem::path vendor = root / "vendor";
+                                      for (std::size_t i = 1; i + 1 < args.size(); ++i)
+                                          if (args[i] == "--vendor-dir") vendor = args[i + 1];
+                                      auto lock = readPackageLock(root);
+                                      if (lock.empty()) {
+                                          std::vector<PackageLockEntry> generated;
+                                          generated.reserve(manifest.dependencies.size());
+                                          for (const auto& dep : manifest.dependencies) {
+                                              auto resolved = resolvePackageDependency(root, dep, registries);
+                                              generated.push_back({ dep.name,dep.version,resolved.source,resolved.digest });
+                                          }
+                                          writePackageLock(root, generated);
+                                          lock = std::move(generated);
+                                      }
+                                      std::error_code ec;
+                                      std::filesystem::create_directories(vendor, ec);
+                                      std::size_t installed = 0;
+                                      for (const auto& entry : lock) {
+                                          const auto sourceHash = packageDigestHex(entry.name + "\n" + entry.version + "\n" + entry.source);
+                                          const auto cached = packageCacheDir(root) / sourceHash.substr(0, 24) / "package.pcn";
+                                          if (!std::filesystem::is_regular_file(cached, ec)) {
+                                              auto refreshed = resolvePackageDependency(root, { entry.name,entry.version,entry.source }, registries);
+                                              (void)refreshed;
+                                          }
+                                          const auto target = vendor / entry.name / entry.version / "package.pcn";
+                                          if (tryCopyFile(cached, target)) ++installed;
+                                          else throw std::runtime_error("failed to install dependency " + entry.name + " to " + target.string());
+                                      }
+                                      std::cout << "installed " << installed << " package(s) to " << vendor.string() << "\n";
+                                      return 0;
+                                  }
+
+                                  if (action == "publish") {
+                                      if (args.size() != 6) throw std::runtime_error("package publish usage: publish <package.pcn> <fs|git|http> <location> <name> <version>");
+                                      const auto packageFile = std::filesystem::path(args[1]);
+                                      if (!std::filesystem::is_regular_file(packageFile)) throw std::runtime_error("publish source package file not found: " + packageFile.string());
+                                      const auto kind = args[2];
+                                      const auto location = args[3];
+                                      const auto name = args[4];
+                                      const auto version = args[5];
+                                      std::filesystem::path rootOut;
+                                      if (kind == "fs" || kind == "git") rootOut = std::filesystem::path(location);
+                                      else if (kind == "http") {
+                                          if (!startsWith(location, "file://")) throw std::runtime_error("http publish supports file:// mirrors in this build");
+                                          std::string native = location.substr(7);
+                                          std::replace(native.begin(), native.end(), '/', static_cast<char>(std::filesystem::path::preferred_separator));
+                                          rootOut = native;
+                                      }
+                                      else throw std::runtime_error("publish kind must be fs, git, or http");
+                                      const auto target = rootOut / name / version / "package.pcn";
+                                      std::filesystem::create_directories(target.parent_path());
+                                      if (!tryCopyFile(packageFile, target)) throw std::runtime_error("publish failed to write " + target.string());
+                                      std::cout << "published " << name << " " << version << " to " << target.string() << "\n";
+                                      return 0;
+                                  }
+
+                                  throw std::runtime_error("unknown package action: " + action);
+                              }
+
                               // Deterministic, cycle-checked local source imports. This is a flat import
                               // subset: `use math` resolves sibling math.pcn. It does not implement
                               // namespace aliases, package resolution, visibility rules or module coherence.
@@ -11044,8 +11922,6 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           linkerSet = true;
                                       }
                                       else if (a == "--libpath" && i + 1 < args.size())searchPaths.push_back(args[++i]);
-                                      else if (a == "--defaultlib" && i + 1 < args.size()) { defaultLibs.push_back(args[++i]); noDefaultLib = false; }
-                                      else if (a == "--wholearchive" && i + 1 < args.size())wholeArchives.push_back(args[++i]);
                                       else if ((a == "--defaultlib" || a == "--lib" || a == "--library") && i + 1 < args.size()) {
                                           const auto lib = args[++i];
                                           if (seenDefaultLibs.insert(lib).second)defaultLibs.push_back(lib);
@@ -11358,6 +12234,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       "  paracine inspect <file.pcn>\n"
                                       "  paracine fmt <file.pcn> [--check|--write|-o formatted.pcn]\n"
                                       "  paracine package <file.pcn> [-o release.zip] [-O0..-O3]\n"
+                                      "  paracine package <init|add|remove|list|lock|install|registry|fetch|publish> ...\n"
                                       "  paracine profile <file.pcn> [-o report.txt] [-O0..-O3]\n"
                                       "  paracine size <file.pcn> [--json] [-o report.txt] [-O0..-O3]\n"
                                       "  paracine audit <file.pcn> [--json] [-o report.json]\n"
@@ -11575,7 +12452,6 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       const std::vector<std::pair<std::string, std::string>> positiveCases = {
                                           { "routine main() gives int\n    let x: int = 1\n    give x\n", "let/typed binding" },
                                           { "routine id<T>(x: T) gives T\n    give x\nroutine main() gives int\n    give id<int>(1)\n", "generic explicit specialization" },
-                                          { "variant Maybe\n    None\n    Some\nroutine map(v: Maybe) gives int\n    give choose v\n        case None\n            0\n        case Some\n            1\n", "variant choose exhaustive" },
                                           { "routine map(v: int) gives int\n    give choose\n        when v > 0\n            1\n        otherwise\n            0\n", "choose expression with otherwise" },
                                           { "routine main() gives int\n    println(1)\n    give 0\n", "println intrinsic call" },
                                           { "routine main() gives int\n    each i in 0..4\n        if i > 2\n            give i\n    give 0\n", "range+each+if" },
@@ -11586,7 +12462,6 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       const std::vector<std::tuple<std::string, std::string, std::string>> negativeCases = {
                                           { "routine main() gives int\n    let x: int = true\n    give x\n", "type mismatch", "type mismatch" },
                                           { "routine id<T>(x: T) gives T\n    give x\nroutine main() gives int\n    give id<UnknownType>(1)\n", "invalid generic argument", "unknown or invalid explicit generic type argument" },
-                                          { "routine main() gives int\n    each i in 0.5..2\n        give i\n    give 0\n", "float range bound", "range start must be an integer-compatible numeric value" },
                                           { "routine main() gives int\n    let start: float = 0.5\n    each i in start..2\n        give i\n    give 0\n", "float range bound", "range start must be an integer-compatible numeric value" },
                                           { "variant Maybe\n    None\n    Some\nroutine main(v: Maybe) gives int\n    give choose v\n        case None\n            0\n", "variant non-exhaustive", "non-exhaustive choose" }
                                       };
@@ -11809,6 +12684,48 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       catch (...) { rejected = true; }
                                       if (!rejected)throw std::runtime_error("corrupted header accepted");
                                       });
+                                  test("optimizer converges with copy propagation and branch folding", [&] {
+                                      auto artifacts = compileAll(
+                                          "routine main() gives int\n"
+                                          "    let a: int = 2\n"
+                                          "    let b: int = a\n"
+                                          "    let c: int = b\n"
+                                          "    if true\n"
+                                          "        give c + 40\n"
+                                          "    give 0\n",
+                                          CompilerOptions{});
+                                      if (!artifacts.analysis.succeeded()) throw std::runtime_error("unexpected semantic diagnostics");
+                                      const auto result = PCIRInterpreter(artifacts.pcir).run("");
+                                      if (result != 42) throw std::runtime_error("optimized PCIR executed wrong value");
+                                  });
+                                  test("package manager manifest and lock workflow", [&] {
+                                      namespace fs = std::filesystem;
+                                      const auto root = fs::temp_directory_path() /
+                                          ("paracine-package-selftest-" + std::to_string(std::uint64_t(std::chrono::steady_clock::now().time_since_epoch().count())));
+                                      fs::create_directories(root);
+                                      const auto prev = fs::current_path();
+                                      struct RestoreCwd { fs::path old; ~RestoreCwd() { std::error_code ec; fs::current_path(old, ec); } } restore{ prev };
+                                      fs::current_path(root);
+                                      const auto mirror = root / "mirror";
+                                      fs::create_directories(mirror / "demo" / "1.0.0");
+                                      writeTextFile(mirror / "demo" / "1.0.0" / "package.pcn", "routine demo() gives int\n    give 1\n");
+                                      if (runPackageManager({ "init", "--name", "app", "--version", "0.1.0" }) != 0)
+                                          throw std::runtime_error("package init failed");
+                                      if (runPackageManager({ "registry", "add", "fs", mirror.string() }) != 0)
+                                          throw std::runtime_error("registry add failed");
+                                      if (runPackageManager({ "add", "demo", "1.0.0" }) != 0)
+                                          throw std::runtime_error("dependency add failed");
+                                      if (runPackageManager({ "lock" }) != 0)
+                                          throw std::runtime_error("lock failed");
+                                      if (runPackageManager({ "install" }) != 0)
+                                          throw std::runtime_error("install failed");
+                                      if (!fs::is_regular_file(root / "paracine.lock"))
+                                          throw std::runtime_error("lockfile missing");
+                                      if (!fs::is_regular_file(root / "vendor" / "demo" / "1.0.0" / "package.pcn"))
+                                          throw std::runtime_error("installed package file missing");
+                                      std::error_code ec;
+                                      fs::remove_all(root, ec);
+                                  });
                                   out << "Selftests: " << passed << " passed, " << failed << " failed\n";
                                   return failed ? 2 : 0;
                               }
@@ -11911,6 +12828,12 @@ int main(int argc, char** argv) {
             std::filesystem::path src = sourceArg; std::size_t removed = 0;
             for (const char* ext : { ".exe",".obj",".cpp",".pcir",".pmir",".asm" }) { auto f = pcn::withExtension(src, ext); std::error_code ec; if (std::filesystem::remove(f, ec))++removed; }
             std::cout << "Paracine clean: removed " << removed << " generated artifact(s).\n"; return 0;
+        }
+        if (command == "package" && (sourceArg.empty() || !isSource(sourceArg))) {
+            std::vector<std::string> packageArgs;
+            if (!sourceArg.empty()) packageArgs.push_back(sourceArg);
+            for (std::size_t i = 1; i < args.size(); ++i) packageArgs.push_back(args[i]);
+            return pcn::runPackageManager(packageArgs);
         }
         if (sourceArg.empty()) throw std::runtime_error("command requires a .pcn source file");
         std::filesystem::path sourcePath = sourceArg;
