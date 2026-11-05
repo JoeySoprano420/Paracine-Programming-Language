@@ -12,6 +12,10 @@ Canonical Tier-1 target: Windows x86-64 Canonical external ABI: Microsoft x64 AB
 
 This document completes and freezes the Paracine Language Specification and Paracine Backend Specifications.
 
+Normative revision: Structured Loop Completion — November 5, 2026.
+
+This revision incorporates "for ... while ...", "from ... to ...", and "continue until ..." into the normative grammar and semantics. It replaces the preceding freeze definition and establishes the loop-completed edition-2026 baseline. The frozen-edition change policy below applies to this revised baseline.
+
 Where this document conflicts with an earlier "[Decision]", "[Verify]", open issue, tentative statement, incomplete backend clause, or wording that implied C++20 was structurally necessary to Paracine, this document is authoritative.
 
 All earlier provisions not changed here remain in force.
@@ -106,7 +110,16 @@ Every former design question is resolved as follows.
 
 ID| Final resolution R1| Indentation is exactly four spaces. Tabs remain forbidden for structural indentation. R2| Layout tokenization is purely lexical and does not depend on parser knowledge. R3| "text" is an immutable borrowed UTF-8 slice. "string" is its owning counterpart. R4| Paracine 1.0 supports zero-allocation capturing closures as statically typed, monomorphized closure values. R5| Ordinary routine pointers remain environment-free. A noncapturing closure may coerce to a routine pointer. R6| There are no implicit numeric conversions. Contextual literal fitting remains allowed. R7| Capability satisfaction remains structural by name/signature with deterministic lookup. Associated types are not part of edition 2026. R8| Record fields remain in declaration order. The compiler never silently reorders them. R9| Integer "+", "-", "*", and unary negation use defined modular two's-complement semantics. R10| Shift counts are reduced modulo operand width. R11| Signed "MIN / -1 = MIN"; "MIN % -1 = 0". R12| Default routine parameters are shared borrows; "var" is exclusive borrowing; "own" transfers ownership. R13| Explicit lifetime parameters do not exist in edition 2026. Borrow regions are inferred and nonlexical. R14| "@from(...)" remains the explicit returned-borrow disambiguator. R15| Traps terminate the process. They do not unwind Paracine scopes and are not catchable exceptions. R16| Thread traps obey the same terminal-trap model. The former recoverable "thread_panic" model is removed. R17| "give" automatically wraps values into "ok" or "some" where required by the declared result type. R18| "fail" automatically produces "err". R19| Floating contraction and reassociation remain disabled outside "@fastmath". R20| Default hash maps use process-randomized hashing. Stable deterministic hashing remains separately available. R21| Allocating growth operations are fallible. Convenience constructors may trap on OOM while retaining "try_" forms. R22| The import graph remains acyclic. R23| Visibility remains private / public / export. R24| "vec<T,N>" remains a compiler-defined exception to the no-user-operator rule. R25| One source file defines one module, and its path must agree with its module name. R26| General textual/preprocessor macros do not exist in edition 2026. R27| User procedural macros do not exist in edition 2026. Built-in "@derive" is the declaration-generation mechanism. R28| Async/await is not a language construct in edition 2026. Structured threads, synchronization, channels and nonblocking APIs form the concurrency model. R29| Windows x86-64 is the only mandatory direct-native Paracine 1.0 target. Additional platforms may be reached by future direct-native profiles or by the optional C++20 exporter. R30| Index disjointness is conservative unless statically proved or established through a disjointness primitive such as "split_at". R31| Associated types are deliberately excluded. Multi-parameter capabilities are canonical. R32| Trap cleanup is deliberately absent. Recoverable failure uses "result<T,E>" and "option". R33| Build-time metaprogramming uses const evaluation and explicit build-tool steps rather than arbitrary compiler-executed scripts. R34| Nullable "raw" is not guaranteed to use null niche optimization inside "option<raw>". R35| Safe "view", "span", "text" and empty "buffer" values use canonical non-null sentinels, enabling guaranteed null niches for their optional forms. R36| "raw" parameter mode is legal only when raw authority actually exists in the parameter type. R37| Tier-1 unwind information uses the Windows x64 unwind representation implemented and verified by Paracine. R38| PDB emission is a native tooling facility and not part of language-semantic equivalence. R39| Production executables use ASLR-compatible relocation, high-entropy VA and NX compatibility by default. R40| Control Flow Guard is enabled only when complete guard metadata is successfully emitted. R41| Reproducible builds contain no uncontrolled wall-clock timestamps. R42| Native executable linking is complete within Paracine. R43| C++20 generation is not required for a conforming native Paracine compiler. R44| ".obj" and ".exe" are Paracine's primary Tier-1 production realizations. R45| C++20 ".cpp" generation is an optional portability/export subsystem branching from optimized PCIR. R46| Absence of the C++20 exporter does not make a Paracine compiler incomplete. R47| Semantic Analysis is deterministic and authoritative. R48| Structural Analysis identifies computational form but does not change program meaning. R49| Stylometric Analysis is optional, local and advisory. It can suggest but cannot establish semantic truth. R50| Every optimization remains subject to independent semantic proof regardless of stylometric suggestion. R51| Stylometry cannot determine validity, type resolution, overload resolution, ownership, alias legality, synchronization legality, arithmetic meaning or unsafe correctness. R52| Paracine stylometry is not an authorship-identification facility. R53| The compiler may maintain a project-local Semantic-Stylometric Fingerprint, but it is not part of language semantics. R54| Default reproducible production builds do not permit unpinned stylometric state to alter emitted machine code. R55| Style-guided optimization is explicit and, when enabled, its exact profile hash becomes a declared build input.
 
-These resolutions are frozen for edition 2026.
+R56| "for pattern in iterable while condition" is guarded iteration that stops at the first false guard after binding the candidate and before entering its body.
+R57| "from index = first to last" is inclusive integer iteration with a fixed direction of +1 or -1, one-time left-to-right bound evaluation, and endpoint testing before any advance.
+R58| "continue until condition" introduces a post-test loop: its body executes before each condition test, false repeats, and true exits.
+R59| A continue jump targets next-candidate acquisition for a for loop, endpoint testing for a from loop, and post-test evaluation for a continue-until loop; normal cleanup precedes the target operation.
+R60| Loop conditions require bool. From-loop bounds require the same built-in integer type with no implicit numeric conversion; the induction binding is immutable and local to each body iteration.
+R61| "to" and "until" are reserved keywords. A continue jump and a continue-until compound statement are distinguished by the next token without changing lexical layout rules.
+R62| Structured loops lower through verified PCIR and PMIR to direct native code. Their control mechanism introduces no mandatory allocation or runtime scheduler and does not depend on the optional C++20 exporter.
+R63| Structured-loop semantics, integer-boundary handling, labels, cleanup, ownership, effect inference, and backend equivalence are mandatory conformance requirements.
+
+These resolutions are frozen for the revised edition-2026 baseline.
 
 Corrected Lexical and Layout Definition
 3.1 Source normalization
@@ -225,7 +238,7 @@ At EOF, emit one final "NEWLINE" if necessary and enough "DEDENT" tokens to rest
 Final Reserved Vocabulary
 Edition 2026 keywords are:
 
-abi alias alloc and as break capability choose const continue defer else export fail false for foreign from give gives if import in io is let loop module move not nothing or own public pure raw record return_ routine static test then thread trap true try unsafe var variant when where while with yield_
+abi alias alloc and as break capability choose const continue defer else export fail false for foreign from give gives if import in io is let loop module move not nothing or own public pure raw record return_ routine static test then thread to trap true try unsafe until var variant when where while with yield_
 
 "return_" and "yield_" are reserved without edition-2026 semantics.
 
@@ -260,9 +273,9 @@ E0208 illegal ellipsis
 Corrected Statement Grammar
 statement = simple_statement NEWLINE | compound_statement ;
 
-simple_statement = let_stmt | var_stmt | assign_stmt | expr_stmt | give_stmt | fail_stmt | break_stmt | continue_stmt ;
+simple_statement = let_stmt | var_stmt | assign_stmt | expr_stmt | give_stmt | fail_stmt | break_stmt | continue_stmt | defer_stmt ;
 
-compound_statement = if_stmt | choose_stmt | loop_stmt | while_stmt | for_stmt | defer_block | unsafe_block ;
+compound_statement = if_stmt | choose_stmt | loop_stmt | while_stmt | for_stmt | from_stmt | continue_until_stmt | defer_block | unsafe_block ;
 
 block = NEWLINE INDENT statement { statement } DEDENT ;
 
@@ -280,11 +293,318 @@ loop_stmt = [ label ':' ] 'loop' block ;
 
 while_stmt = [ label ':' ] 'while' expr block ;
 
-for_stmt = [ label ':' ] 'for' [ 'var' ] pattern 'in' expr block ;
+for_stmt = [ label ':' ] 'for' [ 'var' ] pattern 'in' expr [ 'while' expr ] block ;
+
+from_stmt = [ label ':' ] 'from' identifier [ ':' type ] '=' expr 'to' expr block ;
+
+continue_until_stmt = [ label ':' ] 'continue' 'until' expr block ;
+
+The 'type' in a from_stmt is restricted semantically to a built-in integer type. The expressions following 'while' and 'until' must resolve to bool.
+
+At the current delimiter nesting level, the reserved 'while' token ends a for-loop iterable expression, and the reserved 'to' token separates the two from-loop bound expressions. These rules introduce no textual macro or parser-dependent indentation behavior.
 
 Labeled jumps therefore use:
 
-break @outer continue @scan
+break @outer
+continue @scan
+
+The sequence 'continue until' introduces a compound statement, not a continue jump. Its indented block is required. Bare 'continue' and 'continue @label' retain their existing jump meanings.
+
+The simple-statement alternatives explicitly include the already-defined expression form of defer, so loop cleanup examples follow the statement grammar.
+
+Structured Loop Completion — For ... While / From ... To / Continue ... Until
+
+These are normative structured statements in edition 2026. Source spelling is lowercase:
+
+for ... while ...
+from ... to ...
+continue until ...
+
+The dots above mark explanatory placeholders. They are not source tokens and do not authorize use of the reserved ellipsis token in loop headers.
+
+All three forms use the existing four-space block syntax. Their behavior is resolved by the semantic frontend and represented in PCIR. They require no loop-specific allocation, closure object, scheduler, foreign compiler, or C++ export step. Operations written in their expressions and bodies retain their ordinary allocation, ownership, effect, and failure behavior.
+
+Loop Form Summary
+
+for item in items while condition
+    Iterates through items and stops at the first false condition. The condition is checked after binding each candidate and before its body executes.
+
+from index = first to last
+    Visits both integer endpoints, moving by one toward last. Equal endpoints produce one iteration. Descending bounds count downward automatically.
+
+continue until condition
+    Executes the body, then checks condition. False repeats; true finishes. Reaching the loop normally executes its body at least once.
+
+For ... While — Guarded Iteration
+
+Canonical syntax:
+
+for pattern in iterable while condition
+    statements
+
+The existing mutable-pattern form remains available:
+
+for var pattern in mutable_iterable while condition
+    statements
+
+The existing unguarded "for ... in ..." form remains valid. The optional "while" clause adds a stopping guard to that form.
+
+Execution order is exact:
+
+1. Evaluate the iterable expression once and obtain its iterator under the existing iterator rules.
+2. Request the next candidate.
+3. If the iterator is exhausted, finish without evaluating the guard.
+4. Bind the candidate to the pattern.
+5. Evaluate the guard exactly once for this candidate. Its type must be bool.
+6. If false, perform normal cleanup of the candidate and iterator state and finish the loop.
+7. If true, execute the body.
+8. On ordinary body completion, perform iteration cleanup and request the next candidate.
+
+The guard may refer to names bound by the pattern and to names visible in the enclosing scope. It cannot refer to declarations introduced only inside the body.
+
+The first candidate that fails the guard has already been obtained from the iterator. Its body does not execute; the candidate is not put back. Later candidates are not requested. If an externally retained iterator is resumable under its normal borrowing rules, its position reflects that candidate acquisition.
+
+This is a stopping guard. It does not skip a rejected candidate and resume searching. Per-element selection uses an explicit body condition or an iterator filter.
+
+"for var" retains the existing exclusive-borrow requirements. A guard does not create permission to mutate a shared iterable, overlap exclusive borrows, or keep a borrowed item alive across an incompatible iterator advance.
+
+An ordinary "continue" targeting this loop performs iteration cleanup and advances to the next candidate. It does not test the current candidate again. The guard is evaluated when the next candidate has been bound.
+
+An ordinary "break" targeting this loop performs normal cleanup and exits without requesting another candidate or evaluating another guard.
+
+Example:
+
+routine sum_before_limit(values: view<int>, limit: int) gives int
+    var total: int = 0
+
+    for value in values while value < limit
+        total += value
+
+    give total
+
+For the input values 2, 4, 9, 1 with limit 8, the body sees 2 and 4. The result is 6. The value 9 stops the loop; the later value 1 is not visited.
+
+From ... To — Inclusive Directed Integer Iteration
+
+Canonical syntax:
+
+from index = first to last
+    statements
+
+An explicit induction type may be supplied:
+
+from index: int = first to last
+    statements
+
+"index" is a fresh immutable loop binding. It is in scope only within the body. Each iteration introduces that iteration's binding; assigning to it is an error. Ordinary copying, borrowing, and closure-capture rules apply.
+
+The induction type must be one of Paracine's built-in signed or unsigned integer types, including size and ssize. bool, char, floating-point types, raw pointers, and user records are not induction types.
+
+Both bounds must resolve to the same induction type. An explicit type provides context for literal fitting. Without an explicit type, ordinary expression inference and contextual literal fitting select the common integer type. No implicit numeric conversion is introduced. Differently typed nonliteral bounds require an explicit conversion.
+
+Execution order is exact:
+
+1. Evaluate first once.
+2. Evaluate last once, after first.
+3. Save both values using their resolved integer type.
+4. Choose an ascending direction if first < last, a descending direction if first > last, or a single iteration if they are equal.
+5. Bind the current value and execute the body.
+6. After normal body cleanup, compare the current value with the saved endpoint.
+7. If equal, finish immediately.
+8. Otherwise, advance by exactly one toward the endpoint and execute the next iteration.
+
+Both endpoints are included. "from index = 3 to 1" visits 3, 2, 1. It is not an empty range. A zero-iteration requirement must be expressed with an explicit condition or an appropriate existing iterator.
+
+The direction and endpoint do not change if the source variables used to compute the bounds are later modified. No bound expression is reevaluated by the loop.
+
+Completion is tested before advancing. The loop never forms MAX + 1 after its final ascending iteration or MIN - 1 after its final descending iteration. The unsigned zero endpoint is handled by the same rule.
+
+The loop does not require computing last - first, an absolute difference, or an iteration count in the induction type. Traversing a signed range across zero therefore introduces no hidden overflow or implicit conversion. This rule does not change the language's modular arithmetic for explicit source operations.
+
+An ordinary "continue" targeting this loop performs iteration cleanup and reaches the endpoint test. At the final endpoint it exits; otherwise it advances once toward the saved endpoint.
+
+An ordinary "break" targeting this loop performs normal cleanup and exits without advancing.
+
+No step keyword or implicit arbitrary stride is defined by this form. The progression is exactly +1 or -1 as selected above. Other progressions use existing iterator APIs or explicit "while" logic.
+
+Examples:
+
+routine ascending_sum() gives int
+    var total: int = 0
+
+    from index: int = 1 to 5
+        total += index
+
+    give total
+
+The result is 15.
+
+routine descending_digits() gives int
+    var digits: int = 0
+
+    from digit: int = 3 to 1
+        digits = digits * 10 + digit
+
+    give digits
+
+The result is 321.
+
+routine equal_endpoint_count() gives int
+    var count: int = 0
+
+    from index: int = 7 to 7
+        count += 1
+
+    give count
+
+The result is 1.
+
+Continue ... Until — Post-Test Repetition
+
+Canonical syntax:
+
+continue until condition
+    statements
+
+This is a standalone compound statement. It may introduce a loop even when there is no enclosing loop. Its header condition is evaluated after the body.
+
+Execution order is exact:
+
+1. Enter the body without evaluating condition.
+2. Execute the body.
+3. On ordinary body completion, execute normal cleanup for the completed iteration.
+4. Evaluate condition exactly once. Its type must be bool.
+5. If true, finish.
+6. If false, begin the next iteration.
+
+When reached through normal control flow, the body executes at least once, including when the condition would have been true before entry. A terminal trap or an explicit control transfer can prevent completion of that first body.
+
+The condition resolves names in the enclosing lexical scope. Body-local declarations are outside its scope. Every path that reaches the condition must leave each referenced place initialized and legally usable. State needed by the condition is normally declared before the loop and updated by the body.
+
+An ordinary "continue" targeting this loop performs iteration cleanup and then evaluates the condition. It does not jump directly to the next body entry and bypass the test.
+
+An ordinary "break" targeting this loop performs normal cleanup and exits without evaluating the condition.
+
+Example:
+
+routine count_to_three() gives int
+    var count: int = 0
+
+    continue until count >= 3
+        count += 1
+
+    give count
+
+The result is 3.
+
+Example showing "continue" reaching the post-test:
+
+routine post_test_continue() gives int
+    var count: int = 0
+
+    continue until count >= 3
+        count += 1
+        continue
+
+    give count
+
+The result is 3. The condition is tested after each "continue".
+
+The construct performs sequential repetition. Any waiting, sleeping, yielding through a library, synchronization, or OS event processing must be explicitly provided by operations in its expressions or body.
+
+Loop Labels and Statement Disambiguation
+
+Each new form accepts the existing loop-label prefix:
+
+@scan: for value in values while value >= 0
+    statements
+
+@count: from index: int = 0 to 9
+    statements
+
+@retry: continue until finished
+    statements
+
+"statements" in these three header illustrations is a placeholder, not a language keyword.
+
+"break @label" exits the targeted enclosing loop. "continue @label" transfers to that loop's continuation point:
+
+for ... while ... : iteration cleanup, then next candidate acquisition
+from ... to ... : iteration cleanup, then endpoint test and possible advance
+continue until ... : iteration cleanup, then the post-test condition
+
+Labels must resolve to an enclosing loop. A jump cannot enter a loop, select a sibling loop, or cross a routine or closure boundary. Intervening scopes receive normal cleanup.
+
+The token immediately following "continue" determines the statement form:
+
+until : parse the compound "continue until" loop and require its condition and indented block
+@ : parse a labeled continue jump
+NEWLINE : parse an unlabeled continue jump
+
+No other "continue expression" form is introduced. Bare "continue" outside a loop remains an error. "continue until condition" outside a loop is valid because it introduces its own loop.
+
+"to" and "until" are reserved lowercase keywords. "from" was already reserved. The existing "@from(...)" returned-borrow attribute retains its meaning.
+
+Layout tokenization remains purely lexical. It does not inspect loop meaning. The parser recognizes these headers and consumes their ordinary NEWLINE / INDENT / DEDENT blocks.
+
+Ownership, Cleanup, Effects, and Failure
+
+The new forms use the existing ownership and nonlexical-region rules. They create no exemption for escaping borrows, shared/exclusive aliasing, moves, thread safety, or initialization.
+
+On ordinary iteration completion, continue, break, give, fail, or propagated recoverable failure, cleanup runs for every scope actually exited. Registered defers execute under the existing scope-exit rules before the targeted loop continuation point is reached.
+
+For "continue until", body-scope cleanup precedes the condition test, so a defer that changes enclosing state is observable by that test. Inner scopes crossed by a labeled jump are also cleaned before the target's test or advance.
+
+Loop-owned iterator state is cleaned on normal loop exit. Owned values and temporaries associated with guards and bounds follow the same normal expression and scope rules. An item rejected by a "for ... while" guard is cleaned even though its body never ran.
+
+Terminal traps retain the final failure model: they terminate the process without unwinding, defer, or disposal. A trap in a bound, iterator operation, guard, body, cleanup operation, or post-test is not converted into a loop result.
+
+The inferred effect set is the union of effects required by iterable acquisition, iterator advancement, guards, bounds, post-test conditions, body statements, and cleanup. A loop header is not implicitly pure. The induction mechanism itself requires no allocation and introduces no overflow trap.
+
+A condition must have type bool. There is no implicit numeric truthiness. A false "for ... while" guard stops; a true "continue until" condition stops. Side-effect order follows the execution rules above.
+
+Compiler and Backend Completion for Structured Loops
+
+SAGE Semantic Analysis resolves loop bindings, expression types, ownership, effects, initialization, labels, and precise break/continue targets. The SKM records the resulting facts.
+
+Structural Analysis may classify guarded iterators, directed integer inductions, and post-test loops. Stylometric suggestions cannot select a different stopping condition, change endpoint inclusion, infer a different direction, or authorize an invalid jump.
+
+PCIR represents the verified control flow with explicit entry, test, body, continuation, and exit edges as applicable. Iterator advancement, guard evaluation, endpoint comparison, cleanup, and post-test evaluation have explicit sequencing. Synthetic induction values are ordinary defined values; no poison or undefined sentinel is introduced.
+
+The PCIR verifier checks that a "for ... while" continuation advances before testing the next bound candidate; a "from ... to" continuation tests completion before advancing; and a "continue until" continuation reaches its post-test. A break edge bypasses the corresponding next-iteration work. On each normal exit or jump path, all cleanup required for that path completes before its destination is reached.
+
+PMIR and the direct native backend lower those verified edges to ordinary branches, comparisons, and integer operations. The constructs need no new public ABI, object format, DLL contract, or runtime scheduler.
+
+Optimization may remove, fuse, unroll, or vectorize loop work only after proving semantic equivalence. It preserves iterator consumption, one-time bound evaluation, guard effects, inclusive endpoints, normal cleanup, post-test entry behavior, trap order, and the targets of labeled jumps.
+
+If present, the optional C++20 exporter preserves the same behavior. It may use generated loop structures or reconstructed control flow. It must not implement an inclusive integer loop by unconditionally incrementing after its final endpoint, or implement "continue until" with a jump that bypasses its condition or required cleanup.
+
+All forms are eligible for const evaluation when every executed operation is otherwise const-legal. Const-evaluation step limits remain enforced; the syntax creates no exemption for nontermination or excessive work.
+
+Structured Loop Conformance Requirements
+
+Mandatory frontend cases cover each form with and without labels, guarded and unguarded "for" loops, mutable iterator bindings, nested loops, bare and labeled continue jumps, and disambiguation between a continue jump and a "continue until" compound statement.
+
+Mandatory semantic cases include:
+
+1. Empty guarded iterator: zero guard evaluations and zero body executions.
+2. Initially false iterator guard: one candidate acquisition, one guard evaluation, zero body executions, normal candidate cleanup, and no later candidate request.
+3. Candidate-dependent guard: 2, 4, 9, 1 under "value < 8" visits 2, 4 only.
+4. Inclusive ascending range: 1 to 3 visits 1, 2, 3.
+5. Inclusive descending range: 3 to 1 visits 3, 2, 1.
+6. Equal endpoints: 7 to 7 executes once.
+7. One-time bounds: bound-side effects occur once each, left to right; later source-variable mutation does not change the saved bounds.
+8. Integer limits: ascending completion at MAX, descending completion at MIN, unsigned descent to zero, and "continue" on the final endpoint introduce no extra advance or overflow.
+9. Post-test entry: a condition already true before entry still permits one body execution when that body falls through normally.
+10. Post-test continue: every targeted continue reaches the condition after normal cleanup; true exits and false repeats.
+11. Break and recoverable routine exits: required cleanup runs, while bypassed guards and post-tests do not run.
+12. Nested labeled jumps: intervening cleanup executes and the targeted loop's own continuation rule is used.
+13. Defer ordering: a body defer that updates enclosing state is visible to a "continue until" test.
+14. Rejected programs: non-bool conditions, noninteger or mismatched range bounds, assignment to the immutable induction binding, out-of-scope condition names, invalid labels, invalid borrows, and malformed blocks produce diagnostics.
+15. Trap behavior: traps in loop operations retain process termination and no-unwind semantics; optimizations preserve preceding observable effects.
+
+The mandatory native semantic oracle compares these cases between the PCIR reference interpreter and direct native execution. When the optional C++20 exporter is installed, its differential suite includes the same loop behavior.
+
 
 Completed Top-Level Grammar
 item_body = routine_decl | record_decl | variant_decl | alias_decl | const_decl | static_decl | thread_static_decl | capability_decl | foreign_decl | test_decl ;
@@ -842,7 +1162,7 @@ It is authoritative.
 
 It resolves:
 
-identifiers modules imports types literal types overloads generic arguments capability satisfaction ownership moves borrows borrow regions effects closure captures constants layouts result propagation control-flow reachability initialization state aliasing facts unsafe boundaries FFI compatibility
+identifiers modules imports types literal types overloads generic arguments capability satisfaction ownership moves borrows borrow regions effects closure captures constants layouts result propagation control-flow reachability initialization state aliasing facts unsafe boundaries FFI compatibility loop bindings guarded-iterator stopping conditions inclusive integer progression post-test conditions loop-label resolution break/continue targets
 
 No later heuristic system may override a resolved semantic fact.
 
@@ -858,7 +1178,7 @@ SKM
 
 The SKM may contain:
 
-symbol identities resolved types generic substitutions capability resolutions ownership graph borrow-region graph effect graph closure-capture graph constant facts range facts initialization lattice alias facts source spans public/private visibility known layout facts known call relationships
+symbol identities resolved types generic substitutions capability resolutions ownership graph borrow-region graph effect graph closure-capture graph constant facts range facts initialization lattice alias facts source spans public/private visibility known layout facts known call relationships loop-continuation edges directed-induction facts saved-bound identities cleanup-before-test relationships
 
 The SKM is compiler-internal.
 
@@ -876,7 +1196,7 @@ Structural Analysis answers:
 
 It may classify:
 
-reduction loops map/filter chains sentinel loops state machines lookup-table patterns arena-allocation phases hot/cold branch patterns invariant initialization data-parallel loops serialization passes deserialization passes validation pipelines producer/consumer loops accumulators search loops finite-state dispatch resource-acquisition sequences
+reduction loops guarded iteration inclusive ascending/descending integer loops post-test loops map/filter chains sentinel loops state machines lookup-table patterns arena-allocation phases hot/cold branch patterns invariant initialization data-parallel loops serialization passes deserialization passes validation pipelines producer/consumer loops accumulators search loops finite-state dispatch resource-acquisition sequences
 
 Structural Analysis operates from semantic facts, not textual guesswork alone.
 
@@ -1205,6 +1525,10 @@ magic major version minor version type table layout table symbol table functions
 
 SAGE advisory state is not serialized into semantic PCIR unless converted into independently proven facts.
 
+28.7 Structured loop control flow
+
+The structured-loop forms are resolved before PCIR construction. Their verified control-flow graphs preserve candidate acquisition before a for-while guard, saved inclusive bounds and completion-before-advance for from-to iteration, and body-before-test execution for continue-until repetition. Normal cleanup precedes continuation operations. Break and continue edges retain their resolved label targets.
+
 Optimizer Completion
 29.1 Determinism
 
@@ -1251,6 +1575,10 @@ In advisory mode, stylometry cannot alter optimization output.
 In guided mode, SAGE may prioritize optimization investigations.
 
 It may never waive optimizer legality conditions.
+
+29.7 Structured loop preservation
+
+Loop transformations preserve the Structured Loop Completion contract, including guard evaluation and iterator consumption, one-time bound evaluation, endpoint inclusion and direction, absence of hidden endpoint overflow, post-test entry behavior, cleanup order, effects, trap order, and labeled jump destinations. Instruction-count or performance estimates never authorize weakening those semantics.
 
 PMIR Completion and Corrections
 30.1 Windows unwind model
@@ -1849,6 +2177,10 @@ C++20 atomics use explicit corresponding memory orders.
 
 "thread var" lowers to suitable "thread_local" storage under the same edition-2026 trivial-destruction constraints.
 
+72.10 Structured loops
+
+The exporter preserves guarded for iteration, inclusive directed from-to iteration, and post-test continue-until repetition. Generated control flow retains one-time left-to-right bound evaluation, candidate consumption, cleanup and jump behavior. It tests inclusive completion before advancing at integer extremes and directs a continue-until continuation through its post-test. No C++ signed-overflow assumption or control-flow reconstruction may change these rules.
+
 Optional Cross-Backend Differential Validation
 If the optional C++20 exporter is installed, Paracine should use it as an additional validation oracle.
 
@@ -1934,7 +2266,7 @@ Ambiguity is resolved or diagnosed at the use site.
 Const Evaluation Completion
 Const evaluation supports:
 
-pure arithmetic records variants arrays bounded loops pure routine calls const generics supported const text operations
+pure arithmetic records variants arrays bounded loops (including const-legal for-while, from-to, and continue-until forms that complete within configured evaluation limits) pure routine calls const generics supported const text operations
 
 It cannot use:
 
@@ -2137,6 +2469,10 @@ Frontend
 
 normalization layout grammar name resolution modules overloads generics closures capabilities effects const evaluation
 
+Structured Loops
+
+All cases in Structured Loop Conformance Requirements are mandatory, including guarded iterator exhaustion and first-false behavior; inclusive ascending, descending and equal endpoints; saved bounds; signed and unsigned limits; post-test entry; break/continue disambiguation; nested labeled jumps; cleanup-before-test ordering; and rejection of invalid types, borrows and labels.
+
 SAGE Semantic Core
 
 semantic resolution determinism SKM correctness ownership facts borrow facts effect facts closure capture facts alias facts structural-model consistency
@@ -2201,11 +2537,11 @@ The canonical implementation strategy is native-first.
 
 Phase 1
 
-UTF-8 normalization lexer layout engine parser typed syntax basic diagnostics
+UTF-8 normalization lexer layout engine parser typed syntax basic diagnostics structured-loop grammar and continue/until disambiguation
 
 Phase 2
 
-name resolution types generics capabilities effects ownership closure capture analysis
+name resolution types generics capabilities effects ownership closure capture analysis loop binding/condition/bound checks and labeled-jump resolution
 
 Phase 3
 
@@ -2213,7 +2549,7 @@ SAGE Semantic Core Semantic Knowledge Model Structural Analysis optional advisor
 
 Phase 4
 
-PCIR construction PCIR verifier reference interpreter
+PCIR construction PCIR verifier reference interpreter full structured-loop evaluation, cleanup and continuation semantics
 
 Phase 5
 
@@ -2517,7 +2853,7 @@ And for SAGE:
 Final Language Definition
 Paracine is a mature statically typed ahead-of-time native programming language with:
 
-explicit data explicit ownership inferred nonlexical borrowing static zero-allocation closures monomorphized generics structural capabilities defined arithmetic recoverable result semantics terminal traps structured native concurrency authoritative semantic analysis structural computational analysis optional advisory stylometric analysis PCIR semantic optimization PMIR machine lowering direct x86-64 machine encoding direct COFF generation direct native linking direct PE32+ construction no mandatory GC no mandatory exceptions no mandatory scheduler no hidden dynamic initialization no mandatory external compiler no mandatory external assembler no mandatory external linker no mandatory C++ generation
+explicit data explicit ownership inferred nonlexical borrowing guarded for-while iteration inclusive directed from-to iteration post-test continue-until repetition static zero-allocation closures monomorphized generics structural capabilities defined arithmetic recoverable result semantics terminal traps structured native concurrency authoritative semantic analysis structural computational analysis optional advisory stylometric analysis PCIR semantic optimization PMIR machine lowering direct x86-64 machine encoding direct COFF generation direct native linking direct PE32+ construction no mandatory GC no mandatory exceptions no mandatory scheduler no hidden dynamic initialization no mandatory external compiler no mandatory external assembler no mandatory external linker no mandatory C++ generation
 
 Its essential Tier-1 machine path is:
 
@@ -2532,7 +2868,7 @@ The first path defines Paracine's independence.
 The second extends Paracine's reach.
 
 Frozen Edition-2026 Statement
-Edition 2026 is frozen when the reference native implementation conforms to the grammar, semantics, ownership rules, SAGE semantic boundary, PCIR contract, PMIR contract and Tier-1 native backend described by the complete 1.0 specification.
+The revised edition-2026 baseline includes the normative for-while, from-to, and continue-until forms. The earlier freeze declaration is superseded by this document. Edition 2026 is frozen when the reference native implementation conforms to this completed grammar, its structured-loop semantics, ownership rules, SAGE semantic boundary, PCIR contract, PMIR contract and Tier-1 native backend described by the complete 1.0 specification.
 
 The optional C++20 exporter is not a condition of language completeness.
 
@@ -2551,7 +2887,7 @@ A new SAGE stylometric heuristic alone does not require a new language edition b
 Final Canonical Summary
 PARACINE ".pcn"
 
-Readable source + Exact static types + Authoritative semantic analysis + Structural computational analysis + Optional advisory stylometry + Explicit ownership + Nonlexical borrowing + Zero-allocation static closures + Recoverable result handling + Defined machine arithmetic + PCIR semantic optimization + Path Compression + SSA Reduction + Direct PMIR lowering + Direct x86-64 machine encoding + Direct COFF generation + Direct native linking + Direct PE32+ generation ──────────────────────────────── Independent Native Program ──────────────────────────────── ↓ .obj / .exe
+Readable source + Exact static types + Guarded for-while iteration + Inclusive directed from-to iteration + Post-test continue-until repetition + Authoritative semantic analysis + Structural computational analysis + Optional advisory stylometry + Explicit ownership + Nonlexical borrowing + Zero-allocation static closures + Recoverable result handling + Defined machine arithmetic + PCIR semantic optimization + Path Compression + SSA Reduction + Direct PMIR lowering + Direct x86-64 machine encoding + Direct COFF generation + Direct native linking + Direct PE32+ generation ──────────────────────────────── Independent Native Program ──────────────────────────────── ↓ .obj / .exe
 
 Optional portability exists beside that architecture:
 
