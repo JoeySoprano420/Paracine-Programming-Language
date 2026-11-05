@@ -2885,8 +2885,8 @@ namespace pcn {
                     if (!checkSymbol("}")) {
                         for (;;) {
                             auto fieldName = expectIdentifier();
-                            expectSymbol(":");
-                            auto value = parseExpression();
+                            ExprPtr value;
+                            if (matchSymbol(":")) value = parseExpression();
                             fields.push_back(ConstructField{ fieldName.text, value, fieldName.location });
                             if (!matchSymbol(",")) {
                                 break;
@@ -4200,10 +4200,14 @@ namespace pcn {
             std::set<std::string> variantTags;
             bool variantSubject = false;
             if (node.subject && subjectType.kind == SemanticTypeKind::Custom) {
-                auto it = nominalTypes_.find(subjectType.name);
-                if (it != nominalTypes_.end() && it->second.info.kind == "variant") {
+                auto it = result_.nominalTypes.find(subjectType.name);
+                if (it != result_.nominalTypes.end() && it->second.kind == "variant") {
                     variantSubject = true;
-                    variantTags.insert(it->second.info.tags.begin(), it->second.info.tags.end());
+                    variantTags.insert(it->second.tags.begin(), it->second.tags.end());
+                }
+                else if (it != result_.nominalTypes.end() && it->second.kind == "enum") {
+                    variantSubject = true;
+                    for (const auto& m : it->second.members) variantTags.insert(m.first);
                 }
             }
             SemanticType resultType = makeUnknownType();
@@ -4487,10 +4491,7 @@ namespace pcn {
                         report(selected.location, "unknown enum member '" + selected.name + "' for " + node.typeName);
                     }
                     else if (selected.value) {
-                        auto valueType = analyzeExpr(selected.value);
-                        if (!isAssignableTo(semanticTypeFromName(it->second), valueType)) {
-                            report(selected.location, "enum member payload type mismatch for '" + selected.name + "'");
-                        }
+                        report(selected.location, "enum member '" + selected.name + "' is a tag selector, not a payload field");
                     }
                 }
             }
@@ -4507,11 +4508,17 @@ namespace pcn {
                     if (it == nominal->members.end()) {
                         report(selected.location, "unknown variant case '" + selected.name + "' for " + node.typeName);
                     }
-                    else if (selected.value) {
+                    else if (it->second == "void") {
+                        if (selected.value)
+                            report(selected.location, "payload-free variant case '" + selected.name + "' must not receive a value");
+                    }
+                    else if (!selected.value) {
+                        report(selected.location, "missing payload for variant case '" + selected.name + "'");
+                    }
+                    else {
                         auto valueType = analyzeExpr(selected.value);
-                        if (it->second != "void" && !isAssignableTo(semanticTypeFromName(it->second), valueType)) {
+                        if (!isAssignableTo(semanticTypeFromName(it->second), valueType))
                             report(selected.location, "variant payload type mismatch for case '" + selected.name + "'");
-                        }
                     }
                 }
             }
@@ -5072,6 +5079,7 @@ namespace pcn {
                 else if constexpr (std::is_same_v<T, DeferStmt>)walkExpr(n.expression, inClosure);
                 else if constexpr (std::is_same_v<T, IfStmt>) { walkExpr(n.condition, inClosure); scopes_.push_back({}); walkStatements(n.thenBranch, inClosure); scopes_.pop_back(); scopes_.push_back({}); walkStatements(n.elseBranch, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, WhileStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": loop"); walkExpr(n.condition, inClosure); scopes_.push_back({}); walkStatements(n.body, inClosure); scopes_.pop_back(); }
+                else if constexpr (std::is_same_v<T, EachStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": iterator/range loop"); walkExpr(n.range, inClosure); scopes_.push_back({}); for (const auto& b : n.bindings)declare(b, "int", n.bindingsMutable, false, "shared", n.location, point_); walkStatements(n.body, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, EachStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": iterator/range loop"); walkExpr(n.range, inClosure); scopes_.push_back({}); for (const auto& b : n.bindings)declare(b, "int", n.bindingsMutable, false, "shared", n.location, point_); if (n.guard)walkExpr(n.guard, inClosure); walkStatements(n.body, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, FromStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": directed integer loop"); walkExpr(n.first, inClosure); walkExpr(n.last, inClosure); scopes_.push_back({}); declare(n.binding, n.typeName.empty() ? "int" : n.typeName, false, false, "shared", n.location, point_); walkStatements(n.body, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": post-test loop"); walkExpr(n.condition, inClosure); scopes_.push_back({}); walkStatements(n.body, inClosure); scopes_.pop_back(); }
@@ -5155,6 +5163,7 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, RecordSetStmt>)inferClosureExprEffects(n.value, out); else if constexpr (std::is_same_v<T, ExprStmt>)inferClosureExprEffects(n.expression, out); else if constexpr (std::is_same_v<T, ReturnStmt>) { if (n.hasValue)inferClosureExprEffects(n.value, out); }
             else if constexpr (std::is_same_v<T, GiveStmt>)inferClosureExprEffects(n.value, out); else if constexpr (std::is_same_v<T, FailStmt>)inferClosureExprEffects(n.expression, out); else if constexpr (std::is_same_v<T, IfStmt>) { inferClosureExprEffects(n.condition, out); inferClosureStmtEffects(n.thenBranch, out); inferClosureStmtEffects(n.elseBranch, out); }
             else if constexpr (std::is_same_v<T, WhileStmt>) { inferClosureExprEffects(n.condition, out); inferClosureStmtEffects(n.body, out); }
+            else if constexpr (std::is_same_v<T, EachStmt>) { inferClosureExprEffects(n.range, out); inferClosureStmtEffects(n.body, out); }
             else if constexpr (std::is_same_v<T, EachStmt>) { inferClosureExprEffects(n.range, out); inferClosureExprEffects(n.guard, out); inferClosureStmtEffects(n.body, out); }
             else if constexpr (std::is_same_v<T, FromStmt>) { inferClosureExprEffects(n.first, out); inferClosureExprEffects(n.last, out); inferClosureStmtEffects(n.body, out); }
             else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { inferClosureExprEffects(n.condition, out); inferClosureStmtEffects(n.body, out); }
@@ -5179,6 +5188,7 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, ExprStmt>)scanExpr(n.expression); else if constexpr (std::is_same_v<T, ReturnStmt>) { if (n.hasValue)scanExpr(n.value); }
             else if constexpr (std::is_same_v<T, GiveStmt>)scanExpr(n.value); else if constexpr (std::is_same_v<T, FailStmt>)scanExpr(n.expression); else if constexpr (std::is_same_v<T, IfStmt>) { scanExpr(n.condition); scanStmts(n.thenBranch); scanStmts(n.elseBranch); }
             else if constexpr (std::is_same_v<T, WhileStmt>) { scanExpr(n.condition); scanStmts(n.body); }
+            else if constexpr (std::is_same_v<T, EachStmt>) { scanExpr(n.range); for (auto& x : n.bindings)locals.insert(x); scanStmts(n.body); }
             else if constexpr (std::is_same_v<T, EachStmt>) { scanExpr(n.range); for (auto& x : n.bindings)locals.insert(x); scanExpr(n.guard); scanStmts(n.body); }
             else if constexpr (std::is_same_v<T, FromStmt>) { scanExpr(n.first); scanExpr(n.last); locals.insert(n.binding); scanStmts(n.body); }
             else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { scanExpr(n.condition); scanStmts(n.body); }
@@ -5960,6 +5970,7 @@ namespace pcn {
                     if (i != 0) oss << ", ";
                     oss << node.bindings[i];
                 }
+                oss << " in " << exprToString(node.range) << "\n";
                 oss << " in " << exprToString(node.range);
                 if (node.guard) oss << " while " << exprToString(node.guard);
                 oss << "\n";
@@ -6100,6 +6111,7 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, ReturnStmt>) { if (x.hasValue)x.value = rewriteExpr(x.value, m); }
             else if constexpr (std::is_same_v<T, GiveStmt>)x.value = rewriteExpr(x.value, m);
             else if constexpr (std::is_same_v<T, IfStmt>) { x.condition = rewriteExpr(x.condition, m); x.thenBranch = rewriteStatements(x.thenBranch, m); x.elseBranch = rewriteStatements(x.elseBranch, m); }
+            else if constexpr (std::is_same_v<T, EachStmt>) { x.range = rewriteExpr(x.range, m); x.body = rewriteStatements(x.body, m); }
             else if constexpr (std::is_same_v<T, EachStmt>) { x.range = rewriteExpr(x.range, m); x.guard = rewriteExpr(x.guard, m); x.body = rewriteStatements(x.body, m); }
             else if constexpr (std::is_same_v<T, FromStmt>) { x.first = rewriteExpr(x.first, m); x.last = rewriteExpr(x.last, m); x.typeName = subst(x.typeName, m); x.body = rewriteStatements(x.body, m); }
             else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { x.condition = rewriteExpr(x.condition, m); x.body = rewriteStatements(x.body, m); }
@@ -6119,6 +6131,7 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, ArraySetStmt>) { collectClosuresExpr(n.index, out); collectClosuresExpr(n.value, out); }
             else if constexpr (std::is_same_v<T, RecordSetStmt>)collectClosuresExpr(n.value, out); else if constexpr (std::is_same_v<T, ExprStmt>)collectClosuresExpr(n.expression, out); else if constexpr (std::is_same_v<T, ReturnStmt>) { if (n.hasValue)collectClosuresExpr(n.value, out); }
             else if constexpr (std::is_same_v<T, GiveStmt>)collectClosuresExpr(n.value, out); else if constexpr (std::is_same_v<T, IfStmt>) { collectClosuresExpr(n.condition, out); collectClosuresStmt(n.thenBranch, out); collectClosuresStmt(n.elseBranch, out); }
+            else if constexpr (std::is_same_v<T, EachStmt>) { collectClosuresExpr(n.range, out); collectClosuresStmt(n.body, out); }
             else if constexpr (std::is_same_v<T, EachStmt>) { collectClosuresExpr(n.range, out); collectClosuresExpr(n.guard, out); collectClosuresStmt(n.body, out); }
             else if constexpr (std::is_same_v<T, FromStmt>) { collectClosuresExpr(n.first, out); collectClosuresExpr(n.last, out); collectClosuresStmt(n.body, out); }
             else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { collectClosuresExpr(n.condition, out); collectClosuresStmt(n.body, out); }
@@ -6139,6 +6152,7 @@ namespace pcn {
             nominalTypeNames_.clear();
             globalConstants_.clear();
             nominalVariantTagIndex_.clear();
+            nominalEnumTagIndex_.clear();
             for (const auto& d : program.declarations) {
                 if (const auto* c = std::get_if<ConstDecl>(&d.node)) {
                     globalConstants_.emplace(c->name, std::make_pair(c->typeName, c->value));
@@ -6167,10 +6181,35 @@ namespace pcn {
                         for (const auto& f : n.fields) nominalFieldTypes_[n.name][f.name] = f.typeName;
                     }
                     else if constexpr (std::is_same_v<T, EnumDecl>) {
-                        for (const auto& m : n.members) nominalFieldTypes_[n.name][m.first] = m.second.value_or("int");
+                        std::uint64_t next = 0;
+                        for (const auto& m : n.members) {
+                            std::uint64_t tag = next;
+                            if (m.second) {
+                                std::string digits;
+                                for (char ch : *m.second) if (ch != '_') digits.push_back(ch);
+                                int base = 10;
+                                if (digits.size() > 2 && digits[0] == '0' &&
+                                    (digits[1] == 'x' || digits[1] == 'X' || digits[1] == 'b' || digits[1] == 'B')) {
+                                    base = digits[1] == 'b' || digits[1] == 'B' ? 2 : 16;
+                                    digits.erase(0, 2);
+                                }
+                                const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), tag, base);
+                                if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size())
+                                    throw std::runtime_error("invalid enum tag " + *m.second);
+                            }
+                            if (tag > static_cast<std::uint64_t>(INT64_MAX))
+                                throw std::runtime_error("enum discriminants above INT64_MAX need unsigned PCIR constants");
+                            nominalEnumTagIndex_[n.name][m.first] = tag;
+                            nominalFieldTypes_[n.name][m.first] = "void";
+                            next = tag == UINT64_MAX ? tag : tag + 1;
+                        }
                     }
                     else if constexpr (std::is_same_v<T, VariantDecl>) {
-                        for (const auto& c : n.cases) nominalFieldTypes_[n.name][c.name] = c.fields.empty() ? "void" : (c.fields.size() == 1 ? c.fields.front().typeName : "tuple");
+                        for (std::size_t tag = 0; tag < n.cases.size(); ++tag) {
+                            const auto& c = n.cases[tag];
+                            nominalFieldTypes_[n.name][c.name] = c.fields.empty() ? "void" : (c.fields.size() == 1 ? c.fields.front().typeName : "tuple");
+                            nominalVariantTagIndex_[n.name][c.name] = static_cast<std::int64_t>(tag);
+                        }
                     }
                 }
                 else if constexpr (std::is_same_v<T, ModuleDecl>) collectNominalNames(n.declarations);
@@ -6786,6 +6825,7 @@ namespace pcn {
             IRInstruction branch;
             branch.op = IROpcode::BranchIf;
             branch.args.push_back(condition);
+            branch.targetBlocks = { bodyBlock, exitBlock };
             branch.targetBlocks = { candidateBlock, exitBlock };
             branch.valueType = makeIRVoidType();
             emit(std::move(branch));
@@ -6909,6 +6949,7 @@ namespace pcn {
 
             currentBlock_ = stepSelectBlock;
             currentTerminated_ = false;
+            VReg one = emitConst(IROpcode::ConstInt, "1");
             IRInstruction stepBranch;
             stepBranch.op = IROpcode::BranchIf;
             stepBranch.args.push_back(ascending);
@@ -6916,8 +6957,6 @@ namespace pcn {
             stepBranch.valueType = makeIRVoidType();
             emit(std::move(stepBranch));
             currentTerminated_ = true;
-
-            VReg one = emitConst(IROpcode::ConstInt, "1");
 
             currentBlock_ = stepUpBlock;
             currentTerminated_ = false;
@@ -7037,35 +7076,43 @@ namespace pcn {
             IRValueType subjectType = makeIRUnknownType();
             if (node.subject) subject = lowerExpr(node.subject);
             if (node.subject) subjectType = lowerExprType(node.subject);
-            const bool variantSubject = subject != VReg::None && nominalVariantTagIndex_.contains(subjectType.name);
+            const bool variantSubject = subject != VReg::None &&
+                (nominalVariantTagIndex_.contains(subjectType.name) || nominalEnumTagIndex_.contains(subjectType.name));
             for (std::size_t i = 0; i < node.cases.size(); ++i) {
                 const auto& arm = node.cases[i];
                 VReg condition = VReg::None;
                 if (variantSubject) {
                     const auto* caseName = arm.condition ? std::get_if<VariableExpr>(&arm.condition->node) : nullptr;
                     const auto tagSet = nominalVariantTagIndex_.find(subjectType.name);
+                    const auto enumSet = nominalEnumTagIndex_.find(subjectType.name);
+                    std::optional<std::uint64_t> requestedTag;
                     if (caseName && tagSet != nominalVariantTagIndex_.end()) {
-                        const auto caseTag = tagSet->second.find(caseName->name);
-                        if (caseTag != tagSet->second.end()) {
-                            IRInstruction extractTag;
-                            extractTag.op = IROpcode::ExtractField;
-                            extractTag.dest = allocateVReg();
-                            extractTag.args = { subject };
-                            extractTag.literalText = "$tag";
-                            extractTag.typeName = subjectType.name;
-                            extractTag.valueType = makeIRIntType();
-                            const auto tagValue = extractTag.dest;
-                            emit(std::move(extractTag));
+                        const auto it = tagSet->second.find(caseName->name);
+                        if (it != tagSet->second.end()) requestedTag = static_cast<std::uint64_t>(it->second);
+                    }
+                    if (caseName && enumSet != nominalEnumTagIndex_.end()) {
+                        const auto it = enumSet->second.find(caseName->name);
+                        if (it != enumSet->second.end()) requestedTag = it->second;
+                    }
+                    if (requestedTag) {
+                        IRInstruction extractTag;
+                        extractTag.op = IROpcode::ExtractField;
+                        extractTag.dest = allocateVReg();
+                        extractTag.args = { subject };
+                        extractTag.literalText = "$tag";
+                        extractTag.typeName = subjectType.name;
+                        extractTag.valueType = makeIRIntType();
+                        const auto tagValue = extractTag.dest;
+                        emit(std::move(extractTag));
 
-                            const auto expectedTag = emitConst(IROpcode::ConstInt, std::to_string(caseTag->second));
-                            IRInstruction eq;
-                            eq.op = IROpcode::Eq;
-                            eq.dest = allocateVReg();
-                            eq.args = { tagValue, expectedTag };
-                            eq.valueType = makeIRBoolType();
-                            condition = eq.dest;
-                            emit(std::move(eq));
-                        }
+                        const auto expectedTag = emitConst(IROpcode::ConstInt, std::to_string(*requestedTag));
+                        IRInstruction eq;
+                        eq.op = IROpcode::Eq;
+                        eq.dest = allocateVReg();
+                        eq.args = { tagValue, expectedTag };
+                        eq.valueType = makeIRBoolType();
+                        condition = eq.dest;
+                        emit(std::move(eq));
                     }
                 }
                 if (condition == VReg::None) {
@@ -7245,15 +7292,55 @@ namespace pcn {
                     lastValueType_ = irValueTypeFromName(elem); return dest;
                 }
                 else if constexpr (std::is_same_v<T, ConstructExpr>) {
-                    IRInstruction inst; inst.op = IROpcode::MakeAggregate; inst.dest = allocateVReg(); inst.typeName = node.typeName; inst.valueType = { IRValueKind::Aggregate, node.typeName };
-                    for (const auto& f : node.fields) { auto v = lowerExpr(f.value); inst.args.push_back(v); inst.argumentTypes.push_back(f.name); inst.argumentValueTypes.push_back(lastValueType_); }
-                    for (const auto& f : node.fields) {
-                        auto v = lowerExpr(f.value);
-                        inst.args.push_back(v);
-                        inst.argumentTypes.push_back(f.name);
-                        inst.argumentValueTypes.push_back(lastValueType_);
+                    IRInstruction inst; inst.op = IROpcode::MakeAggregate;
+                    inst.dest = allocateVReg(); inst.typeName = node.typeName;
+                    inst.valueType = { IRValueKind::Aggregate, node.typeName };
+                    const auto enumType = nominalEnumTagIndex_.find(node.typeName);
+                    const auto variant = nominalVariantTagIndex_.find(node.typeName);
+                    if (enumType != nominalEnumTagIndex_.end()) {
+                        if (node.fields.size() != 1 || node.fields.front().value)
+                            throw std::runtime_error("enum construction expects exactly one payload-free member");
+                        const auto tag = enumType->second.find(node.fields.front().name);
+                        if (tag == enumType->second.end()) throw std::runtime_error("unknown enum member");
+                        const auto vtag = emitConst(IROpcode::ConstInt, std::to_string(tag->second));
+                        inst.args.push_back(vtag);
+                        inst.argumentTypes.push_back("$tag");
+                        inst.argumentValueTypes.push_back(makeIRIntType());
                     }
-                    emit(inst); lastValueType_ = inst.valueType; return inst.dest;
+                    else if (variant != nominalVariantTagIndex_.end()) {
+                        if (node.fields.size() != 1)
+                            throw std::runtime_error("variant construction expects exactly one case");
+                        const auto& selected = node.fields.front();
+                        const auto tag = variant->second.find(selected.name);
+                        if (tag == variant->second.end())
+                            throw std::runtime_error("unknown variant case " + selected.name);
+                        const auto vtag = emitConst(IROpcode::ConstInt, std::to_string(tag->second));
+                        inst.args.push_back(vtag);
+                        inst.argumentTypes.push_back("$tag");
+                        inst.argumentValueTypes.push_back(makeIRIntType());
+                        const auto fieldTypes = nominalFieldTypes_.at(node.typeName);
+                        const auto payloadType = fieldTypes.at(selected.name);
+                        if (payloadType != "void") {
+                            if (!selected.value)
+                                throw std::runtime_error("missing variant payload for " + selected.name);
+                            auto v = lowerExprWithExpected(selected.value, irValueTypeFromName(payloadType));
+                            inst.args.push_back(v);
+                            inst.argumentTypes.push_back(selected.name + ".$0");
+                            inst.argumentValueTypes.push_back(lastValueType_);
+                        }
+                    }
+                    else {
+                        for (const auto& f : node.fields) {
+                            auto v = lowerExpr(f.value);
+                            inst.args.push_back(v);
+                            inst.argumentTypes.push_back(f.name);
+                            inst.argumentValueTypes.push_back(lastValueType_);
+                        }
+                    }
+                    const auto dest = inst.dest;
+                    emit(std::move(inst));
+                    lastValueType_ = { IRValueKind::Aggregate, node.typeName };
+                    return dest;
                 }
                 else if constexpr (std::is_same_v<T, MemberExpr>) {
                     auto objectType = lowerExprType(node.object);
@@ -7875,6 +7962,7 @@ namespace pcn {
         std::unordered_set<std::string> nominalTypeNames_;
         std::unordered_map<std::string, std::unordered_map<std::string, std::string>> nominalFieldTypes_;
         std::unordered_map<std::string, std::unordered_map<std::string, std::int64_t>> nominalVariantTagIndex_;
+        std::unordered_map<std::string, std::unordered_map<std::string, std::uint64_t>> nominalEnumTagIndex_;
         std::string currentReturnType_;
         std::vector<IRBasicBlock> blocks_;
         std::unordered_map<std::string, VReg> locals_;
@@ -8227,7 +8315,7 @@ namespace pcn {
                         resolved = next->second;
                     }
                     return resolved;
-                };
+                    };
                 for (auto& phi : b.phiNodes) {
                     for (auto& incoming : phi.phiInputs) {
                         auto rewritten = rewrite(incoming.second);
@@ -12560,7 +12648,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       const auto artifacts = compileAll(
                                           "variant Maybe\n"
                                           "    None\n"
-                                          "    Some\n"
+                                          "    Some(value: int)\n"
                                           "routine pick(v: Maybe) gives int\n"
                                           "    give choose v\n"
                                           "        case Some\n"
@@ -12677,14 +12765,14 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           "    let a: int = 2\n"
                                           "    let b: int = a\n"
                                           "    let c: int = b\n"
-                                          "    if true\n"
+                                          "    if c > 0\n"
                                           "        give c + 40\n"
                                           "    give 0\n",
                                           CompilerOptions{});
                                       if (!artifacts.analysis.succeeded()) throw std::runtime_error("unexpected semantic diagnostics");
                                       const auto result = PCIRInterpreter(artifacts.pcir).run("");
                                       if (result != 42) throw std::runtime_error("optimized PCIR executed wrong value");
-                                  });
+                                      });
                                   test("package manager manifest and lock workflow", [&] {
                                       namespace fs = std::filesystem;
                                       const auto root = fs::temp_directory_path() /
@@ -12712,7 +12800,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           throw std::runtime_error("installed package file missing");
                                       std::error_code ec;
                                       fs::remove_all(root, ec);
-                                  });
+                                      });
                                   out << "Selftests: " << passed << " passed, " << failed << " failed\n";
                                   return failed ? 2 : 0;
                               }
@@ -13114,4 +13202,3 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
-
