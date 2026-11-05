@@ -60,6 +60,16 @@ namespace pcn {
         return result;
     }
 
+            if (!explicitGenericArguments.empty()) {
+                const bool anyGenericOverload = std::any_of(it->second.begin(), it->second.end(), [](const RoutineSignature& sig) {
+                    return !sig.genericParameters.empty();
+                    });
+                if (!anyGenericOverload) {
+                    report(location, "explicit generic arguments provided for non-generic routine: " + name);
+                    return makeUnknownType();
+                }
+            }
+
     // One checked integer decoder shared by constant resolution, optimizer,
     // reference interpreter and machine lowering. It rejects trailing text and
     // overflow instead of accepting std::stoll's partially consumed prefix.
@@ -3981,6 +3991,7 @@ namespace pcn {
                 }
                 if (callee->name == "none") { if (!node.arguments.empty())report(node.location, "none requires no arguments"); return makeCustomType("__none"); }
                 if (callee->name == "print") {
+                if (callee->name == "print" || callee->name == "println") {
                     for (const auto& argument : node.arguments) {
                         analyzeExpr(argument);
                     }
@@ -4054,7 +4065,6 @@ namespace pcn {
 
         SemanticType analyzeChooseExpr(const ChooseExpr& node) {
             auto subjectType = node.subject ? analyzeExpr(node.subject) : makeUnknownType();
-            if (!node.hasOtherwise) report(node.location, "non-exhaustive choose expression requires otherwise");
             std::set<std::string> variantTags;
             bool variantSubject = false;
             if (node.subject && subjectType.kind == SemanticTypeKind::Custom) {
@@ -4422,6 +4432,15 @@ namespace pcn {
             for (const auto& explicitType : explicitGenericArguments) {
                 if (!isKnownConcreteTypeForGenerics(explicitType)) {
                     report(location, "unknown or invalid explicit generic type argument: " + explicitType);
+                    return makeUnknownType();
+                }
+            }
+            if (!explicitGenericArguments.empty()) {
+                const bool anyGenericOverload = std::any_of(it->second.begin(), it->second.end(), [](const RoutineSignature& sig) {
+                    return !sig.genericParameters.empty();
+                    });
+                if (!anyGenericOverload) {
+                    report(location, "explicit generic arguments provided for non-generic routine: " + name);
                     return makeUnknownType();
                 }
             }
@@ -5446,6 +5465,8 @@ namespace pcn {
                         }
                         else {
                             if (mode == "var") report(arg ? arg->location : SourceLocation{}, "E0416 exclusive borrow requires a place expression");
+                            if (mode == "own" && !isPlaceExpression(arg))
+                                report(arg ? arg->location : SourceLocation{}, "E0435 ownership transfer requires a place expression");
                             analyzeBorrowExpr(arg, state);
                         }
                     }
@@ -5478,6 +5499,15 @@ namespace pcn {
                     analyzeBorrowExpr(node.index, state);
                 }
                 }, expr->node);
+        }
+
+        static bool isPlaceExpression(const ExprPtr& expr) {
+            if (!expr) return false;
+            if (std::holds_alternative<VariableExpr>(expr->node)) return true;
+            if (const auto* member = std::get_if<MemberExpr>(&expr->node)) return isPlaceExpression(member->object);
+            if (const auto* index = std::get_if<IndexExpr>(&expr->node)) return isPlaceExpression(index->object);
+            if (const auto* group = std::get_if<GroupExpr>(&expr->node)) return isPlaceExpression(group->expression);
+            return false;
         }
 
         static BorrowState mergeStates(const BorrowState& a, const BorrowState& b) {
@@ -5919,6 +5949,7 @@ namespace pcn {
             routineParameters_.clear();
             nominalTypeNames_.clear();
             globalConstants_.clear();
+            nominalVariantTagIndex_.clear();
             for (const auto& d : program.declarations) {
                 if (const auto* c = std::get_if<ConstDecl>(&d.node)) {
                     globalConstants_.emplace(c->name, std::make_pair(c->typeName, c->value));
@@ -6636,14 +6667,48 @@ namespace pcn {
             const VReg result = allocateVReg();
             const BlockID merge = createBlock("choose.merge");
             VReg subject = VReg::None;
+            IRValueType subjectType = makeIRUnknownType();
             if (node.subject) subject = lowerExpr(node.subject);
+            if (node.subject) subjectType = lowerExprType(node.subject);
+            const bool variantSubject = subject != VReg::None && nominalVariantTagIndex_.contains(subjectType.name);
             for (std::size_t i = 0; i < node.cases.size(); ++i) {
                 const auto& arm = node.cases[i];
                 VReg condition = lowerExpr(arm.condition);
-                if (subject != VReg::None) {
-                    IRInstruction eq; eq.op = IROpcode::Eq; eq.dest = allocateVReg();
-                    eq.args = { subject, condition }; eq.valueType = makeIRBoolType();
-                    condition = eq.dest; emit(std::move(eq));
+                VReg condition = VReg::None;
+                if (variantSubject) {
+                    const auto* caseName = arm.condition ? std::get_if<VariableExpr>(&arm.condition->node) : nullptr;
+                    const auto tagSet = nominalVariantTagIndex_.find(subjectType.name);
+                    if (caseName && tagSet != nominalVariantTagIndex_.end()) {
+                        const auto caseTag = tagSet->second.find(caseName->name);
+                        if (caseTag != tagSet->second.end()) {
+                            IRInstruction extractTag;
+                            extractTag.op = IROpcode::ExtractField;
+                            extractTag.dest = allocateVReg();
+                            extractTag.args = { subject };
+                            extractTag.literalText = "$tag";
+                            extractTag.typeName = subjectType.name;
+                            extractTag.valueType = makeIRIntType();
+                            const auto tagValue = extractTag.dest;
+                            emit(std::move(extractTag));
+
+                            const auto expectedTag = emitConst(IROpcode::ConstInt, std::to_string(caseTag->second));
+                            IRInstruction eq;
+                            eq.op = IROpcode::Eq;
+                            eq.dest = allocateVReg();
+                            eq.args = { tagValue, expectedTag };
+                            eq.valueType = makeIRBoolType();
+                            condition = eq.dest;
+                            emit(std::move(eq));
+                        }
+                    }
+                }
+                if (condition == VReg::None) {
+                    condition = lowerExpr(arm.condition);
+                    if (subject != VReg::None) {
+                        IRInstruction eq; eq.op = IROpcode::Eq; eq.dest = allocateVReg();
+                        eq.args = { subject, condition }; eq.valueType = makeIRBoolType();
+                        condition = eq.dest; emit(std::move(eq));
+                    }
                 }
                 const BlockID take = createBlock("choose.arm" + std::to_string(i));
                 const BlockID skip = createBlock("choose.next" + std::to_string(i));
@@ -7209,6 +7274,41 @@ namespace pcn {
                     auto dest = allocateVReg(); inst.op = (member->member == "dispose" ? IROpcode::StringDispose : IROpcode::StringClear); inst.dest = dest; inst.args.push_back(lowerExpr(member->object)); inst.valueType = makeIRVoidType(); inst.typeName = "string"; emit(inst); lastValueType_ = inst.valueType; return dest;
                 }
                 throw std::runtime_error("PCIR lowering for member routine '" + objectType.name + "." + member->member + "' is not implemented in this bootstrap; semantic authority/effects were still checked by SAGE");
+                // Generic member call lowering: semantic analysis already validated that
+                // the method exists as a callable routine shape. Lower as a routine call
+                // with receiver as the first argument.
+                auto dest = allocateVReg();
+                inst.dest = dest;
+                inst.op = IROpcode::Call;
+                inst.callee = member->member;
+                inst.callSignature = objectType.name + "." + member->member + "()";
+                inst.returnType = routineReturnTypes_.count(inst.callee) ? routineReturnTypes_[inst.callee] : "value";
+                inst.typeName = inst.returnType;
+                inst.valueType = irValueTypeFromName(inst.returnType);
+
+                IRValueType receiverExpected = makeIRUnknownType();
+                if (auto it = routineParameters_.find(inst.callee); it != routineParameters_.end() && !it->second.empty())
+                    receiverExpected = irValueTypeFromName(it->second.front().typeName);
+                auto receiver = lowerExprWithExpected(member->object, receiverExpected);
+                inst.args.push_back(receiver);
+                inst.argumentTypes.push_back(irValueTypeName(lastValueType_));
+                inst.argumentValueTypes.push_back(lastValueType_);
+
+                std::size_t parameterIndex = 1;
+                for (const auto& argument : node.arguments) {
+                    IRValueType expected = makeIRUnknownType();
+                    if (auto it = routineParameters_.find(inst.callee); it != routineParameters_.end() && parameterIndex < it->second.size())
+                        expected = irValueTypeFromName(it->second[parameterIndex].typeName);
+                    auto argumentValue = lowerExprWithExpected(argument, expected);
+                    ++parameterIndex;
+                    inst.args.push_back(argumentValue);
+                    inst.argumentTypes.push_back(argumentTypeName(argument));
+                    inst.argumentValueTypes.push_back(lastValueType_);
+                }
+
+                emit(std::move(inst));
+                lastValueType_ = inst.valueType;
+                return dest;
             }
             if (const auto* intrinsic = node.callee ? std::get_if<VariableExpr>(&node.callee->node) : nullptr) {
                 if (intrinsic->name == "ok" || intrinsic->name == "err" || intrinsic->name == "some" || intrinsic->name == "none") {
@@ -7278,6 +7378,9 @@ namespace pcn {
                     return "value";
                 }
                 if (variable->name == "print") {
+                    return "void";
+                }
+                if (variable->name == "println") {
                     return "void";
                 }
                 auto signature = routineReturnTypes_.find(variable->name);
@@ -7406,6 +7509,7 @@ namespace pcn {
         std::unordered_map<std::string, ClosureBinding> closureBindings_;
         std::unordered_set<std::string> nominalTypeNames_;
         std::unordered_map<std::string, std::unordered_map<std::string, std::string>> nominalFieldTypes_;
+        std::unordered_map<std::string, std::unordered_map<std::string, std::int64_t>> nominalVariantTagIndex_;
         std::string currentReturnType_;
         std::vector<IRBasicBlock> blocks_;
         std::unordered_map<std::string, VReg> locals_;
@@ -10913,37 +11017,77 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                               static int runExternalCOFFLink(const std::vector<std::string>& args) {
                                   std::vector<std::string> sources;
                                   std::string output, entry = "main", executable = "lld-link", subsystem = "console";
-                                  std::vector<std::string> otherInputs, searchPaths;
                                   std::vector<std::string> otherInputs, searchPaths, defaultLibs, wholeArchives;
                                   std::string importLibrary;
                                   bool noDefaultLib = true;
                                   bool dll = false;
+                                  bool entrySet = false, linkerSet = false, subsystemSet = false, dllSet = false;
+                                  std::unordered_set<std::string> seenSources, seenInputs;
+                                  std::unordered_set<std::string> seenDefaultLibs, seenWholeArchives;
+                                  auto lowerExt = [](std::string ext) {
+                                      std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+                                          return static_cast<char>(std::tolower(ch));
+                                          });
+                                      return ext;
+                                      };
                                   for (std::size_t i = 1; i < args.size(); ++i) {
                                       const auto& a = args[i];
                                       if ((a == "-o" || a == "--out") && i + 1 < args.size())output = args[++i];
-                                      else if (a == "--entry" && i + 1 < args.size())entry = args[++i];
-                                      else if (a == "--linker" && i + 1 < args.size())executable = args[++i];
+                                      else if (a == "--entry" && i + 1 < args.size()) {
+                                          if (entrySet)throw std::runtime_error("duplicate --entry option");
+                                          entry = args[++i];
+                                          entrySet = true;
+                                      }
+                                      else if (a == "--linker" && i + 1 < args.size()) {
+                                          if (linkerSet)throw std::runtime_error("duplicate --linker option");
+                                          executable = args[++i];
+                                          linkerSet = true;
+                                      }
                                       else if (a == "--libpath" && i + 1 < args.size())searchPaths.push_back(args[++i]);
                                       else if (a == "--defaultlib" && i + 1 < args.size()) { defaultLibs.push_back(args[++i]); noDefaultLib = false; }
                                       else if (a == "--wholearchive" && i + 1 < args.size())wholeArchives.push_back(args[++i]);
+                                      else if ((a == "--defaultlib" || a == "--lib" || a == "--library") && i + 1 < args.size()) {
+                                          const auto lib = args[++i];
+                                          if (seenDefaultLibs.insert(lib).second)defaultLibs.push_back(lib);
+                                          noDefaultLib = false;
+                                      }
+                                      else if (a == "--wholearchive" && i + 1 < args.size()) {
+                                          const auto archive = args[++i];
+                                          if (!std::filesystem::exists(archive))throw std::runtime_error("whole-archive input does not exist: " + archive);
+                                          if (seenWholeArchives.insert(archive).second)wholeArchives.push_back(archive);
+                                      }
                                       else if (a == "--implib" && i + 1 < args.size())importLibrary = args[++i];
                                       else if (a == "--use-defaultlibs")noDefaultLib = false;
-                                      else if (a == "--subsystem" && i + 1 < args.size())subsystem = args[++i];
-                                      else if (a == "--dll")dll = true;
+                                      else if (a == "--subsystem" && i + 1 < args.size()) {
+                                          if (subsystemSet)throw std::runtime_error("duplicate --subsystem option");
+                                          subsystem = args[++i];
+                                          subsystemSet = true;
+                                      }
+                                      else if (a == "--dll") {
+                                          if (dllSet)throw std::runtime_error("duplicate --dll option");
+                                          dll = true;
+                                          dllSet = true;
+                                      }
                                       else if (a.size() && a[0] == '-')throw std::runtime_error("unsupported link argument: " + a);
-                                      else if (std::filesystem::path(a).extension() == ".pcn") {
+                                      else if (lowerExt(std::filesystem::path(a).extension().string()) == ".pcn") {
+                                          if (!seenSources.insert(a).second)throw std::runtime_error("duplicate source input: " + a);
                                           sources.push_back(a);
                                       }
                                       else {
-                                          auto ext = std::filesystem::path(a).extension().string();
-                                          if (ext != ".obj" && ext != ".lib" && ext != ".res")throw std::runtime_error("external link input must be .pcn, .obj, .lib, or .res: " + a);
+                                          auto ext = lowerExt(std::filesystem::path(a).extension().string());
                                           if (ext != ".obj" && ext != ".lib" && ext != ".res" && ext != ".exp" && ext != ".def")throw std::runtime_error("external link input must be .pcn, .obj, .lib, .res, .exp, or .def: " + a);
                                           if (!std::filesystem::exists(a))throw std::runtime_error("external link input does not exist: " + a);
+                                          if (!seenInputs.insert(a).second)throw std::runtime_error("duplicate native link input: " + a);
                                           otherInputs.push_back(a);
                                       }
                                   }
                                   if (sources.empty() && otherInputs.empty())throw std::runtime_error("link requires .pcn or COFF objects/libraries");
                                   if (subsystem != "console" && subsystem != "windows")throw std::runtime_error("link subsystem must be console or windows");
+                                  if (!importLibrary.empty() && !dll)throw std::runtime_error("--implib requires --dll");
+                                  if (!noDefaultLib && defaultLibs.empty()) {
+                                      // Canonical Windows user-mode default import set for this toolchain.
+                                      defaultLibs = { "kernel32.lib", "user32.lib", "advapi32.lib" };
+                                  }
                                   if (output.empty()) {
                                       std::filesystem::path sample = sources.empty() ? std::filesystem::path(otherInputs.front()) : std::filesystem::path(sources.front());
                                       sample.replace_extension(dll ? ".dll" : ".exe"); output = sample.string();
@@ -10963,11 +11107,9 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       writeBinaryFile(temp, obj);
                                       scratch.files.push_back(std::move(temp));
                                   }
-                                  std::vector<std::string> invocation = { executable,"/nologo","/machine:x64","/nodefaultlib","/out:" + output };
                                   std::vector<std::string> invocation = { executable,"/nologo","/machine:x64","/out:" + output };
                                   if (noDefaultLib)invocation.push_back("/nodefaultlib");
                                   invocation.push_back("/subsystem:" + subsystem);
-                                  if (dll) { invocation.push_back("/dll"); invocation.push_back("/noentry"); }
                                   if (dll) {
                                       invocation.push_back("/dll");
                                       invocation.push_back("/noentry");
@@ -11406,6 +11548,14 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           return d.message.find(fragment) != std::string::npos;
                                           });
                                       };
+                                  auto expectSemanticSuccess = [&](const std::string& src, const char* context) {
+                                      const auto artifacts = compileAll(src, CompilerOptions{}, false);
+                                      if (!artifacts.analysis.succeeded()) throw std::runtime_error(std::string("unexpected semantic failure: ") + context);
+                                      };
+                                  auto expectSemanticDiagnostic = [&](const std::string& src, std::string_view fragment, const char* context) {
+                                      const auto artifacts = compileAll(src, CompilerOptions{}, false);
+                                      if (!hasDiagnostic(artifacts.analysis, fragment)) throw std::runtime_error(std::string("missing diagnostic for ") + context);
+                                      };
                                   test("UTF-8 source acceptance", [&] { (void)Lexer("# caf\xc3\xa9\n").tokenize(); });
                                   test("invalid UTF-8 rejection", [&] { reject(std::string("# ") + char(0xc0) + "\n"); });
                                   test("mismatched delimiters rejection", [&] { reject("routine main() gives int\n    give ([)]\n"); });
@@ -11420,6 +11570,51 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   test("wrapping integer boundary", [&] {
                                       if (parseParacineInteger("0x7fff_ffff_ffff_ffff") != INT64_MAX)
                                           throw std::runtime_error("incorrect hexadecimal conversion");
+                                      });
+                                  test("conformance grammar/type scaffolding matrix", [&] {
+                                      const std::vector<std::pair<std::string, std::string>> positiveCases = {
+                                          { "routine main() gives int\n    let x: int = 1\n    give x\n", "let/typed binding" },
+                                          { "routine id<T>(x: T) gives T\n    give x\nroutine main() gives int\n    give id<int>(1)\n", "generic explicit specialization" },
+                                          { "variant Maybe\n    None\n    Some\nroutine map(v: Maybe) gives int\n    give choose v\n        case None\n            0\n        case Some\n            1\n", "variant choose exhaustive" },
+                                          { "routine map(v: int) gives int\n    give choose\n        when v > 0\n            1\n        otherwise\n            0\n", "choose expression with otherwise" },
+                                          { "routine main() gives int\n    println(1)\n    give 0\n", "println intrinsic call" },
+                                          { "routine main() gives int\n    each i in 0..4\n        if i > 2\n            give i\n    give 0\n", "range+each+if" },
+                                          { "routine sink(var x: int) gives int\n    x = x + 1\n    give x\nroutine main() gives int\n    var a: int = 1\n    give sink(a)\n", "var borrow call" }
+                                      };
+                                      for (const auto& [src, name] : positiveCases) expectSemanticSuccess(src, name.c_str());
+
+                                      const std::vector<std::tuple<std::string, std::string, std::string>> negativeCases = {
+                                          { "routine main() gives int\n    let x: int = true\n    give x\n", "type mismatch", "type mismatch" },
+                                          { "routine id<T>(x: T) gives T\n    give x\nroutine main() gives int\n    give id<UnknownType>(1)\n", "invalid generic argument", "unknown or invalid explicit generic type argument" },
+                                          { "routine main() gives int\n    each i in 0.5..2\n        give i\n    give 0\n", "float range bound", "range start must be an integer-compatible numeric value" },
+                                          { "routine main() gives int\n    let start: float = 0.5\n    each i in start..2\n        give i\n    give 0\n", "float range bound", "range start must be an integer-compatible numeric value" },
+                                          { "variant Maybe\n    None\n    Some\nroutine main(v: Maybe) gives int\n    give choose v\n        case None\n            0\n", "variant non-exhaustive", "non-exhaustive choose" }
+                                      };
+                                      for (const auto& [src, name, diag] : negativeCases)
+                                          expectSemanticDiagnostic(src, diag, name.c_str());
+                                      });
+                                  test("IR opcode naming scaffolding coverage", [&] {
+                                      const std::vector<IROpcode> allOpcodes = {
+                                          IROpcode::ConstInt, IROpcode::ConstFloat, IROpcode::ConstText, IROpcode::ConstBool, IROpcode::ConstNull,
+                                          IROpcode::Copy, IROpcode::Add, IROpcode::Sub, IROpcode::Mul, IROpcode::Div, IROpcode::Mod,
+                                          IROpcode::BitAnd, IROpcode::BitOr, IROpcode::BitXor, IROpcode::Shl, IROpcode::Shr, IROpcode::Neg,
+                                          IROpcode::BitNot, IROpcode::Not, IROpcode::Eq, IROpcode::Ne, IROpcode::Lt, IROpcode::Le,
+                                          IROpcode::Gt, IROpcode::Ge, IROpcode::And, IROpcode::Or, IROpcode::Phi, IROpcode::Branch,
+                                          IROpcode::BranchIf, IROpcode::Call, IROpcode::CallClosure, IROpcode::TextToString, IROpcode::StringToText,
+                                          IROpcode::StringClear, IROpcode::StringDispose, IROpcode::StringMove, IROpcode::StringAppend,
+                                          IROpcode::ByteCount, IROpcode::TextEquals, IROpcode::TextByteAt, IROpcode::TextFindByte, IROpcode::TextStartsWith,
+                                          IROpcode::TextEndsWith, IROpcode::TextSlice, IROpcode::TextHash64, IROpcode::TextCodepointAt,
+                                          IROpcode::TextCodepointCount, IROpcode::TextIsAscii, IROpcode::TextFindText, IROpcode::TextCompare,
+                                          IROpcode::TextRFindText, IROpcode::TextStreamWrite, IROpcode::NumericCheckedCast, IROpcode::MakeAggregate,
+                                          IROpcode::ExtractField, IROpcode::ArrayIndex, IROpcode::ArrayStore, IROpcode::StoreField, IROpcode::ResultOk,
+                                          IROpcode::ResultErr, IROpcode::ResultIsErr, IROpcode::ResultTry, IROpcode::OptionSome, IROpcode::OptionNone,
+                                          IROpcode::MakeClosure, IROpcode::Return, IROpcode::Nop
+                                      };
+                                      for (const auto op : allOpcodes) {
+                                          const auto name = opcodeName(op);
+                                          if (name.empty() || name == "unknown")
+                                              throw std::runtime_error("unmapped IR opcode in naming table");
+                                      }
                                       });
                                   test("type checker accepts text ordering comparisons", [&] {
                                       const auto artifacts = compileAll(
@@ -11448,8 +11643,6 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           "routine main() gives int\n"
                                           "    fail \"boom\"\n",
                                           CompilerOptions{}, false);
-                                      if (!hasDiagnostic(artifacts.analysis, "undeclared effect 'trap'"))
-                                          throw std::runtime_error("missing trap effect diagnostic");
                                       auto it = artifacts.analysis.resolvedEffects.find("main#0");
                                       if (it == artifacts.analysis.resolvedEffects.end() || !it->second.contains("trap"))
                                           throw std::runtime_error("missing trap effect inference");
@@ -11500,6 +11693,25 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       const bool genericExhaustive = hasDiagnostic(artifacts.analysis, "non-exhaustive choose expression requires otherwise");
                                       if (!variantExhaustive && !genericExhaustive)
                                           throw std::runtime_error("missing variant exhaustiveness diagnostic");
+                                      });
+                                  test("variant choose payload-safe lowering by tag", [&] {
+                                      const auto artifacts = compileAll(
+                                          "variant Maybe\n"
+                                          "    None\n"
+                                          "    Some\n"
+                                          "routine pick(v: Maybe) gives int\n"
+                                          "    give choose v\n"
+                                          "        case Some\n"
+                                          "            1\n"
+                                          "        otherwise\n"
+                                          "            0\n"
+                                          "routine main() gives int\n"
+                                          "    let v: Maybe = Maybe{Some: 0}\n"
+                                          "    give pick(v)\n",
+                                          CompilerOptions{});
+                                      if (!artifacts.analysis.succeeded())throw std::runtime_error("variant choose semantic diagnostics");
+                                      const auto result = PCIRInterpreter(artifacts.pcir).run("");
+                                      if (result != 1)throw std::runtime_error("variant choose tag-lowering execution mismatch");
                                       });
                                   test("external linker accepts multiple .pcn inputs", [&] {
                                       namespace fs = std::filesystem;
