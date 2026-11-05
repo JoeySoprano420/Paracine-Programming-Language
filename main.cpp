@@ -809,7 +809,6 @@ namespace pcn {
     };
 
     struct Stmt {
-        using Node = std::variant<LetStmt, VarStmt, AssignStmt, ArraySetStmt, RecordSetStmt, ExprStmt, ReturnStmt, GiveStmt, IfStmt, EachStmt, UnsafeStmt, DeferStmt, FailStmt, WhileStmt, BreakStmt, ContinueStmt, BlockStmt>;
         using Node = std::variant<LetStmt, VarStmt, AssignStmt, ArraySetStmt, RecordSetStmt, ExprStmt, ReturnStmt, GiveStmt, IfStmt, EachStmt, FromStmt, ContinueUntilStmt, UnsafeStmt, DeferStmt, FailStmt, WhileStmt, BreakStmt, ContinueStmt, BlockStmt>;
         Node node;
         SourceSpan span;
@@ -2182,7 +2181,6 @@ namespace pcn {
                     return AstFactory::makeStmt(Stmt{ IfStmt{ value.condition, value.thenBranch, value.elseBranch, value.hasElse, span, location }, span, location }, span);
                 }
                 else if constexpr (std::is_same_v<T, EachStmt>) {
-                    return AstFactory::makeStmt(Stmt{ EachStmt{ value.bindings, value.range, value.body, span, location, value.bindingsMutable }, span, location }, span);
                     return AstFactory::makeStmt(Stmt{ EachStmt{ value.bindings, value.range, value.guard, value.body, span, location, value.bindingsMutable }, span, location }, span);
                 }
                 else if constexpr (std::is_same_v<T, FromStmt>) {
@@ -2365,14 +2363,11 @@ namespace pcn {
                 return makeStmt(WhileStmt{ condition, std::move(body),{ start, location }, location }, { start, location }, location);
             }
 
-            if (matchKeyword("break") || matchKeyword("continue")) {
-                const bool isBreak = previous().text == "break";
             if (matchKeyword("break")) {
                 auto location = previous().location;
                 std::string label;
                 if (matchSymbol("@")) label = expectIdentifier().text;
                 consumeLineBreak();
-                if (isBreak) return makeStmt(BreakStmt{ label,{ location, location }, location }, { location, location }, location);
                 return makeStmt(BreakStmt{ label,{ location, location }, location }, { location, location }, location);
             }
 
@@ -2434,7 +2429,6 @@ namespace pcn {
                 expectIndent();
                 auto body = parseBlockStatements();
                 expectDedent();
-                return makeStmt(EachStmt{ std::move(bindings), range, std::move(body),{ start, location }, location, bindingsMutable }, { start, location }, location);
                 return makeStmt(FromStmt{ binding, typeName, first, last, std::move(body),{ start, location }, location }, { start, location }, location);
             }
 
@@ -5078,7 +5072,6 @@ namespace pcn {
                 else if constexpr (std::is_same_v<T, DeferStmt>)walkExpr(n.expression, inClosure);
                 else if constexpr (std::is_same_v<T, IfStmt>) { walkExpr(n.condition, inClosure); scopes_.push_back({}); walkStatements(n.thenBranch, inClosure); scopes_.pop_back(); scopes_.push_back({}); walkStatements(n.elseBranch, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, WhileStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": loop"); walkExpr(n.condition, inClosure); scopes_.push_back({}); walkStatements(n.body, inClosure); scopes_.pop_back(); }
-                else if constexpr (std::is_same_v<T, EachStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": iterator/range loop"); walkExpr(n.range, inClosure); scopes_.push_back({}); for (const auto& b : n.bindings)declare(b, "int", n.bindingsMutable, false, "shared", n.location, point_); walkStatements(n.body, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, EachStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": iterator/range loop"); walkExpr(n.range, inClosure); scopes_.push_back({}); for (const auto& b : n.bindings)declare(b, "int", n.bindingsMutable, false, "shared", n.location, point_); if (n.guard)walkExpr(n.guard, inClosure); walkStatements(n.body, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, FromStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": directed integer loop"); walkExpr(n.first, inClosure); walkExpr(n.last, inClosure); scopes_.push_back({}); declare(n.binding, n.typeName.empty() ? "int" : n.typeName, false, false, "shared", n.location, point_); walkStatements(n.body, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": post-test loop"); walkExpr(n.condition, inClosure); scopes_.push_back({}); walkStatements(n.body, inClosure); scopes_.pop_back(); }
@@ -5162,7 +5155,6 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, RecordSetStmt>)inferClosureExprEffects(n.value, out); else if constexpr (std::is_same_v<T, ExprStmt>)inferClosureExprEffects(n.expression, out); else if constexpr (std::is_same_v<T, ReturnStmt>) { if (n.hasValue)inferClosureExprEffects(n.value, out); }
             else if constexpr (std::is_same_v<T, GiveStmt>)inferClosureExprEffects(n.value, out); else if constexpr (std::is_same_v<T, FailStmt>)inferClosureExprEffects(n.expression, out); else if constexpr (std::is_same_v<T, IfStmt>) { inferClosureExprEffects(n.condition, out); inferClosureStmtEffects(n.thenBranch, out); inferClosureStmtEffects(n.elseBranch, out); }
             else if constexpr (std::is_same_v<T, WhileStmt>) { inferClosureExprEffects(n.condition, out); inferClosureStmtEffects(n.body, out); }
-            else if constexpr (std::is_same_v<T, EachStmt>) { inferClosureExprEffects(n.range, out); inferClosureStmtEffects(n.body, out); }
             else if constexpr (std::is_same_v<T, EachStmt>) { inferClosureExprEffects(n.range, out); inferClosureExprEffects(n.guard, out); inferClosureStmtEffects(n.body, out); }
             else if constexpr (std::is_same_v<T, FromStmt>) { inferClosureExprEffects(n.first, out); inferClosureExprEffects(n.last, out); inferClosureStmtEffects(n.body, out); }
             else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { inferClosureExprEffects(n.condition, out); inferClosureStmtEffects(n.body, out); }
@@ -5187,7 +5179,6 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, ExprStmt>)scanExpr(n.expression); else if constexpr (std::is_same_v<T, ReturnStmt>) { if (n.hasValue)scanExpr(n.value); }
             else if constexpr (std::is_same_v<T, GiveStmt>)scanExpr(n.value); else if constexpr (std::is_same_v<T, FailStmt>)scanExpr(n.expression); else if constexpr (std::is_same_v<T, IfStmt>) { scanExpr(n.condition); scanStmts(n.thenBranch); scanStmts(n.elseBranch); }
             else if constexpr (std::is_same_v<T, WhileStmt>) { scanExpr(n.condition); scanStmts(n.body); }
-            else if constexpr (std::is_same_v<T, EachStmt>) { scanExpr(n.range); for (auto& x : n.bindings)locals.insert(x); scanStmts(n.body); }
             else if constexpr (std::is_same_v<T, EachStmt>) { scanExpr(n.range); for (auto& x : n.bindings)locals.insert(x); scanExpr(n.guard); scanStmts(n.body); }
             else if constexpr (std::is_same_v<T, FromStmt>) { scanExpr(n.first); scanExpr(n.last); locals.insert(n.binding); scanStmts(n.body); }
             else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { scanExpr(n.condition); scanStmts(n.body); }
@@ -5969,7 +5960,6 @@ namespace pcn {
                     if (i != 0) oss << ", ";
                     oss << node.bindings[i];
                 }
-                oss << " in " << exprToString(node.range) << "\n";
                 oss << " in " << exprToString(node.range);
                 if (node.guard) oss << " while " << exprToString(node.guard);
                 oss << "\n";
@@ -6110,7 +6100,6 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, ReturnStmt>) { if (x.hasValue)x.value = rewriteExpr(x.value, m); }
             else if constexpr (std::is_same_v<T, GiveStmt>)x.value = rewriteExpr(x.value, m);
             else if constexpr (std::is_same_v<T, IfStmt>) { x.condition = rewriteExpr(x.condition, m); x.thenBranch = rewriteStatements(x.thenBranch, m); x.elseBranch = rewriteStatements(x.elseBranch, m); }
-            else if constexpr (std::is_same_v<T, EachStmt>) { x.range = rewriteExpr(x.range, m); x.body = rewriteStatements(x.body, m); }
             else if constexpr (std::is_same_v<T, EachStmt>) { x.range = rewriteExpr(x.range, m); x.guard = rewriteExpr(x.guard, m); x.body = rewriteStatements(x.body, m); }
             else if constexpr (std::is_same_v<T, FromStmt>) { x.first = rewriteExpr(x.first, m); x.last = rewriteExpr(x.last, m); x.typeName = subst(x.typeName, m); x.body = rewriteStatements(x.body, m); }
             else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { x.condition = rewriteExpr(x.condition, m); x.body = rewriteStatements(x.body, m); }
@@ -6130,7 +6119,6 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, ArraySetStmt>) { collectClosuresExpr(n.index, out); collectClosuresExpr(n.value, out); }
             else if constexpr (std::is_same_v<T, RecordSetStmt>)collectClosuresExpr(n.value, out); else if constexpr (std::is_same_v<T, ExprStmt>)collectClosuresExpr(n.expression, out); else if constexpr (std::is_same_v<T, ReturnStmt>) { if (n.hasValue)collectClosuresExpr(n.value, out); }
             else if constexpr (std::is_same_v<T, GiveStmt>)collectClosuresExpr(n.value, out); else if constexpr (std::is_same_v<T, IfStmt>) { collectClosuresExpr(n.condition, out); collectClosuresStmt(n.thenBranch, out); collectClosuresStmt(n.elseBranch, out); }
-            else if constexpr (std::is_same_v<T, EachStmt>) { collectClosuresExpr(n.range, out); collectClosuresStmt(n.body, out); }
             else if constexpr (std::is_same_v<T, EachStmt>) { collectClosuresExpr(n.range, out); collectClosuresExpr(n.guard, out); collectClosuresStmt(n.body, out); }
             else if constexpr (std::is_same_v<T, FromStmt>) { collectClosuresExpr(n.first, out); collectClosuresExpr(n.last, out); collectClosuresStmt(n.body, out); }
             else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { collectClosuresExpr(n.condition, out); collectClosuresStmt(n.body, out); }
@@ -6798,7 +6786,6 @@ namespace pcn {
             IRInstruction branch;
             branch.op = IROpcode::BranchIf;
             branch.args.push_back(condition);
-            branch.targetBlocks = { bodyBlock, exitBlock };
             branch.targetBlocks = { candidateBlock, exitBlock };
             branch.valueType = makeIRVoidType();
             emit(std::move(branch));
