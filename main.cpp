@@ -3559,7 +3559,6 @@ namespace pcn {
             auto value = analyzeExpr(node.value);
             if (!isAssignableTo(semanticTypeFromName(field->second), value))
                 report(node.location, "E0315 field assignment type mismatch: expected " + field->second + ", got " + semanticTypeName(value));
-            if (field->second == "string")report(node.location, "E0426 owned string field writes require recursive drop glue");
             return true;
         }
 
@@ -3582,8 +3581,6 @@ namespace pcn {
             const auto value = analyzeExpr(node.value);
             if (!element.empty() && !isAssignableTo(semanticTypeFromName(element), value))
                 report(node.location, "E0312 array element assignment type mismatch: expected " + element + ", got " + semanticTypeName(value));
-            // Owning aggregate elements require recursive drop/move; refuse until proven safe.
-            if (element == "string")report(node.location, "E0426 indexed assignment of owning strings requires recursive drop glue");
             return true;
         }
 
@@ -11287,10 +11284,40 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                               // Deterministic, cycle-checked local source imports. This is a flat import
                               // subset: `use math` resolves sibling math.pcn. It does not implement
                               // namespace aliases, package resolution, visibility rules or module coherence.
+                              // Deterministic, cycle-checked source imports. Resolution prefers local
+                              // sibling modules and falls back to vendored package dependencies.
+                              // Namespace aliases, visibility rules, and full module coherence remain
+                              // outside this bootstrap resolver.
                               static void resolveSourceImports(Program& root, const std::filesystem::path& sourceFile) {
                                   if (sourceFile.empty())return;
                                   namespace fs = std::filesystem;
                                   const auto canonicalRoot = fs::weakly_canonical(sourceFile);
+                                  fs::path packageRoot;
+                                  std::unordered_map<std::string, PackageDependency> packageDeps;
+                                  {
+                                      std::error_code ec;
+                                      auto cursor = canonicalRoot.parent_path();
+                                      for (;;) {
+                                          if (cursor.empty()) break;
+                                          if (fs::is_regular_file(packageManifestPath(cursor), ec)) {
+                                              packageRoot = cursor;
+                                              break;
+                                          }
+                                          const auto parent = cursor.parent_path();
+                                          if (parent == cursor) break;
+                                          cursor = parent;
+                                      }
+                                      if (!packageRoot.empty()) {
+                                          try {
+                                              const auto manifest = readPackageManifest(packageRoot);
+                                              for (const auto& dep : manifest.dependencies)
+                                                  if (!dep.name.empty()) packageDeps[dep.name] = dep;
+                                          }
+                                          catch (...) {
+                                              packageDeps.clear();
+                                          }
+                                      }
+                                  }
                                   std::set<fs::path> visited, active;
                                   visited.insert(canonicalRoot);
                                   std::vector<Routine> loadedRoutines;
@@ -11305,16 +11332,43 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           if (u->path.size() != 1 || u->path[0].empty())throw std::runtime_error("E0522 malformed source import");
                                           const auto& name = u->path[0];
                                           fs::path relative;
+                                          std::vector<std::string> components;
                                           std::size_t start = 0;
                                           while (start < name.size()) {
                                               auto end = name.find("::", start);
                                               auto component = name.substr(start, end == std::string::npos ? std::string::npos : end - start);
                                               if (component.empty() || component == "." || component == "..")throw std::runtime_error("E0522 invalid import component");
+                                              components.push_back(component);
                                               relative /= component;
                                               if (end == std::string::npos)break;
                                               start = end + 2;
                                           }
                                           auto target = fs::weakly_canonical(file.parent_path() / (relative.string() + ".pcn"));
+                                          bool resolved = false;
+                                          std::error_code ec;
+                                          if (fs::is_regular_file(target, ec)) {
+                                              resolved = true;
+                                          }
+                                          else if (!packageRoot.empty() && !components.empty()) {
+                                              const auto depIt = packageDeps.find(components.front());
+                                              if (depIt != packageDeps.end()) {
+                                                  fs::path vendorBase = packageRoot / "vendor" / depIt->second.name / depIt->second.version;
+                                                  fs::path packageTarget;
+                                                  if (components.size() == 1) {
+                                                      packageTarget = vendorBase / "package.pcn";
+                                                  }
+                                                  else {
+                                                      fs::path nested;
+                                                      for (std::size_t i = 1; i < components.size(); ++i) nested /= components[i];
+                                                      packageTarget = vendorBase / (nested.string() + ".pcn");
+                                                  }
+                                                  if (fs::is_regular_file(packageTarget, ec)) {
+                                                      target = fs::weakly_canonical(packageTarget);
+                                                      resolved = true;
+                                                  }
+                                              }
+                                          }
+                                          if (!resolved)throw std::runtime_error("E0525 missing source import: " + name);
                                           if (active.contains(target) || target == canonicalRoot)
                                               throw std::runtime_error("E0523 import cycle involving: " + target.string());
                                           if (visited.contains(target))continue;
