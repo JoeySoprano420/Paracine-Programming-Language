@@ -4055,13 +4055,34 @@ namespace pcn {
         SemanticType analyzeChooseExpr(const ChooseExpr& node) {
             auto subjectType = node.subject ? analyzeExpr(node.subject) : makeUnknownType();
             if (!node.hasOtherwise) report(node.location, "non-exhaustive choose expression requires otherwise");
+            std::set<std::string> variantTags;
+            bool variantSubject = false;
+            if (node.subject && subjectType.kind == SemanticTypeKind::Custom) {
+                auto it = nominalTypes_.find(subjectType.name);
+                if (it != nominalTypes_.end() && it->second.info.kind == "variant") {
+                    variantSubject = true;
+                    variantTags.insert(it->second.info.tags.begin(), it->second.info.tags.end());
+                }
+            }
             SemanticType resultType = makeUnknownType();
+            std::set<std::string> coveredVariantTags;
             for (const auto& choice : node.cases) {
-                const auto conditionType = analyzeExpr(choice.condition);
-                if (!node.subject && conditionType.kind != SemanticTypeKind::Bool && conditionType.kind != SemanticTypeKind::Unknown)
-                    report(choice.location, "subjectless choose when-clause requires bool");
-                if (node.subject && !isAssignableTo(subjectType, conditionType) && !isAssignableTo(conditionType, subjectType))
-                    report(choice.location, "choose subject and when-clause must have compatible types");
+                bool variantSelectorCase = false;
+                if (variantSubject && choice.condition) {
+                    if (const auto* variable = std::get_if<VariableExpr>(&choice.condition->node)) {
+                        if (variantTags.contains(variable->name)) {
+                            coveredVariantTags.insert(variable->name);
+                            variantSelectorCase = true;
+                        }
+                    }
+                }
+                if (!variantSelectorCase) {
+                    const auto conditionType = analyzeExpr(choice.condition);
+                    if (!node.subject && conditionType.kind != SemanticTypeKind::Bool && conditionType.kind != SemanticTypeKind::Unknown)
+                        report(choice.location, "subjectless choose when-clause requires bool");
+                    if (node.subject && !isAssignableTo(subjectType, conditionType) && !isAssignableTo(conditionType, subjectType))
+                        report(choice.location, "choose subject and when-clause must have compatible types");
+                }
                 auto branchType = analyzeExpr(choice.value);
                 if (resultType.kind == SemanticTypeKind::Unknown) {
                     resultType = branchType;
@@ -4078,6 +4099,23 @@ namespace pcn {
                 else if (!isAssignableTo(resultType, otherwiseType) && !isAssignableTo(otherwiseType, resultType)) {
                     report(node.location, "otherwise branch must match choose branch types");
                 }
+            }
+            if (variantSubject && !variantTags.empty()) {
+                std::vector<std::string> missing;
+                for (const auto& tag : variantTags)
+                    if (!coveredVariantTags.contains(tag)) missing.push_back(tag);
+                if (!missing.empty() && !node.hasOtherwise) {
+                    std::ostringstream oss;
+                    oss << "non-exhaustive choose over variant '" << subjectType.name << "'; missing case(s): ";
+                    for (std::size_t i = 0; i < missing.size(); ++i) {
+                        if (i) oss << ", ";
+                        oss << missing[i];
+                    }
+                    report(node.location, oss.str());
+                }
+            }
+            else if (!node.hasOtherwise) {
+                report(node.location, "non-exhaustive choose expression requires otherwise");
             }
             return resultType;
         }
@@ -4381,6 +4419,13 @@ namespace pcn {
                 return makeUnknownType();
             }
 
+            for (const auto& explicitType : explicitGenericArguments) {
+                if (!isKnownConcreteTypeForGenerics(explicitType)) {
+                    report(location, "unknown or invalid explicit generic type argument: " + explicitType);
+                    return makeUnknownType();
+                }
+            }
+
             std::vector<SemanticType> argumentTypes = collectArgumentTypes(arguments);
 
             std::vector<SemanticAnalyzer::Candidate> candidates = buildCandidates(it->second, argumentTypes, explicitGenericArguments);
@@ -4474,9 +4519,80 @@ namespace pcn {
                     if (!isAssignableTo(signature.parameterTypes[i], argumentTypes[i])) { compatible = false; break; }
                     if (argumentTypes[i] == signature.parameterTypes[i]) ++score;
                 }
+                if (compatible && !genericNames.empty()) {
+                    for (const auto& generic : signature.genericParameters) {
+                        if (!substitutions.contains(generic)) {
+                            compatible = false;
+                            break;
+                        }
+                    }
+                }
+                if (compatible && !genericNames.empty()) {
+                    const auto returnTypeText = substituteGenericType(semanticTypeName(signature.returnType), substitutions);
+                    if (containsUnsubstitutedGeneric(returnTypeText, genericNames) || !isKnownConcreteTypeForGenerics(returnTypeText)) {
+                        compatible = false;
+                    }
+                }
+                if (compatible && !genericNames.empty()) {
+                    for (const auto& parameter : signature.parameterTypes) {
+                        const auto substituted = substituteGenericType(semanticTypeName(parameter), substitutions);
+                        if (containsUnsubstitutedGeneric(substituted, genericNames) || !isKnownConcreteTypeForGenerics(substituted)) {
+                            compatible = false;
+                            break;
+                        }
+                    }
+                }
                 if (compatible) candidates.push_back(SemanticAnalyzer::Candidate{ &signature, score, std::move(substitutions) });
             }
             return candidates;
+        }
+
+        static bool canonicalContainsGeneric(const CanonicalTypeExpr& typeExpr, const std::unordered_set<std::string>& genericNames) {
+            if (!typeExpr.tuple && genericNames.contains(typeExpr.head)) return true;
+            for (const auto& arg : typeExpr.args)
+                if (canonicalContainsGeneric(arg, genericNames)) return true;
+            return false;
+        }
+
+        static bool canonicalKnownConcrete(const CanonicalTypeExpr& typeExpr,
+            const std::unordered_map<std::string, NominalRecord>& nominalTypes,
+            const std::unordered_map<std::string, RoutineSignature>& closureSignatures) {
+            if (typeExpr.tuple) {
+                for (const auto& arg : typeExpr.args)
+                    if (!canonicalKnownConcrete(arg, nominalTypes, closureSignatures)) return false;
+                return true;
+            }
+            static const std::unordered_set<std::string> genericContainerHeads = {
+                "result", "option", "raw", "view", "span", "ref", "mut", "array"
+            };
+            const bool knownHead =
+                isBuiltinTypeName(typeExpr.head) || typeExpr.head == "never" ||
+                nominalTypes.contains(typeExpr.head) || closureSignatures.contains(typeExpr.head) ||
+                genericContainerHeads.contains(typeExpr.head);
+            if (!knownHead) return false;
+            for (const auto& arg : typeExpr.args)
+                if (!canonicalKnownConcrete(arg, nominalTypes, closureSignatures)) return false;
+            return true;
+        }
+
+        bool containsUnsubstitutedGeneric(const std::string& typeName, const std::unordered_set<std::string>& genericNames) const {
+            try {
+                const auto parsed = CanonicalTypeParser(typeName).parse();
+                return canonicalContainsGeneric(parsed, genericNames);
+            }
+            catch (...) {
+                return false;
+            }
+        }
+
+        bool isKnownConcreteTypeForGenerics(const std::string& typeName) const {
+            try {
+                const auto parsed = CanonicalTypeParser(typeName).parse();
+                return canonicalKnownConcrete(parsed, nominalTypes_, closureSignatures_);
+            }
+            catch (...) {
+                return false;
+            }
         }
 
         std::string formatSignature(const RoutineSignature& signature) const {
@@ -5221,6 +5337,16 @@ namespace pcn {
             return !typeName.empty() && !isCopyType(typeName);
         }
 
+        static bool isSharedBorrowMode(const std::string& mode) {
+            return mode == "shared" || mode == "raw";
+        }
+
+        static bool isBorrowConflict(bool hasShared, bool hasExclusive, bool hasOwned, const std::string& mode) {
+            if (mode == "own") return hasShared || hasExclusive || hasOwned;
+            if (mode == "var") return hasShared || hasExclusive || hasOwned;
+            return hasExclusive || hasOwned;
+        }
+
         std::string inferBorrowType(const ExprPtr& e, BorrowState& state) {
             if (!e) return {};
             if (const auto* v = std::get_if<VariableExpr>(&e->node)) {
@@ -5287,6 +5413,27 @@ namespace pcn {
                     }
                     const Routine* callee = nullptr;
                     if (const auto* v = node.callee ? std::get_if<VariableExpr>(&node.callee->node) : nullptr) callee = resolveRoutine(v->name, node.arguments.size());
+                    struct BorrowUse {
+                        bool shared = false;
+                        bool exclusive = false;
+                        bool owned = false;
+                        SourceLocation firstLocation{};
+                    };
+                    std::unordered_map<std::string, BorrowUse> borrowUses;
+                    for (std::size_t i = 0; i < node.arguments.size(); ++i) {
+                        const auto& arg = node.arguments[i];
+                        std::string mode = callee && i < callee->parameters.size() ? callee->parameters[i].mode : "shared";
+                        const auto* variable = arg ? std::get_if<VariableExpr>(&arg->node) : nullptr;
+                        if (!variable) continue;
+                        auto& use = borrowUses[variable->name];
+                        if (use.firstLocation.line == 0) use.firstLocation = variable->location;
+                        if (isBorrowConflict(use.shared, use.exclusive, use.owned, mode)) {
+                            report(variable->location, "E0434 conflicting borrows in call for value '" + variable->name + "' (shared/exclusive/owned overlap)");
+                        }
+                        if (mode == "own") use.owned = true;
+                        else if (mode == "var") use.exclusive = true;
+                        else if (isSharedBorrowMode(mode)) use.shared = true;
+                    }
                     for (std::size_t i = 0; i < node.arguments.size(); ++i) {
                         const auto& arg = node.arguments[i];
                         std::string mode = callee && i < callee->parameters.size() ? callee->parameters[i].mode : "shared";
@@ -10767,6 +10914,9 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   std::vector<std::string> sources;
                                   std::string output, entry = "main", executable = "lld-link", subsystem = "console";
                                   std::vector<std::string> otherInputs, searchPaths;
+                                  std::vector<std::string> otherInputs, searchPaths, defaultLibs, wholeArchives;
+                                  std::string importLibrary;
+                                  bool noDefaultLib = true;
                                   bool dll = false;
                                   for (std::size_t i = 1; i < args.size(); ++i) {
                                       const auto& a = args[i];
@@ -10774,6 +10924,10 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       else if (a == "--entry" && i + 1 < args.size())entry = args[++i];
                                       else if (a == "--linker" && i + 1 < args.size())executable = args[++i];
                                       else if (a == "--libpath" && i + 1 < args.size())searchPaths.push_back(args[++i]);
+                                      else if (a == "--defaultlib" && i + 1 < args.size()) { defaultLibs.push_back(args[++i]); noDefaultLib = false; }
+                                      else if (a == "--wholearchive" && i + 1 < args.size())wholeArchives.push_back(args[++i]);
+                                      else if (a == "--implib" && i + 1 < args.size())importLibrary = args[++i];
+                                      else if (a == "--use-defaultlibs")noDefaultLib = false;
                                       else if (a == "--subsystem" && i + 1 < args.size())subsystem = args[++i];
                                       else if (a == "--dll")dll = true;
                                       else if (a.size() && a[0] == '-')throw std::runtime_error("unsupported link argument: " + a);
@@ -10783,6 +10937,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       else {
                                           auto ext = std::filesystem::path(a).extension().string();
                                           if (ext != ".obj" && ext != ".lib" && ext != ".res")throw std::runtime_error("external link input must be .pcn, .obj, .lib, or .res: " + a);
+                                          if (ext != ".obj" && ext != ".lib" && ext != ".res" && ext != ".exp" && ext != ".def")throw std::runtime_error("external link input must be .pcn, .obj, .lib, .res, .exp, or .def: " + a);
                                           if (!std::filesystem::exists(a))throw std::runtime_error("external link input does not exist: " + a);
                                           otherInputs.push_back(a);
                                       }
@@ -10809,10 +10964,19 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       scratch.files.push_back(std::move(temp));
                                   }
                                   std::vector<std::string> invocation = { executable,"/nologo","/machine:x64","/nodefaultlib","/out:" + output };
+                                  std::vector<std::string> invocation = { executable,"/nologo","/machine:x64","/out:" + output };
+                                  if (noDefaultLib)invocation.push_back("/nodefaultlib");
                                   invocation.push_back("/subsystem:" + subsystem);
                                   if (dll) { invocation.push_back("/dll"); invocation.push_back("/noentry"); }
+                                  if (dll) {
+                                      invocation.push_back("/dll");
+                                      invocation.push_back("/noentry");
+                                      if (!importLibrary.empty())invocation.push_back("/implib:" + importLibrary);
+                                  }
                                   else invocation.push_back("/entry:" + entry);
                                   for (const auto& dir : searchPaths)invocation.push_back("/libpath:" + dir);
+                                  for (const auto& lib : defaultLibs)invocation.push_back("/defaultlib:" + lib);
+                                  for (const auto& lib : wholeArchives)invocation.push_back("/wholearchive:" + lib);
                                   for (const auto& file : scratch.files)invocation.push_back(file.string());
                                   for (const auto& arg : otherInputs)invocation.push_back(arg);
                                   const int result = executeArgv(invocation);
@@ -11145,9 +11309,27 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       if (strSize < 4) throw std::runtime_error("E0910 invalid string table");
                                       require(std::uint64_t(symbolOffset) + std::uint64_t(symbolCount) * 18, strSize, "COFF string table");
                                   }
+                                  std::vector<std::int32_t> symbolSectionRefs(symbolCount, 0);
+                                  if (symbolCount) {
+                                      for (std::uint32_t i = 0; i < symbolCount; ++i) {
+                                          const std::uint64_t record = std::uint64_t(symbolOffset) + std::uint64_t(i) * 18ull;
+                                          require(record, 18, "truncated symbol entry");
+                                          const std::int16_t sectionNumber = static_cast<std::int16_t>(u16(record + 12));
+                                          const std::uint8_t auxCount = b[std::size_t(record + 17)];
+                                          if (sectionNumber > 0 && static_cast<std::uint16_t>(sectionNumber) > result.sectionCount)
+                                              throw std::runtime_error("E0910 symbol references out-of-range section");
+                                          symbolSectionRefs[i] = sectionNumber;
+                                          if (auxCount) {
+                                              if (i + auxCount >= symbolCount)throw std::runtime_error("E0910 symbol auxiliary record overflow");
+                                              i += auxCount;
+                                          }
+                                      }
+                                  }
                                   auto sectionTable = optional + optionalSize;
                                   require(sectionTable, std::uint64_t(result.sectionCount) * 40, "section table");
                                   bool executableEntry = !pe;
+                                  std::uint32_t pdataRawOffset = 0, pdataRawSize = 0, pdataVirtualSize = 0, pdataRva = 0;
+                                  std::uint32_t xdataRva = 0, xdataSpan = 0;
                                   for (unsigned i = 0; i < result.sectionCount; ++i) {
                                       auto sh = sectionTable + i * 40ull;
                                       std::string name;
@@ -11162,14 +11344,47 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       auto flags = u32(sh + 36);
                                       if (rawSize) require(rawOffset, rawSize, "section raw bytes out of file");
                                       if (relocCount) require(relocOffset, std::uint64_t(relocCount) * 10, "COFF relocations out of file");
+                                      if (relocCount && !symbolCount)
+                                          throw std::runtime_error("E0910 relocation records require a symbol table");
+                                      for (std::uint16_t r = 0; r < relocCount; ++r) {
+                                          const auto reloc = std::uint64_t(relocOffset) + std::uint64_t(r) * 10ull;
+                                          const auto symbolIndex = u32(reloc + 4);
+                                          if (symbolIndex >= symbolCount)
+                                              throw std::runtime_error("E0910 relocation references out-of-range symbol index");
+                                      }
                                       if (pe) {
                                           if (std::uint64_t(virtualAddress) + std::max(virtualSize, rawSize) > result.imageSize)
                                               throw std::runtime_error("E0910 section extends beyond SizeOfImage");
                                           if ((flags & 0x20000000u) && result.entryRVA >= virtualAddress &&
                                               std::uint64_t(result.entryRVA) < std::uint64_t(virtualAddress) + std::max(virtualSize, rawSize))
                                               executableEntry = true;
+                                          if (name == ".pdata") {
+                                              pdataRawOffset = rawOffset;
+                                              pdataRawSize = rawSize;
+                                              pdataVirtualSize = virtualSize;
+                                              pdataRva = virtualAddress;
+                                          }
+                                          if (name == ".xdata") {
+                                              xdataRva = virtualAddress;
+                                              xdataSpan = std::max(virtualSize, rawSize);
+                                          }
                                       }
                                       result.sections.push_back(name);
+                                  }
+                                  if (pe && pdataRawSize) {
+                                      const std::uint32_t runtimeBytes = pdataVirtualSize ? pdataVirtualSize : pdataRawSize;
+                                      if (runtimeBytes % 12 != 0) throw std::runtime_error("E0910 .pdata size is not aligned to RUNTIME_FUNCTION entries");
+                                      if (!xdataSpan) throw std::runtime_error("E0910 .pdata present without .xdata unwind section");
+                                      if (runtimeBytes > pdataRawSize) throw std::runtime_error("E0910 .pdata virtual size exceeds raw section bytes");
+                                      for (std::uint32_t at = 0; at < runtimeBytes; at += 12) {
+                                          const auto beginRva = u32(std::uint64_t(pdataRawOffset) + at + 0);
+                                          const auto endRva = u32(std::uint64_t(pdataRawOffset) + at + 4);
+                                          const auto unwindRva = u32(std::uint64_t(pdataRawOffset) + at + 8);
+                                          if (!(beginRva < endRva)) throw std::runtime_error("E0910 invalid runtime-function range in .pdata");
+                                          if (endRva > result.imageSize) throw std::runtime_error("E0910 runtime-function range exceeds image size");
+                                          if (unwindRva < xdataRva || std::uint64_t(unwindRva) >= std::uint64_t(xdataRva) + xdataSpan)
+                                              throw std::runtime_error("E0910 runtime-function unwind RVA is outside .xdata");
+                                      }
                                   }
                                   if (!executableEntry)throw std::runtime_error("E0910 entry point is not in executable section");
                                   return result;
@@ -11250,6 +11465,42 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       if (!hasDiagnostic(artifacts.analysis, "use after move: 'input'"))
                                           throw std::runtime_error("missing non-copy move diagnostic");
                                       });
+                                  test("generic explicit type argument validation", [&] {
+                                      const auto artifacts = compileAll(
+                                          "routine id<T>(x: T) gives T\n"
+                                          "    give x\n"
+                                          "routine main() gives int\n"
+                                          "    give id<UnknownType>(1)\n",
+                                          CompilerOptions{}, false);
+                                      if (!hasDiagnostic(artifacts.analysis, "unknown or invalid explicit generic type argument"))
+                                          throw std::runtime_error("missing generic argument validation diagnostic");
+                                      });
+                                  test("flow-sensitive borrow conflict in one call", [&] {
+                                      const auto artifacts = compileAll(
+                                          "routine mix(own a: string, b: string) gives int\n"
+                                          "    give 0\n"
+                                          "routine main() gives int\n"
+                                          "    var s: string = \"seed\".to_string()\n"
+                                          "    give mix(s, s)\n",
+                                          CompilerOptions{}, false);
+                                      if (!hasDiagnostic(artifacts.analysis, "E0434 conflicting borrows in call"))
+                                          throw std::runtime_error("missing call-borrow conflict diagnostic");
+                                      });
+                                  test("variant choose exhaustiveness without otherwise", [&] {
+                                      const auto artifacts = compileAll(
+                                          "variant Maybe\n"
+                                          "    None\n"
+                                          "    Some\n"
+                                          "routine main(v: Maybe) gives int\n"
+                                          "    give choose v\n"
+                                          "        case None\n"
+                                          "            0\n",
+                                          CompilerOptions{}, false);
+                                      const bool variantExhaustive = hasDiagnostic(artifacts.analysis, "non-exhaustive choose over variant 'Maybe'");
+                                      const bool genericExhaustive = hasDiagnostic(artifacts.analysis, "non-exhaustive choose expression requires otherwise");
+                                      if (!variantExhaustive && !genericExhaustive)
+                                          throw std::runtime_error("missing variant exhaustiveness diagnostic");
+                                      });
                                   test("external linker accepts multiple .pcn inputs", [&] {
                                       namespace fs = std::filesystem;
                                       const auto root = fs::temp_directory_path() / ("paracine-link-selftest-" + std::to_string(std::uint64_t(std::chrono::steady_clock::now().time_since_epoch().count())));
@@ -11270,6 +11521,51 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       fs::remove_all(root, ec);
                                       if (!acceptedMultipleUnits)throw std::runtime_error("multi-unit .pcn link still rejected");
                                       if (!failedAsExpected)throw std::runtime_error("link test did not reach external linker stage");
+                                      });
+                                  test("external linker accepts import-library options", [&] {
+                                      namespace fs = std::filesystem;
+                                      const auto root = fs::temp_directory_path() / ("paracine-link-implib-selftest-" + std::to_string(std::uint64_t(std::chrono::steady_clock::now().time_since_epoch().count())));
+                                      fs::create_directories(root);
+                                      writeTextFile(root / "dllmain.pcn", "routine main() gives int\n    give 0\n");
+                                      bool failedAsExpected = false;
+                                      try {
+                                          (void)runExternalCOFFLink({ "link", "--dll", (root / "dllmain.pcn").string(), "--implib", (root / "x.lib").string(), "--defaultlib", "kernel32.lib", "--linker", "paracine-no-such-linker" });
+                                      }
+                                      catch (const std::exception&) {
+                                          failedAsExpected = true;
+                                      }
+                                      std::error_code ec;
+                                      fs::remove_all(root, ec);
+                                      if (!failedAsExpected)throw std::runtime_error("import-library options were not accepted to linker invocation stage");
+                                      });
+                                  test("native verifier rejects relocation with bad symbol index", [&] {
+                                      auto writeU16 = [](std::vector<std::uint8_t>& out, std::size_t at, std::uint16_t value) {
+                                          out[at] = static_cast<std::uint8_t>(value & 0xFFu);
+                                          out[at + 1] = static_cast<std::uint8_t>((value >> 8) & 0xFFu);
+                                          };
+                                      auto writeU32 = [](std::vector<std::uint8_t>& out, std::size_t at, std::uint32_t value) {
+                                          out[at] = static_cast<std::uint8_t>(value & 0xFFu);
+                                          out[at + 1] = static_cast<std::uint8_t>((value >> 8) & 0xFFu);
+                                          out[at + 2] = static_cast<std::uint8_t>((value >> 16) & 0xFFu);
+                                          out[at + 3] = static_cast<std::uint8_t>((value >> 24) & 0xFFu);
+                                          };
+                                      const std::uint32_t sectionTable = 20;
+                                      const std::uint32_t relocOffset = sectionTable + 40;
+                                      const std::uint32_t symbolOffset = relocOffset + 10;
+                                      std::vector<std::uint8_t> obj(symbolOffset + 18 + 4, 0);
+                                      writeU16(obj, 0, 0x8664);
+                                      writeU16(obj, 2, 1);
+                                      writeU32(obj, 8, symbolOffset);
+                                      writeU32(obj, 12, 1);
+                                      std::memcpy(obj.data() + sectionTable, ".text", 5);
+                                      writeU32(obj, sectionTable + 24, relocOffset);
+                                      writeU16(obj, sectionTable + 32, 1);
+                                      writeU32(obj, relocOffset + 4, 2);
+                                      writeU32(obj, symbolOffset + 18, 4);
+                                      bool rejected = false;
+                                      try { (void)verifyNativeArtifact(obj); }
+                                      catch (const std::exception&) { rejected = true; }
+                                      if (!rejected)throw std::runtime_error("bad relocation symbol index accepted");
                                       });
                                   test("native verifier accepts broader section-count range", [&] {
                                       std::vector<std::uint8_t> obj(20 + 100 * 40, 0);
