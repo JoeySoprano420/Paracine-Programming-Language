@@ -1,22 +1,69 @@
-Area	Implementation status	What was verified	Important remaining gap
-Source normalization	Partial	UTF-8 validation and line-ending normalization	Full NFC normalization and all raw source forms
-Layout lexer	Subset tested	Four-space INDENT/DEDENT and blank line tests	All lexical edge cases and line continuation proofs
-Modules and imports	Partial	Flat module hello plus std.io import	Full package/module graph and visibility enforcement
-Routines and calls	Subset tested	Routine calls and return values	Full ABI forms and all generic/closure interactions
-Basic numeric and text types	Partial	Arithmetic and text stdout in covered programs	All widths strict conversions char behavior and nontrivial text APIs
-Records arrays variants	Partial	Fixed array iteration + existing aggregate/variant cases	All aggregates and layout/serialization/ABI rules
-For/for-while	Partial + extended	Fixed array and numeric range guard tests at O0/O3	Arbitrary iterator and view iteration mutable borrowing
-From/to inclusive	Partial + extended	Ascending descending equal endpoint and labels tests	All unsigned widths and endpoint/side-effect/cleanup proofs
-Continue/until	Partial + extended	Labeled post-test behavior on PCIR and machine	Complete defer/cleanup/event/trap matrix
-Labeled break/continue	Implemented for covered loops	Nested PCIR + x64 target execution	Deep ownership/defers/closure interactions
-Results/options/try/fail	Partial	Existing semantic/IR tests	Complete result error propagation and ABI/native tests
-SAGE analysis	Partial	Semantic diagnostics and SKM + some strict verifiers	Full legality proofs and stylometry profile integration
-Ownership and borrowing	Partial	Selected move/borrow selftests	Complete nonlexical region and concurrency rules
-Generics and closures	Partial	Selected specialization and closure paths	Full generic capabilities/zero-allocation closure semantics
-PCIR optimizer	Partial	Verifier and selected optimizer differential tests	Every opcode and optimization transformation proof
-PMIR x64 generator	Partial	Host shim native tests for covered examples	Full Win64 ABI unwind atomic thread and all type combinations
-COFF and PE32+	Partial	Structural verification and artifact generation	Windows loader certification and full link-feature support
-Windows native linker	Limited	Minimal image generation and selected COFF integration	All static archive COMDAT TLS CFG PDB resources libraries
-Standard library	Limited	Text output and some alloc/string operations	Networking dynlib threads channels filesystem and full std APIs
-C++20 exporter	Optional + incomplete	Selected simple programs	Closure aggregates result option and complete semantics
-Self-hosting and production hardening	Not certified	C++23 development build only	Self-hosting reproducibility fuzzing security and mature release gates
+PCIR opcode	effect classification	implemented optimization / handling	preconditions and explicit limitations
+ConstInt	PureTotal	Constant fact tracking and dead-result elimination	Only when observable values are unchanged
+ConstFloat	PureTotal	Constant fact tracking and dead-result elimination	Only when observable values are unchanged
+ConstText	PureTotal	Constant fact tracking and dead-result elimination	Only when observable values are unchanged
+ConstBool	PureTotal	Constant fact tracking and dead-result elimination	Only when observable values are unchanged
+ConstNull	PureTotal	Constant fact tracking and dead-result elimination	Only when observable values are unchanged
+Copy	PureTotal	Write-aware copy propagation and scalar dead copy elimination	No substitution into predecessor PHI edges
+Add	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Sub	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Mul	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Div	MayTrap	Integral constant folding for proven nonzero divisor	Division/remainder traps preserved; cannot be removed by DCE
+Mod	MayTrap	Integral constant folding for proven nonzero divisor	Division/remainder traps preserved; cannot be removed by DCE
+BitAnd	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+BitOr	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+BitXor	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Shl	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Shr	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Neg	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+BitNot	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Not	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Eq	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Ne	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Lt	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Le	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Gt	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Ge	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+And	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Or	PureTotal	Integral constant folding, algebraic identities, local value numbering	Integral operands only; no IEEE-754 reassociation
+Phi	ControlFlow	Same-register incoming PHI reduction	Path-specific phi semantics remain authoritative
+Branch	ControlFlow	Unreachable-block pruning	Retained edges and PHI inputs are reconciled
+BranchIf	ControlFlow	Conditional branch folding	Constant condition or identical targets only
+Call	Observable	Small pure scalar leaf routine inlining	-O3, single-block <=24 instructions, no effects; generic calls preserved
+CallClosure	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+TextToString	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+StringToText	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+StringClear	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+StringDispose	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+StringMove	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+StringAppend	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+ByteCount	MayTrap	Exact immutable UTF-8 literal specialization	Only when literal facts prove result, and bounds checks prove safe
+TextEquals	MayTrap	Exact immutable UTF-8 literal specialization	Only when literal facts prove result, and bounds checks prove safe
+TextByteAt	MayTrap	Exact immutable UTF-8 literal specialization	Only when literal facts prove result, and bounds checks prove safe
+TextFindByte	MayTrap	Exact immutable UTF-8 literal specialization	Only when literal facts prove result, and bounds checks prove safe
+TextStartsWith	MayTrap	Exact immutable UTF-8 literal specialization	Only when literal facts prove result, and bounds checks prove safe
+TextEndsWith	MayTrap	Exact immutable UTF-8 literal specialization	Only when literal facts prove result, and bounds checks prove safe
+TextSlice	MayTrap	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+TextHash64	MayTrap	Exact immutable UTF-8 literal specialization	Only when literal facts prove result, and bounds checks prove safe
+TextCodepointAt	MayTrap	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+TextCodepointCount	MayTrap	Exact immutable UTF-8 literal specialization	Only when literal facts prove result, and bounds checks prove safe
+TextIsAscii	MayTrap	Exact immutable UTF-8 literal specialization	Only when literal facts prove result, and bounds checks prove safe
+TextFindText	MayTrap	Exact immutable UTF-8 literal specialization	Only when literal facts prove result, and bounds checks prove safe
+TextCompare	MayTrap	Exact immutable UTF-8 literal specialization	Only when literal facts prove result, and bounds checks prove safe
+TextRFindText	MayTrap	Exact immutable UTF-8 literal specialization	Only when literal facts prove result, and bounds checks prove safe
+TextStreamWrite	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+NumericCheckedCast	MayTrap	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+MakeAggregate	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+ExtractField	MayTrap	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+ArrayIndex	MayTrap	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+ArrayStore	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+StoreField	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+ResultOk	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+ResultErr	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+ResultIsErr	MayTrap	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+ResultTry	MayTrap	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+OptionSome	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+OptionNone	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+MakeClosure	Observable	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+Return	ControlFlow	Safety classified / preserved by optimizer	No general transformation is claimed without proof
+Nop	PureTotal	Dead pure-result elimination	No removal if a trap or side effect is possible
