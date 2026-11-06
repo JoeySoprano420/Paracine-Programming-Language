@@ -8540,20 +8540,38 @@ namespace pcn {
 
     };
 
+    // Semantics-first PCIR optimizer.
+    // Important: this bootstrap PCIR permits multiple writes to a VReg. It is NOT
+    // strict SSA. Every transformation below respects value-cell writes, the
+    // trap/ownership contract, and the original instruction order.
     class PCIROptimizer {
     public:
         explicit PCIROptimizer(int level = 2) : level_(std::clamp(level, 0, 3)) {}
 
         void optimize(IRProgram& program) const {
             if (level_ == 0) return;
-            const int maxRounds = level_ >= 3 ? 12 : (level_ == 2 ? 8 : 4);
+            if (level_ >= 3) inlineSmallScalarLeaves(program);
+            const int maxRounds = level_ == 3 ? 12 : level_ == 2 ? 8 : 4;
             for (auto& fn : program.functions) {
+                const auto types = registerTypes(fn);
                 for (int round = 0; round < maxRounds; ++round) {
                     bool changed = false;
-                    for (auto& block : fn.blocks) changed = foldBlock(block) || changed;
-                    if (level_ >= 1) changed = copyPropagate(fn) || changed;
-                    if (level_ >= 2) changed = removeDeadPureInstructions(fn) || changed;
-                    if (level_ >= 2) changed = removeRedundantPhi(fn) || changed;
+                    const auto incoming = (level_ >= 2) ? incomingConstants(fn, types) : Incoming{};
+                    const auto textIncoming = (level_ >= 2) ? incomingTextLiterals(fn) : TextIncoming{};
+                    for (auto& block : fn.blocks) {
+                        auto it = incoming.find(reg(block.id));
+                        ConstMap initial = it == incoming.end() ? ConstMap{} : it->second;
+                        auto tit = textIncoming.find(reg(block.id));
+                        TextMap texts = tit == textIncoming.end() ? TextMap{} : tit->second;
+                        changed = simplifyBlock(block, std::move(initial), types, level_ >= 3, std::move(texts)).first || changed;
+                    }
+                    changed = copyPropagate(fn) || changed;
+                    if (level_ >= 2) {
+                        // Fixed-point DCE is needed because a dead result may be
+                        // the sole consumer of another pure instruction.
+                        while (removeDeadPureInstructions(fn)) changed = true;
+                        changed = removeRedundantPhi(fn) || changed;
+                    }
                     if (level_ >= 3) changed = removeUnreachableBlocks(fn) || changed;
                     if (!changed) break;
                 }
@@ -8561,212 +8579,736 @@ namespace pcn {
         }
 
     private:
-        struct Constant { bool known = false; std::int64_t value = 0; bool boolean = false; };
-
-        static bool pure(IROpcode op) {
+        enum class EffectClass { PureTotal, MayTrap, Observable, ControlFlow };
+        // This classification covers EVERY PCIR opcode, including those not
+        // eligible for optimization. Unknown or effectful operations fail closed.
+        static constexpr EffectClass effectOf(IROpcode op) {
             switch (op) {
-            case IROpcode::ConstInt: case IROpcode::ConstFloat: case IROpcode::ConstBool: case IROpcode::ConstNull: case IROpcode::Copy:
-            case IROpcode::Add: case IROpcode::Sub: case IROpcode::Mul: case IROpcode::BitAnd: case IROpcode::BitOr:
-            case IROpcode::BitXor: case IROpcode::Shl: case IROpcode::Shr: case IROpcode::Neg: case IROpcode::BitNot:
-            case IROpcode::Not: case IROpcode::Eq: case IROpcode::Ne: case IROpcode::Lt: case IROpcode::Le:
-            case IROpcode::Gt: case IROpcode::Ge: case IROpcode::And: case IROpcode::Or: case IROpcode::StringToText:case IROpcode::ByteCount:case IROpcode::TextEquals:case IROpcode::TextFindByte:case IROpcode::TextStartsWith:case IROpcode::TextEndsWith:case IROpcode::TextHash64:case IROpcode::TextCodepointCount:case IROpcode::TextIsAscii:case IROpcode::TextFindText:case IROpcode::TextCompare:case IROpcode::TextRFindText:
-            case IROpcode::MakeAggregate: case IROpcode::ExtractField: case IROpcode::ResultOk: case IROpcode::ResultErr:
-            case IROpcode::OptionSome: case IROpcode::OptionNone: case IROpcode::MakeClosure: return true;
+            case IROpcode::ConstInt: case IROpcode::ConstFloat: case IROpcode::ConstText:
+            case IROpcode::ConstBool: case IROpcode::ConstNull: case IROpcode::Copy:
+            case IROpcode::Add: case IROpcode::Sub: case IROpcode::Mul:
+            case IROpcode::BitAnd: case IROpcode::BitOr: case IROpcode::BitXor:
+            case IROpcode::Shl: case IROpcode::Shr: case IROpcode::Neg:
+            case IROpcode::BitNot: case IROpcode::Not: case IROpcode::Eq:
+            case IROpcode::Ne: case IROpcode::Lt: case IROpcode::Le:
+            case IROpcode::Gt: case IROpcode::Ge: case IROpcode::And:
+            case IROpcode::Or: case IROpcode::Nop:
+                return EffectClass::PureTotal;
+            case IROpcode::Div: case IROpcode::Mod:
+            case IROpcode::ByteCount: case IROpcode::TextEquals:
+            case IROpcode::TextByteAt: case IROpcode::TextFindByte:
+            case IROpcode::TextStartsWith: case IROpcode::TextEndsWith:
+            case IROpcode::TextSlice: case IROpcode::TextHash64:
+            case IROpcode::TextCodepointAt: case IROpcode::TextCodepointCount:
+            case IROpcode::TextIsAscii: case IROpcode::TextFindText:
+            case IROpcode::TextCompare: case IROpcode::TextRFindText:
+            case IROpcode::NumericCheckedCast: case IROpcode::ExtractField:
+            case IROpcode::ArrayIndex: case IROpcode::ResultIsErr:
+            case IROpcode::ResultTry:
+                return EffectClass::MayTrap;
+            case IROpcode::Call: case IROpcode::CallClosure:
+            case IROpcode::TextToString: case IROpcode::StringToText:
+            case IROpcode::StringClear: case IROpcode::StringDispose:
+            case IROpcode::StringMove: case IROpcode::StringAppend:
+            case IROpcode::TextStreamWrite: case IROpcode::MakeAggregate:
+            case IROpcode::StoreField: case IROpcode::ArrayStore:
+            case IROpcode::ResultOk: case IROpcode::ResultErr:
+            case IROpcode::OptionSome: case IROpcode::OptionNone:
+            case IROpcode::MakeClosure:
+                return EffectClass::Observable;
+            case IROpcode::Phi: case IROpcode::Branch:
+            case IROpcode::BranchIf: case IROpcode::Return:
+                return EffectClass::ControlFlow;
+            }
+            return EffectClass::Observable;
+        }
+
+        static std::uint32_t reg(VReg r) { return static_cast<std::uint32_t>(r); }
+        static std::uint32_t reg(BlockID b) { return static_cast<std::uint32_t>(b); }
+        struct Constant {
+            std::int64_t value = 0; bool boolean = false;
+            bool operator==(const Constant& other) const { return value == other.value && boolean == other.boolean; }
+        };
+        using ConstMap = std::unordered_map<std::uint32_t, Constant>;
+        using RegTypes = std::unordered_map<std::uint32_t, IRValueType>;
+        using Incoming = std::unordered_map<std::uint32_t, ConstMap>;
+        using TextMap = std::unordered_map<std::uint32_t, std::string>;
+        using TextIncoming = std::unordered_map<std::uint32_t, TextMap>;
+
+        static RegTypes registerTypes(const IRFunction& fn) {
+            RegTypes result;
+            for (std::size_t i = 0; i < fn.parameterVregs.size() && i < fn.parameterValueTypes.size(); ++i)
+                result[reg(fn.parameterVregs[i])] = fn.parameterValueTypes[i];
+            for (const auto& b : fn.blocks) {
+                for (const auto& phi : b.phiNodes)
+                    if (phi.dest != VReg::None) result[reg(phi.dest)] = phi.valueType;
+                for (const auto& i : b.instructions)
+                    if (i.dest != VReg::None) result[reg(i.dest)] = i.valueType;
+            }
+            return result;
+        }
+        // Small, side-effect-free, single-block integer/boolean routines are
+        // expanded into their caller at -O3. Each callee VReg gets its own fresh
+        // caller cell; parameter cells are read-only by eligibility contract.
+        // This unlocks both interprocedural constant folding and call removal.
+        static bool eligibleLeaf(const IRFunction& fn) {
+            if (fn.blocks.size() != 1 || !fn.blocks[0].phiNodes.empty() ||
+                fn.blocks[0].instructions.empty() || fn.blocks[0].instructions.size() > 24 ||
+                (fn.valueType.kind != IRValueKind::Int64 && fn.valueType.kind != IRValueKind::Bool))
+                return false;
+            if (fn.parameterVregs.size() != fn.parameterValueTypes.size()) return false;
+            for (std::size_t i = 0; i < fn.parameterVregs.size(); ++i) {
+                if (fn.parameterValueTypes[i].kind != IRValueKind::Int64 &&
+                    fn.parameterValueTypes[i].kind != IRValueKind::Bool) return false;
+                if (i < fn.parameterModes.size() && fn.parameterModes[i] != "shared") return false;
+            }
+            const auto& code = fn.blocks[0].instructions;
+            if (code.back().op != IROpcode::Return || code.back().args.size() != 1) return false;
+            std::unordered_set<std::uint32_t> defined;
+            for (auto v : fn.parameterVregs) defined.insert(reg(v));
+            for (std::size_t n = 0; n < code.size(); ++n) {
+                const auto& i = code[n];
+                if (n + 1 != code.size()) {
+                    if (effectOf(i.op) != EffectClass::PureTotal || i.dest == VReg::None ||
+                        (i.valueType.kind != IRValueKind::Int64 && i.valueType.kind != IRValueKind::Bool))
+                        return false;
+                    for (auto param : fn.parameterVregs) if (param == i.dest) return false;
+                    if (defined.contains(reg(i.dest))) return false; // no mutable cells in leaf
+                }
+                for (auto arg : i.args) if (!defined.contains(reg(arg))) return false;
+                if (i.dest != VReg::None) defined.insert(reg(i.dest));
+            }
+            return true;
+        }
+        static bool inlineSmallScalarLeaves(IRProgram& program) {
+            std::unordered_map<std::string, IRFunction> leaves;
+            for (const auto& fn : program.functions) if (eligibleLeaf(fn)) leaves.emplace(fn.name, fn);
+            bool changed = false;
+            for (auto& caller : program.functions) for (auto& block : caller.blocks) {
+                std::vector<IRInstruction> output;
+                output.reserve(block.instructions.size());
+                for (const auto& call : block.instructions) {
+                    auto found = call.op == IROpcode::Call ? leaves.find(call.callee) : leaves.end();
+                    if (found == leaves.end() || found->first == caller.name || call.dest == VReg::None ||
+                        (call.valueType.kind != IRValueKind::Int64 && call.valueType.kind != IRValueKind::Bool) ||
+                        call.args.size() != found->second.parameterVregs.size()) {
+                        output.push_back(call);
+                        continue;
+                    }
+                    const auto& leaf = found->second;
+                    std::unordered_map<std::uint32_t, VReg> cells;
+                    for (std::size_t j = 0; j < call.args.size(); ++j)
+                        cells.emplace(reg(leaf.parameterVregs[j]), call.args[j]);
+                    std::vector<IRInstruction> replacement;
+                    replacement.reserve(leaf.blocks[0].instructions.size());
+                    const auto originalVregCount = caller.totalVregs;
+                    bool valid = true;
+                    for (const auto& original : leaf.blocks[0].instructions) {
+                        if (original.op == IROpcode::Return) {
+                            const auto it = cells.find(reg(original.args[0]));
+                            if (it == cells.end()) { valid = false; break; }
+                            IRInstruction copy;
+                            copy.op = IROpcode::Copy; copy.dest = call.dest;
+                            copy.valueType = call.valueType; copy.args = { it->second };
+                            replacement.push_back(std::move(copy));
+                            continue;
+                        }
+                        IRInstruction emit = original;
+                        for (auto& arg : emit.args) {
+                            const auto it = cells.find(reg(arg));
+                            if (it == cells.end()) { valid = false; break; }
+                            arg = it->second;
+                        }
+                        if (!valid) break;
+                        emit.dest = static_cast<VReg>(++caller.totalVregs);
+                        cells[reg(original.dest)] = emit.dest;
+                        replacement.push_back(std::move(emit));
+                    }
+                    if (!valid) {
+                        // No partially-expanded calls may escape this block.
+                        caller.totalVregs = originalVregCount;
+                        output.push_back(call);
+                        continue;
+                    }
+                    output.insert(output.end(), replacement.begin(), replacement.end());
+                    changed = true;
+                }
+                block.instructions = std::move(output);
+            }
+            return changed;
+        }
+        static bool scalarInteger(const IRValueType& t) {
+            return t.kind == IRValueKind::Int64 || t.kind == IRValueKind::Bool;
+        }
+        static bool integerOperands(const IRInstruction& inst, const RegTypes& types) {
+            if (inst.args.empty() || !(scalarInteger(inst.valueType))) return false;
+            for (auto v : inst.args) {
+                const auto it = types.find(reg(v));
+                if (it == types.end() || !scalarInteger(it->second)) return false;
+            }
+            for (const auto& t : inst.argumentValueTypes) if (!scalarInteger(t)) return false;
+            return true;
+        }
+        static bool arithmetic(IROpcode op) {
+            switch (op) {
+            case IROpcode::Add: case IROpcode::Sub: case IROpcode::Mul:
+            case IROpcode::Div: case IROpcode::Mod: case IROpcode::BitAnd:
+            case IROpcode::BitOr: case IROpcode::BitXor: case IROpcode::Shl:
+            case IROpcode::Shr: case IROpcode::Neg: case IROpcode::BitNot:
+            case IROpcode::Not: case IROpcode::Eq: case IROpcode::Ne:
+            case IROpcode::Lt: case IROpcode::Le: case IROpcode::Gt:
+            case IROpcode::Ge: case IROpcode::And: case IROpcode::Or: return true;
             default: return false;
             }
         }
-
-        static std::optional<std::int64_t> eval(IROpcode op, std::int64_t a, std::int64_t b = 0) {
-            auto u = [](std::int64_t x) { return static_cast<std::uint64_t>(x); };
+        static bool noTrapMath(IROpcode op) {
+            return arithmetic(op) && op != IROpcode::Div && op != IROpcode::Mod;
+        }
+        static bool commutative(IROpcode op) {
+            switch (op) {
+            case IROpcode::Add: case IROpcode::Mul: case IROpcode::BitAnd:
+            case IROpcode::BitOr: case IROpcode::BitXor: case IROpcode::Eq:
+            case IROpcode::Ne: case IROpcode::And: case IROpcode::Or: return true;
+            default: return false;
+            }
+        }
+        static std::optional<std::int64_t> evaluate(IROpcode op, std::int64_t a, std::int64_t b = 0) {
+            const auto u = [](std::int64_t x) { return static_cast<std::uint64_t>(x); };
             switch (op) {
             case IROpcode::Add: return static_cast<std::int64_t>(u(a) + u(b));
             case IROpcode::Sub: return static_cast<std::int64_t>(u(a) - u(b));
             case IROpcode::Mul: return static_cast<std::int64_t>(u(a) * u(b));
             case IROpcode::Div:
-                if (b == 0) return std::nullopt;
-                if (a == std::numeric_limits<std::int64_t>::min() && b == -1) return a;
+                if (!b) return std::nullopt;
+                if (a == INT64_MIN && b == -1) return a;
                 return a / b;
             case IROpcode::Mod:
-                if (b == 0) return std::nullopt;
-                if (a == std::numeric_limits<std::int64_t>::min() && b == -1) return 0;
+                if (!b) return std::nullopt;
+                if (a == INT64_MIN && b == -1) return std::int64_t{ 0 };
                 return a % b;
             case IROpcode::BitAnd: return a & b;
             case IROpcode::BitOr: return a | b;
             case IROpcode::BitXor: return a ^ b;
             case IROpcode::Shl: return static_cast<std::int64_t>(u(a) << (u(b) & 63u));
             case IROpcode::Shr: return a >> (u(b) & 63u);
-            case IROpcode::Neg: return static_cast<std::int64_t>(0u - u(a));
+            case IROpcode::Neg: return static_cast<std::int64_t>(0ull - u(a));
             case IROpcode::BitNot: return ~a;
             case IROpcode::Not: return a == 0 ? 1 : 0;
             case IROpcode::Eq: return a == b; case IROpcode::Ne: return a != b;
             case IROpcode::Lt: return a < b; case IROpcode::Le: return a <= b;
             case IROpcode::Gt: return a > b; case IROpcode::Ge: return a >= b;
-            case IROpcode::And: return (a != 0) && (b != 0); case IROpcode::Or: return (a != 0) || (b != 0);
+            case IROpcode::And: return (a != 0) && (b != 0);
+            case IROpcode::Or: return (a != 0) || (b != 0);
             default: return std::nullopt;
             }
         }
 
-        bool foldBlock(IRBasicBlock& block) const {
-            std::unordered_map<std::uint32_t, Constant> constants;
-            auto key = [](VReg v) { return static_cast<std::uint32_t>(v); };
-            bool changed = false;
-            for (auto& inst : block.instructions) {
-                if (inst.op == IROpcode::ConstInt) {
-                    try { constants[key(inst.dest)] = { true, parseParacineInteger(inst.literalText), false }; }
-                    catch (...) { constants.erase(key(inst.dest)); }
-                    continue;
+        static void setInteger(IRInstruction& inst, std::int64_t value) {
+            const bool asBool = inst.valueType.kind == IRValueKind::Bool;
+            inst.op = asBool ? IROpcode::ConstBool : IROpcode::ConstInt;
+            inst.args.clear(); inst.targetBlocks.clear(); inst.phiInputs.clear();
+            inst.literalText = asBool ? std::string{} : std::to_string(value);
+            inst.hasImmediate = asBool;
+            inst.immediate = value;
+            inst.argumentTypes.clear(); inst.argumentValueTypes.clear();
+        }
+        static void setCopy(IRInstruction& inst, VReg source) {
+            inst.op = IROpcode::Copy;
+            inst.args = { source }; inst.targetBlocks.clear(); inst.phiInputs.clear();
+            inst.hasImmediate = false; inst.immediate = 0;
+            inst.literalText.clear();
+            inst.argumentTypes.clear(); inst.argumentValueTypes.clear();
+        }
+        static void learn(const IRInstruction& i, ConstMap& known) {
+            if (i.dest == VReg::None) return;
+            const auto d = reg(i.dest);
+            switch (i.op) {
+            case IROpcode::ConstInt:
+                try { known[d] = { parseParacineInteger(i.literalText), false }; }
+                catch (...) { known.erase(d); }
+                break;
+            case IROpcode::ConstBool: known[d] = { i.immediate ? 1 : 0, true }; break;
+            case IROpcode::ConstNull: known[d] = { 0, false }; break;
+            case IROpcode::Copy:
+                if (i.args.size() == 1) {
+                    const auto f = known.find(reg(i.args[0]));
+                    if (f != known.end()) { const auto saved = f->second; known[d] = saved; }
+                    else known.erase(d);
                 }
-                if (inst.op == IROpcode::ConstBool) { constants[key(inst.dest)] = { true, inst.immediate ? 1 : 0, true }; continue; }
-                if (inst.op == IROpcode::ConstNull) { constants[key(inst.dest)] = { true, 0, false }; continue; }
-                if (inst.op == IROpcode::Copy && inst.args.size() == 1) {
-                    auto it = constants.find(key(inst.args[0]));
-                    if (it != constants.end()) constants[key(inst.dest)] = it->second; else constants.erase(key(inst.dest));
-                    continue;
-                }
-                if (inst.op == IROpcode::BranchIf && inst.args.size() == 1 && inst.targetBlocks.size() == 2) {
-                    auto it = constants.find(key(inst.args[0]));
-                    if (it != constants.end() && it->second.known) {
-                        BlockID target = it->second.value ? inst.targetBlocks[0] : inst.targetBlocks[1];
-                        inst.op = IROpcode::Branch; inst.args.clear(); inst.targetBlocks = { target };
-                        changed = true;
-                    }
-                    continue;
-                }
-                if (pure(inst.op) && inst.dest != VReg::None && (inst.args.size() == 1 || inst.args.size() == 2) &&
-                    std::none_of(inst.argumentValueTypes.begin(), inst.argumentValueTypes.end(), [](const IRValueType& t) {return t.kind == IRValueKind::Float32 || t.kind == IRValueKind::Float64; })) {
-                    auto a = constants.find(key(inst.args[0]));
-                    auto b = inst.args.size() == 2 ? constants.find(key(inst.args[1])) : constants.end();
-                    if (a != constants.end() && (inst.args.size() == 1 || b != constants.end())) {
-                        auto value = eval(inst.op, a->second.value, inst.args.size() == 2 ? b->second.value : 0);
-                        if (value) {
-                            bool isBool = inst.valueType.kind == IRValueKind::Bool;
-                            const auto originalOp = inst.op;
-                            inst.op = isBool ? IROpcode::ConstBool : IROpcode::ConstInt;
-                            inst.args.clear(); inst.targetBlocks.clear(); inst.phiInputs.clear();
-                            inst.hasImmediate = isBool;
-                            inst.immediate = *value;
-                            inst.literalText = isBool ? std::string{} : std::to_string(*value);
-                            constants[key(inst.dest)] = { true, *value, isBool };
-                            if (originalOp != inst.op) changed = true;
-                            continue;
+                else known.erase(d);
+                break;
+            default: known.erase(d); break;
+            }
+        }
+        static std::optional<Constant> knownValue(const ConstMap& known, VReg v) {
+            auto it = known.find(reg(v));
+            if (it == known.end()) return std::nullopt;
+            return it->second;
+        }
+        static ConstMap intersection(ConstMap a, const ConstMap& b) {
+            for (auto it = a.begin(); it != a.end();) {
+                const auto other = b.find(it->first);
+                if (other == b.end() || !(other->second == it->second)) it = a.erase(it);
+                else ++it;
+            }
+            return a;
+        }
+        static bool same(const ConstMap& a, const ConstMap& b) {
+            if (a.size() != b.size()) return false;
+            for (const auto& [k, v] : a) {
+                const auto it = b.find(k);
+                if (it == b.end() || !(v == it->second)) return false;
+            }
+            return true;
+        }
+
+        // Constant tracking uses an intersection meet over *all reachable* CFG
+        // incoming edges. In particular, loop backedges are never assumed to
+        // preserve values that the body rewrites.
+        Incoming incomingConstants(const IRFunction& fn, const RegTypes& types) const {
+            Incoming incoming, outgoing;
+            if (fn.blocks.empty()) return incoming;
+            const auto entry = reg(fn.blocks.front().id);
+            std::unordered_map<std::uint32_t, const IRBasicBlock*> blocks;
+            std::unordered_map<std::uint32_t, std::set<std::uint32_t>> predecessors;
+            for (const auto& b : fn.blocks) blocks[reg(b.id)] = &b;
+            for (const auto& b : fn.blocks) {
+                if (b.instructions.empty()) continue;
+                const auto& tail = b.instructions.back();
+                if (tail.op == IROpcode::Branch || tail.op == IROpcode::BranchIf)
+                    for (auto t : tail.targetBlocks) predecessors[reg(t)].insert(reg(b.id));
+            }
+            std::unordered_set<std::uint32_t> reachable;
+            std::vector<std::uint32_t> todo{ entry };
+            while (!todo.empty()) {
+                auto id = todo.back(); todo.pop_back();
+                if (!reachable.insert(id).second) continue;
+                const auto it = blocks.find(id);
+                if (it == blocks.end() || it->second->instructions.empty()) continue;
+                const auto& tail = it->second->instructions.back();
+                if (tail.op == IROpcode::Branch || tail.op == IROpcode::BranchIf)
+                    for (auto t : tail.targetBlocks) todo.push_back(reg(t));
+            }
+            for (std::size_t iteration = 0; iteration < fn.blocks.size() * 8 + 16; ++iteration) {
+                bool changed = false;
+                for (const auto& b : fn.blocks) {
+                    const auto id = reg(b.id);
+                    if (!reachable.contains(id)) continue;
+                    ConstMap next;
+                    if (id != entry) {
+                        bool first = true;
+                        for (auto pred : predecessors[id]) {
+                            if (!reachable.contains(pred)) continue;
+                            if (first) { next = outgoing[pred]; first = false; }
+                            else next = intersection(std::move(next), outgoing[pred]);
                         }
                     }
-                    constants.erase(key(inst.dest));
+                    // PHIs overwrite their result cells on block entry. Their
+                    // path-specific values are deliberately not guessed here.
+                    for (const auto& phi : b.phiNodes) if (phi.dest != VReg::None) next.erase(reg(phi.dest));
+                    IRBasicBlock simulation = b;
+                    auto [ignored, finalValues] = simplifyBlock(simulation, next, types, false);
+                    (void)ignored;
+                    if (!same(incoming[id], next) || !same(outgoing[id], finalValues)) {
+                        incoming[id] = std::move(next);
+                        outgoing[id] = std::move(finalValues);
+                        changed = true;
+                    }
                 }
-                else if (inst.dest != VReg::None) constants.erase(key(inst.dest));
+                if (!changed) break;
             }
-            return changed;
+            return incoming;
+        }
+
+        // Immutable UTF-8 literals may also flow across basic blocks. The
+        // intersection meet respects joins and loop backedges; effect barriers
+        // and register redefinitions invalidate facts.
+        TextIncoming incomingTextLiterals(const IRFunction& fn) const {
+            TextIncoming incoming, outgoing;
+            if (fn.blocks.empty()) return incoming;
+            const auto entry = reg(fn.blocks.front().id);
+            std::unordered_map<std::uint32_t, const IRBasicBlock*> blocks;
+            std::unordered_map<std::uint32_t, std::set<std::uint32_t>> predecessors;
+            for (const auto& b : fn.blocks) blocks[reg(b.id)] = &b;
+            for (const auto& b : fn.blocks) if (!b.instructions.empty()) {
+                const auto& tail = b.instructions.back();
+                if (tail.op == IROpcode::Branch || tail.op == IROpcode::BranchIf)
+                    for (auto t : tail.targetBlocks) predecessors[reg(t)].insert(reg(b.id));
+            }
+            std::unordered_set<std::uint32_t> reachable;
+            std::vector<std::uint32_t> work{ entry };
+            while (!work.empty()) {
+                const auto id = work.back(); work.pop_back();
+                if (!reachable.insert(id).second) continue;
+                const auto it = blocks.find(id);
+                if (it == blocks.end() || it->second->instructions.empty()) continue;
+                const auto& tail = it->second->instructions.back();
+                if (tail.op == IROpcode::Branch || tail.op == IROpcode::BranchIf)
+                    for (auto t : tail.targetBlocks) work.push_back(reg(t));
+            }
+            for (std::size_t n = 0; n < fn.blocks.size() * 8 + 16; ++n) {
+                bool changed = false;
+                for (const auto& b : fn.blocks) {
+                    const auto id = reg(b.id);
+                    if (!reachable.contains(id)) continue;
+                    TextMap in;
+                    if (id != entry) {
+                        bool first = true;
+                        for (auto pred : predecessors[id]) if (reachable.contains(pred)) {
+                            if (first) { in = outgoing[pred]; first = false; }
+                            else for (auto it = in.begin(); it != in.end();) {
+                                const auto other = outgoing[pred].find(it->first);
+                                if (other == outgoing[pred].end() || other->second != it->second) it = in.erase(it);
+                                else ++it;
+                            }
+                        }
+                    }
+                    for (const auto& phi : b.phiNodes) if (phi.dest != VReg::None) in.erase(reg(phi.dest));
+                    TextMap out = in;
+                    for (const auto& i : b.instructions) {
+                        if (i.op == IROpcode::Call || i.op == IROpcode::CallClosure ||
+                            i.op == IROpcode::StoreField || i.op == IROpcode::ArrayStore ||
+                            i.op == IROpcode::StringAppend || i.op == IROpcode::StringClear ||
+                            i.op == IROpcode::StringDispose || i.op == IROpcode::StringMove)
+                            out.clear();
+                        if (i.dest == VReg::None) continue;
+                        const auto d = reg(i.dest);
+                        if (i.op == IROpcode::ConstText) out[d] = i.literalText;
+                        else if (i.op == IROpcode::Copy && i.valueType.kind == IRValueKind::Text && i.args.size() == 1) {
+                            const auto it = out.find(reg(i.args[0]));
+                            if (it == out.end()) out.erase(d);
+                            else { const auto saved = it->second; out[d] = saved; }
+                        }
+                        else out.erase(d);
+                    }
+                    if (incoming[id] != in || outgoing[id] != out) {
+                        incoming[id] = std::move(in); outgoing[id] = std::move(out); changed = true;
+                    }
+                }
+                if (!changed) break;
+            }
+            return incoming;
+        }
+
+        // One block, one ordered instruction stream: all simplifications use
+        // only facts known at the *point of execution*.
+        std::pair<bool, ConstMap> simplifyBlock(IRBasicBlock& block, ConstMap known,
+            const RegTypes& types, bool enableCSE, TextMap literalText = {}) const {
+            bool changed = false;
+            std::unordered_map<std::uint32_t, std::uint64_t> versions;
+            struct Cached { VReg result; std::uint64_t resultVersion; };
+            std::map<std::string, Cached> expressions;
+            auto version = [&](VReg v) { return versions[reg(v)]; };
+            for (auto& inst : block.instructions) {
+                if (inst.op == IROpcode::BranchIf && inst.targetBlocks.size() == 2 && inst.args.size() == 1) {
+                    auto cond = knownValue(known, inst.args[0]);
+                    if (cond || inst.targetBlocks[0] == inst.targetBlocks[1]) {
+                        const auto target = cond && cond->value == 0 ? inst.targetBlocks[1] : inst.targetBlocks[0];
+                        inst.op = IROpcode::Branch;
+                        inst.args.clear(); inst.targetBlocks = { target };
+                        changed = true;
+                    }
+                }
+                if (arithmetic(inst.op) && integerOperands(inst, types)) {
+                    bool ready = true;
+                    std::vector<std::int64_t> vals;
+                    vals.reserve(inst.args.size());
+                    for (auto arg : inst.args) {
+                        auto value = knownValue(known, arg);
+                        if (!value) { ready = false; break; }
+                        vals.push_back(value->value);
+                    }
+                    if (ready && (vals.size() == 1 || vals.size() == 2)) {
+                        auto result = evaluate(inst.op, vals[0], vals.size() == 2 ? vals[1] : 0);
+                        if (result) { setInteger(inst, *result); changed = true; }
+                    }
+                    // Algebraic identities are restricted to integral types.
+                    // They never rewrite float comparisons (NaN or signed zero)
+                    // and never skip a trap-capable operation.
+                    if (noTrapMath(inst.op) && inst.args.size() == 2 && inst.op != IROpcode::Copy) {
+                        const auto a = inst.args[0], b = inst.args[1];
+                        const auto av = knownValue(known, a), bv = knownValue(known, b);
+                        const auto zero = [](std::optional<Constant> v) { return v && v->value == 0; };
+                        const auto one = [](std::optional<Constant> v) { return v && v->value == 1; };
+                        std::optional<VReg> replacement;
+                        std::optional<std::int64_t> literal;
+                        switch (inst.op) {
+                        case IROpcode::Add:
+                            if (zero(bv)) replacement = a; else if (zero(av)) replacement = b; break;
+                        case IROpcode::Sub:
+                            if (zero(bv)) replacement = a; else if (a == b) literal = 0; break;
+                        case IROpcode::Mul:
+                            if (zero(av) || zero(bv)) literal = 0;
+                            else if (one(av)) replacement = b; else if (one(bv)) replacement = a;
+                            break;
+                        case IROpcode::BitAnd:
+                            if (zero(av) || zero(bv)) literal = 0;
+                            else if (a == b) replacement = a; break;
+                        case IROpcode::BitOr:
+                            if (zero(av)) replacement = b; else if (zero(bv)) replacement = a;
+                            else if (a == b) replacement = a; break;
+                        case IROpcode::BitXor:
+                            if (zero(av)) replacement = b; else if (zero(bv)) replacement = a;
+                            else if (a == b) literal = 0; break;
+                        case IROpcode::Shl: case IROpcode::Shr:
+                            if (zero(bv)) replacement = a; break;
+                        case IROpcode::Eq: if (a == b) literal = 1; break;
+                        case IROpcode::Ne: if (a == b) literal = 0; break;
+                        case IROpcode::Lt: case IROpcode::Gt:
+                            if (a == b) literal = 0; break;
+                        case IROpcode::Le: case IROpcode::Ge:
+                            if (a == b) literal = 1; break;
+                        default: break;
+                        }
+                        if (replacement) { setCopy(inst, *replacement); changed = true; }
+                        else if (literal) { setInteger(inst, *literal); changed = true; }
+                    }
+                }
+                // Local value numbering is available at -O3. Both argument
+                // versions and cached-result versions are checked: replacing a
+                // register cell invalidates prior expressions using that cell.
+                if (enableCSE && noTrapMath(inst.op) && integerOperands(inst, types)
+                    && inst.dest != VReg::None && !inst.args.empty()) {
+                    std::vector<std::pair<std::uint32_t, std::uint64_t>> operands;
+                    for (auto v : inst.args) operands.emplace_back(reg(v), version(v));
+                    if (commutative(inst.op)) std::sort(operands.begin(), operands.end());
+                    std::ostringstream key;
+                    key << static_cast<int>(inst.op) << ':' << static_cast<int>(inst.valueType.kind)
+                        << ':' << inst.valueType.name;
+                    for (const auto& [v, epoch] : operands) key << ':' << v << '@' << epoch;
+                    const auto expressionKey = key.str();
+                    const auto prev = expressions.find(expressionKey);
+                    if (prev != expressions.end() && version(prev->second.result) == prev->second.resultVersion
+                        && prev->second.result != inst.dest) {
+                        setCopy(inst, prev->second.result);
+                        changed = true;
+                    }
+                    else {
+                        expressions[expressionKey] = { inst.dest, version(inst.dest) + 1 };
+                    }
+                }
+                // Compile-time UTF-8 literal specialization: operations are
+                // evaluated only when all required data are exact immutable
+                // literals. Failing bounds checks remain runtime traps.
+                if (inst.dest != VReg::None && !inst.args.empty()) {
+                    const auto text0 = literalText.find(reg(inst.args[0]));
+                    if (text0 != literalText.end()) {
+                        const auto& a = text0->second;
+                        std::optional<std::int64_t> result;
+                        auto text1 = inst.args.size() >= 2 ? literalText.find(reg(inst.args[1])) : literalText.end();
+                        if (inst.op == IROpcode::ByteCount && inst.args.size() == 1)
+                            result = static_cast<std::int64_t>(a.size());
+                        else if (inst.op == IROpcode::TextIsAscii && inst.args.size() == 1) {
+                            result = std::all_of(a.begin(), a.end(), [](unsigned char ch) {return ch < 0x80u; }) ? 1 : 0;
+                        }
+                        else if (inst.op == IROpcode::TextCodepointCount && inst.args.size() == 1) {
+                            std::int64_t count = 0;
+                            for (unsigned char ch : a) if ((ch & 0xC0u) != 0x80u) ++count;
+                            result = count;
+                        }
+                        else if (inst.op == IROpcode::TextHash64 && inst.args.size() == 1) {
+                            std::uint64_t hash = 14695981039346656037ull;
+                            for (unsigned char ch : a) { hash ^= ch; hash *= 1099511628211ull; }
+                            result = std::bit_cast<std::int64_t>(hash);
+                        }
+                        else if (text1 != literalText.end() && inst.args.size() == 2) {
+                            const auto& b = text1->second;
+                            switch (inst.op) {
+                            case IROpcode::TextEquals: result = a == b ? 1 : 0; break;
+                            case IROpcode::TextStartsWith: result = a.starts_with(b) ? 1 : 0; break;
+                            case IROpcode::TextEndsWith: result = a.ends_with(b) ? 1 : 0; break;
+                            case IROpcode::TextFindText: {
+                                auto pos = a.find(b);
+                                result = pos == std::string::npos ? -1 : static_cast<std::int64_t>(pos);
+                                break;
+                            }
+                            case IROpcode::TextRFindText: {
+                                auto pos = a.rfind(b);
+                                result = pos == std::string::npos ? -1 : static_cast<std::int64_t>(pos);
+                                break;
+                            }
+                            case IROpcode::TextCompare: {
+                                const auto n = std::min(a.size(), b.size());
+                                std::int64_t cmp = 0;
+                                for (std::size_t i = 0; i < n; ++i) {
+                                    const auto x = static_cast<unsigned char>(a[i]);
+                                    const auto y = static_cast<unsigned char>(b[i]);
+                                    if (x != y) { cmp = x < y ? -1 : 1; break; }
+                                }
+                                if (!cmp) cmp = a.size() < b.size() ? -1 : a.size() > b.size() ? 1 : 0;
+                                result = cmp;
+                                break;
+                            }
+                            default: break;
+                            }
+                        }
+                        else if (inst.args.size() == 2) {
+                            const auto index = knownValue(known, inst.args[1]);
+                            if (index && inst.op == IROpcode::TextByteAt && index->value >= 0 &&
+                                static_cast<std::uint64_t>(index->value) < a.size())
+                                result = static_cast<unsigned char>(a[static_cast<std::size_t>(index->value)]);
+                            if (index && inst.op == IROpcode::TextFindByte) {
+                                if (index->value < 0 || index->value > 255) result = -1;
+                                else {
+                                    const auto pos = a.find(static_cast<char>(index->value));
+                                    result = pos == std::string::npos ? -1 : static_cast<std::int64_t>(pos);
+                                }
+                            }
+                        }
+                        if (result) { setInteger(inst, *result); changed = true; }
+                    }
+                }
+                // Preserve text literal knowledge only for copies of immutable
+                // text. Runtime string-to-text views are never assumed static.
+                if (inst.dest != VReg::None) {
+                    const auto d = reg(inst.dest);
+                    if (inst.op == IROpcode::ConstText) literalText[d] = inst.literalText;
+                    else if (inst.op == IROpcode::Copy && inst.valueType.kind == IRValueKind::Text && inst.args.size() == 1) {
+                        const auto old = literalText.find(reg(inst.args[0]));
+                        if (old == literalText.end()) literalText.erase(d);
+                        else { const auto text = old->second; literalText[d] = text; }
+                    }
+                    else literalText.erase(d);
+                }
+                // Foreign/user calls and mutable aggregate operations form
+                // alias/effect barriers. They may change caller-visible state
+                // through borrowed storage without writing a PCIR destination.
+                if (inst.op == IROpcode::Call || inst.op == IROpcode::CallClosure ||
+                    inst.op == IROpcode::StoreField || inst.op == IROpcode::ArrayStore ||
+                    inst.op == IROpcode::StringAppend || inst.op == IROpcode::StringClear ||
+                    inst.op == IROpcode::StringDispose || inst.op == IROpcode::StringMove) {
+                    known.clear();
+                    literalText.clear();
+                    expressions.clear();
+                }
+                learn(inst, known);
+                if (inst.dest != VReg::None) ++versions[reg(inst.dest)];
+            }
+            return { changed, std::move(known) };
         }
 
         bool copyPropagate(IRFunction& fn) const {
             bool changed = false;
-            auto key = [](VReg v) { return static_cast<std::uint32_t>(v); };
             for (auto& b : fn.blocks) {
-                std::unordered_map<std::uint32_t, VReg> copies;
-                auto rewrite = [&](VReg v) {
-                    auto it = copies.find(key(v));
-                    if (it == copies.end()) return v;
-                    VReg resolved = it->second;
-                    std::unordered_set<std::uint32_t> seen{ key(v) };
-                    while (true) {
-                        auto next = copies.find(key(resolved));
-                        if (next == copies.end() || !seen.insert(key(resolved)).second) break;
-                        resolved = next->second;
+                std::unordered_map<std::uint32_t, VReg> replacements;
+                auto resolved = [&](VReg v) {
+                    std::unordered_set<std::uint32_t> seen;
+                    while (seen.insert(reg(v)).second) {
+                        const auto it = replacements.find(reg(v));
+                        if (it == replacements.end()) break;
+                        v = it->second;
                     }
-                    return resolved;
+                    return v;
                     };
-                for (auto& phi : b.phiNodes) {
-                    for (auto& incoming : phi.phiInputs) {
-                        auto rewritten = rewrite(incoming.second);
-                        if (rewritten != incoming.second) {
-                            incoming.second = rewritten;
-                            changed = true;
-                        }
-                    }
-                    if (phi.dest != VReg::None) copies.erase(key(phi.dest));
-                }
+                // PHI inputs are selected on predecessor edges. The local block
+                // replacement table is not valid on those edges.
                 for (auto& inst : b.instructions) {
                     for (auto& arg : inst.args) {
-                        auto rewritten = rewrite(arg);
-                        if (rewritten != arg) {
-                            arg = rewritten;
-                            changed = true;
-                        }
+                        const auto next = resolved(arg);
+                        if (next != arg) { arg = next; changed = true; }
                     }
-                    if (inst.op == IROpcode::Copy && inst.dest != VReg::None && inst.args.size() == 1 && inst.args[0] != inst.dest) {
-                        copies[key(inst.dest)] = inst.args[0];
+                    if (inst.dest == VReg::None) continue;
+                    const auto d = reg(inst.dest);
+                    // A write invalidates every mapping to or through this
+                    // mutable register. This is essential for while/from loops.
+                    for (auto it = replacements.begin(); it != replacements.end();) {
+                        if (it->first == d || reg(it->second) == d) it = replacements.erase(it);
+                        else ++it;
                     }
-                    else if (inst.dest != VReg::None) {
-                        copies.erase(key(inst.dest));
+                    if (inst.op == IROpcode::Copy && inst.args.size() == 1 && inst.args[0] != inst.dest &&
+                        (inst.valueType.kind == IRValueKind::Int64 || inst.valueType.kind == IRValueKind::Bool ||
+                            inst.valueType.kind == IRValueKind::Float32 || inst.valueType.kind == IRValueKind::Float64)) {
+                        replacements[d] = inst.args[0];
                     }
                 }
             }
             return changed;
         }
-
         bool removeDeadPureInstructions(IRFunction& fn) const {
             std::unordered_map<std::uint32_t, std::size_t> uses;
             for (const auto& b : fn.blocks) {
-                for (const auto& phi : b.phiNodes) for (auto [pred, v] : phi.phiInputs) { (void)pred; ++uses[static_cast<std::uint32_t>(v)]; }
-                for (const auto& i : b.instructions) for (auto v : i.args) ++uses[static_cast<std::uint32_t>(v)];
+                for (const auto& phi : b.phiNodes)
+                    for (auto [pred, v] : phi.phiInputs) { (void)pred; ++uses[reg(v)]; }
+                for (const auto& i : b.instructions) for (auto v : i.args) ++uses[reg(v)];
             }
             bool changed = false;
             for (auto& b : fn.blocks) {
-                const auto before = b.instructions.size();
+                const auto oldSize = b.instructions.size();
                 b.instructions.erase(std::remove_if(b.instructions.begin(), b.instructions.end(), [&](const IRInstruction& i) {
-                    return i.dest != VReg::None && pure(i.op) && uses[static_cast<std::uint32_t>(i.dest)] == 0;
+                    if (i.dest == VReg::None || uses[reg(i.dest)] != 0) return false;
+                    // In particular, owned aggregates, reference-sensitive
+                    // operations and trapping reads must remain observable.
+                    if (effectOf(i.op) != EffectClass::PureTotal) return false;
+                    if ((i.valueType.kind == IRValueKind::Float32 || i.valueType.kind == IRValueKind::Float64) &&
+                        i.op != IROpcode::ConstFloat && i.op != IROpcode::Copy) return false;
+                    if (i.op == IROpcode::Copy && !scalarInteger(i.valueType) &&
+                        i.valueType.kind != IRValueKind::Float32 && i.valueType.kind != IRValueKind::Float64)
+                        return false;
+                    return true;
                     }), b.instructions.end());
-                changed = changed || before != b.instructions.size();
+                if (b.instructions.size() != oldSize) changed = true;
             }
             return changed;
         }
-
         bool removeRedundantPhi(IRFunction& fn) const {
             bool changed = false;
             for (auto& b : fn.blocks) {
                 std::vector<IRInstruction> kept;
                 kept.reserve(b.phiNodes.size());
                 for (const auto& phi : b.phiNodes) {
-                    bool same = !phi.phiInputs.empty();
-                    VReg first = VReg::None;
-                    for (std::size_t i = 0; i < phi.phiInputs.size(); ++i) {
-                        if (i == 0) first = phi.phiInputs[i].second;
-                        else if (phi.phiInputs[i].second != first) { same = false; break; }
-                    }
-                    if (same && phi.dest != VReg::None && first != phi.dest) {
+                    bool sameReg = !phi.phiInputs.empty();
+                    const auto first = sameReg ? phi.phiInputs[0].second : VReg::None;
+                    for (const auto& input : phi.phiInputs)
+                        if (input.second != first) { sameReg = false; break; }
+                    if (sameReg && phi.dest != VReg::None && first != phi.dest) {
                         IRInstruction copy;
-                        copy.op = IROpcode::Copy;
-                        copy.dest = phi.dest;
-                        copy.valueType = phi.valueType;
-                        copy.args = { first };
+                        copy.op = IROpcode::Copy; copy.dest = phi.dest;
+                        copy.valueType = phi.valueType; copy.args = { first };
                         b.instructions.insert(b.instructions.begin(), std::move(copy));
                         changed = true;
                     }
-                    else {
-                        kept.push_back(phi);
-                    }
+                    else kept.push_back(phi);
                 }
                 b.phiNodes = std::move(kept);
             }
             return changed;
         }
-
         bool removeUnreachableBlocks(IRFunction& fn) const {
             if (fn.blocks.empty()) return false;
-            std::unordered_map<std::uint32_t, const IRBasicBlock*> byId;
-            for (const auto& b : fn.blocks) byId[static_cast<std::uint32_t>(b.id)] = &b;
+            std::unordered_map<std::uint32_t, const IRBasicBlock*> blocks;
+            for (const auto& b : fn.blocks) blocks[reg(b.id)] = &b;
             std::unordered_set<std::uint32_t> live;
-            std::vector<std::uint32_t> work{ static_cast<std::uint32_t>(fn.blocks.front().id) };
+            std::vector<std::uint32_t> work{ reg(fn.blocks.front().id) };
             while (!work.empty()) {
-                auto id = work.back(); work.pop_back(); if (!live.insert(id).second) continue;
-                auto it = byId.find(id); if (it == byId.end()) continue;
-                for (const auto& inst : it->second->instructions) for (auto t : inst.targetBlocks) work.push_back(static_cast<std::uint32_t>(t));
+                const auto id = work.back(); work.pop_back();
+                if (!live.insert(id).second) continue;
+                const auto it = blocks.find(id);
+                if (it == blocks.end() || it->second->instructions.empty()) continue;
+                const auto& tail = it->second->instructions.back();
+                if (tail.op == IROpcode::Branch || tail.op == IROpcode::BranchIf)
+                    for (auto target : tail.targetBlocks) work.push_back(reg(target));
             }
             const auto before = fn.blocks.size();
-            fn.blocks.erase(std::remove_if(fn.blocks.begin(), fn.blocks.end(), [&](const IRBasicBlock& b) { return !live.contains(static_cast<std::uint32_t>(b.id)); }), fn.blocks.end());
-            return before != fn.blocks.size();
+            fn.blocks.erase(std::remove_if(fn.blocks.begin(), fn.blocks.end(), [&](const IRBasicBlock& b) {
+                return !live.contains(reg(b.id));
+                }), fn.blocks.end());
+            std::unordered_map<std::uint32_t, std::set<std::uint32_t>> preds;
+            for (const auto& b : fn.blocks) {
+                if (b.instructions.empty()) continue;
+                const auto& tail = b.instructions.back();
+                if (tail.op == IROpcode::Branch || tail.op == IROpcode::BranchIf)
+                    for (auto target : tail.targetBlocks) preds[reg(target)].insert(reg(b.id));
+            }
+            bool changed = before != fn.blocks.size();
+            for (auto& b : fn.blocks) for (auto& phi : b.phiNodes) {
+                const auto oldSize = phi.phiInputs.size();
+                phi.phiInputs.erase(std::remove_if(phi.phiInputs.begin(), phi.phiInputs.end(), [&](const auto& input) {
+                    return !preds[reg(b.id)].contains(reg(input.first));
+                    }), phi.phiInputs.end());
+                if (oldSize != phi.phiInputs.size()) changed = true;
+            }
+            return changed;
         }
-
         int level_ = 2;
     };
 
@@ -12524,7 +13066,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                               // --- Developer workflows: conservative formatting, deterministic packaging,
                               //     compiler-phase profiling, project creation and environment diagnostics. ---
                               // These tools don't change the language's supported semantic surface.
-                              static constexpr const char* kCompilerBuild = "Paracine 2026 iterative-stdlib-upgrade-20261106.1 (development; non-1.0)";
+                              static constexpr const char* kCompilerBuild = "Paracine 2026 semantic-optimizer-upgrade-20261106.2 (development; non-1.0)";
 
                               static std::string canonicalFormat(const std::string& source) {
                                   // Whitespace-only normalization: line-ending normalization, trailing-space
@@ -13515,6 +14057,175 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       if (!artifacts.analysis.succeeded()) throw std::runtime_error("unexpected semantic diagnostics");
                                       const auto result = PCIRInterpreter(artifacts.pcir).run("");
                                       if (result != 42) throw std::runtime_error("optimized PCIR executed wrong value");
+                                      });
+                                  test("premium optimizer: leaf call inlining is executable and beneficial", [&] {
+                                      const std::string src =
+                                          "routine twice(x: int) gives int\n"
+                                          "    let a: int = x * x\n"
+                                          "    let b: int = x * x\n"
+                                          "    give a + b\n"
+                                          "routine main() gives int\n"
+                                          "    give twice(6)\n";
+                                      CompilerOptions slow; slow.optimizationLevel = 0;
+                                      CompilerOptions fast; fast.optimizationLevel = 3;
+                                      auto baseline = compileAll(src, slow), optimized = compileAll(src, fast);
+                                      if (PCIRInterpreter(baseline.pcir).run("") != 72 ||
+                                          PCIRInterpreter(optimized.pcir).run("") != 72)
+                                          throw std::runtime_error("O0/O3 leaf call produced inconsistent value");
+                                      auto calls = [](const IRProgram& p, std::string_view name) {
+                                          std::size_t count = 0;
+                                          for (const auto& f : p.functions) if (f.name == name)
+                                              for (const auto& b : f.blocks) for (const auto& i : b.instructions)
+                                                  if (i.op == IROpcode::Call) ++count;
+                                          return count;
+                                          };
+                                      if (calls(baseline.pcir, "main") != 1 || calls(optimized.pcir, "main") != 0)
+                                          throw std::runtime_error("small pure leaf call was not eliminated");
+#if defined(__linux__) && defined(__x86_64__)
+                                      if (executeEmittedMachineTextIsolated(optimized.machine) != 72)
+                                          throw std::runtime_error("inlined native x64 differs from PCIR");
+#endif
+                                      });
+                                  test("premium optimizer: local common-subexpression reuse", [&] {
+                                      const std::string src =
+                                          "routine twice(x: int) gives int\n"
+                                          "    let left: int = x * x\n"
+                                          "    let right: int = x * x\n"
+                                          "    give left + right\n"
+                                          "routine main() gives int\n"
+                                          "    give twice(6)\n";
+                                      auto multiplicationCount = [](const IRProgram& program) {
+                                          std::size_t n = 0;
+                                          for (const auto& f : program.functions) if (f.name == "twice")
+                                              for (const auto& b : f.blocks) for (const auto& i : b.instructions)
+                                                  if (i.op == IROpcode::Mul) ++n;
+                                          return n;
+                                          };
+                                      CompilerOptions o0; o0.optimizationLevel = 0;
+                                      CompilerOptions o3; o3.optimizationLevel = 3;
+                                      const auto a = compileAll(src, o0), b = compileAll(src, o3);
+                                      if (multiplicationCount(a.pcir) != 2 || multiplicationCount(b.pcir) != 1)
+                                          throw std::runtime_error("integer value numbering did not remove duplicate multiplication");
+                                      });
+                                  test("premium optimizer: cross-block propagation and dead CFG", [&] {
+                                      const std::string src =
+                                          "routine main() gives int\n"
+                                          "    let a: int = 15\n"
+                                          "    if a > 10\n"
+                                          "        let b: int = a + 27\n"
+                                          "        give b\n"
+                                          "    give 0\n";
+                                      CompilerOptions o0; o0.optimizationLevel = 0;
+                                      CompilerOptions o3; o3.optimizationLevel = 3;
+                                      const auto baseline = compileAll(src, o0), opt = compileAll(src, o3);
+                                      if (opt.pcir.functions.front().blocks.size() >= baseline.pcir.functions.front().blocks.size())
+                                          throw std::runtime_error("constant CFG edges were not pruned");
+                                      if (PCIRInterpreter(opt.pcir).run("") != 42)
+                                          throw std::runtime_error("cross-block constant propagation changed result");
+                                      });
+                                  test("premium optimizer: mutable snapshots retain old values", [&] {
+                                      const std::string src =
+                                          "routine main() gives int\n"
+                                          "    var n: int = 4\n"
+                                          "    let before: int = n\n"
+                                          "    n = 7\n"
+                                          "    let after: int = n\n"
+                                          "    give before * 10 + after\n";
+                                      for (int level : {0, 3}) {
+                                          CompilerOptions o; o.optimizationLevel = level;
+                                          auto a = compileAll(src, o);
+                                          if (PCIRInterpreter(a.pcir).run("") != 47)
+                                              throw std::runtime_error("copy propagation corrupted mutable register snapshot");
+#if defined(__linux__) && defined(__x86_64__)
+                                          if (executeEmittedMachineTextIsolated(a.machine) != 47)
+                                              throw std::runtime_error("native mutable snapshot diverged");
+#endif
+                                      }
+                                      });
+                                  test("premium optimizer: loop-carried dataflow is conservative", [&] {
+                                      const std::string src =
+                                          "routine main() gives int\n"
+                                          "    var count: int = 0\n"
+                                          "    var total: int = 0\n"
+                                          "    while count < 7\n"
+                                          "        let snapshot: int = count\n"
+                                          "        count += 1\n"
+                                          "        total += snapshot\n"
+                                          "    give total\n";
+                                      for (int level : {0, 3}) {
+                                          CompilerOptions o; o.optimizationLevel = level;
+                                          auto a = compileAll(src, o);
+                                          if (PCIRInterpreter(a.pcir).run("") != 21)
+                                              throw std::runtime_error("loop values were incorrectly treated as constant");
+#if defined(__linux__) && defined(__x86_64__)
+                                          if (executeEmittedMachineTextIsolated(a.machine) != 21)
+                                              throw std::runtime_error("loop native execution changed by optimizer");
+#endif
+                                      }
+                                      });
+                                  test("premium optimizer: division-by-zero trap is retained even if unused", [&] {
+                                      CompilerOptions o; o.optimizationLevel = 3;
+                                      auto a = compileAll(
+                                          "routine main() gives int with trap\n"
+                                          "    let numerator: int = 1\n"
+                                          "    let divisor: int = 0\n"
+                                          "    let unused: int = numerator / divisor\n"
+                                          "    give 0\n", o);
+                                      bool hasDivision = false;
+                                      for (const auto& f : a.pcir.functions) for (const auto& b : f.blocks)
+                                          for (const auto& i : b.instructions)
+                                              if (i.op == IROpcode::Div) hasDivision = true;
+                                      if (!hasDivision) throw std::runtime_error("unsafe DCE removed observable divide trap");
+                                      });
+                                  test("premium optimizer: immutable UTF-8 literal predicates across blocks", [&] {
+                                      const std::string src =
+                                          "routine main() gives int\n"
+                                          "    let s: text = \"alpha.beta.alpha\"\n"
+                                          "    if s.compare(\"alpha.beta.alpha\") != 0\n"
+                                          "        give 1\n"
+                                          "    if not s.contains(\"beta\")\n"
+                                          "        give 2\n"
+                                          "    if s.rfind(\"alpha\") != 11\n"
+                                          "        give 3\n"
+                                          "    give 73\n";
+                                      CompilerOptions o0; o0.optimizationLevel = 0;
+                                      CompilerOptions o3; o3.optimizationLevel = 3;
+                                      auto a = compileAll(src, o0), b = compileAll(src, o3);
+                                      auto n = [](const IRProgram& program) {
+                                          std::size_t count = 0;
+                                          for (const auto& f : program.functions) for (const auto& block : f.blocks)
+                                              for (const auto& i : block.instructions) ++count;
+                                          return count;
+                                          };
+                                      if (n(b.pcir) >= n(a.pcir))
+                                          throw std::runtime_error("constant text code produced no IR reduction");
+                                      if (PCIRInterpreter(b.pcir).run("") != 73)
+                                          throw std::runtime_error("optimized literal UTF-8 query returned wrong result");
+#if defined(__linux__) && defined(__x86_64__)
+                                      if (executeEmittedMachineTextIsolated(b.machine) != 73)
+                                          throw std::runtime_error("UTF-8 literal native result differs from PCIR");
+#endif
+                                      });
+                                  test("premium optimizer: observable stdout operations remain ordered", [&] {
+                                      const std::string src =
+                                          "module hello\n"
+                                          "import std.io\n"
+                                          "routine main() gives int with io\n"
+                                          "    std.io.println(\"first\")\n"
+                                          "    std.io.println(\"second\")\n"
+                                          "    give 0\n";
+                                      CompilerOptions o0; o0.optimizationLevel = 0;
+                                      CompilerOptions o3; o3.optimizationLevel = 3;
+                                      auto a = compileAll(src, o0), b = compileAll(src, o3);
+                                      auto writes = [](const IRProgram& program) {
+                                          std::size_t n = 0;
+                                          for (const auto& f : program.functions) for (const auto& block : f.blocks)
+                                              for (const auto& i : block.instructions)
+                                                  if (i.op == IROpcode::TextStreamWrite) ++n;
+                                          return n;
+                                          };
+                                      if (writes(a.pcir) != 4 || writes(b.pcir) != 4)
+                                          throw std::runtime_error("optimizer discarded or reordered observable print operations");
                                       });
                                   test("package manager manifest and lock workflow", [&] {
                                       namespace fs = std::filesystem;
