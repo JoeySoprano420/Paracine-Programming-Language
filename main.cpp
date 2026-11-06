@@ -3986,6 +3986,10 @@ namespace pcn {
                 if (!call.arguments.empty())report(call.location, "text/string.count() takes no arguments");
                 return { SemanticTypeKind::Number,"size" };
             }
+            if ((objectType.kind == SemanticTypeKind::Text || objectType.kind == SemanticTypeKind::String) && member.member == "is_empty") {
+                if (!call.arguments.empty())report(call.location, "text/string.is_empty() takes no arguments");
+                return makeBoolType();
+            }
             if (objectType.kind == SemanticTypeKind::Text &&
                 (member.member == "byte_at" || member.member == "find_byte")) {
                 if (call.arguments.size() != 1) {
@@ -4021,6 +4025,18 @@ namespace pcn {
             if (objectType.kind == SemanticTypeKind::Text && member.member == "find") {
                 if (call.arguments.size() != 1 || analyzeExpr(call.arguments[0]).kind != SemanticTypeKind::Text)
                     report(call.location, "text.find requires exactly one text argument");
+                return { SemanticTypeKind::Number,"int" };
+            }
+            if (objectType.kind == SemanticTypeKind::Text && member.member == "find_from") {
+                if (call.arguments.size() != 2) {
+                    report(call.location, "text.find_from requires needle:text and start:int");
+                }
+                else {
+                    const auto needle = analyzeExpr(call.arguments[0]);
+                    const auto start = analyzeExpr(call.arguments[1]);
+                    if (needle.kind != SemanticTypeKind::Text || !isIntegerLikeNumericType(start))
+                        report(call.location, "text.find_from expects (text, integer)");
+                }
                 return { SemanticTypeKind::Number,"int" };
             }
             if (objectType.kind == SemanticTypeKind::Text && member.member == "codepoint_at") {
@@ -7606,6 +7622,15 @@ namespace pcn {
                     if (!node.arguments.empty())throw std::runtime_error("text/string.count takes no arguments");
                     auto dest = allocateVReg(); inst.op = IROpcode::ByteCount; inst.dest = dest; inst.args.push_back(lowerExpr(member->object)); inst.valueType = makeIRIntType(); emit(inst); lastValueType_ = inst.valueType; return dest;
                 }
+                if ((objectType.kind == IRValueKind::Text || objectType.kind == IRValueKind::String) && member->member == "is_empty") {
+                    if (!node.arguments.empty())throw std::runtime_error("text/string.is_empty takes no arguments");
+                    IRInstruction length; length.op = IROpcode::ByteCount; length.dest = allocateVReg();
+                    length.args.push_back(lowerExpr(member->object)); length.valueType = makeIRIntType(); emit(length);
+                    const auto zero = emitConst(IROpcode::ConstInt, "0");
+                    IRInstruction eq; eq.op = IROpcode::Eq; eq.dest = allocateVReg();
+                    eq.args = { length.dest, zero }; eq.valueType = makeIRBoolType(); emit(eq);
+                    lastValueType_ = makeIRBoolType(); return eq.dest;
+                }
                 if (objectType.kind == IRValueKind::Int64 &&
                     (member->member == "to_int" || member->member == "to_size")) {
                     if (!node.arguments.empty())throw std::runtime_error("numeric checked cast takes no arguments");
@@ -7655,6 +7680,28 @@ namespace pcn {
                     inst.args.push_back(lowerExpr(member->object));
                     inst.args.push_back(lowerExprWithExpected(node.arguments[0], makeIRTextType()));
                     inst.valueType = makeIRIntType(); emit(inst); lastValueType_ = inst.valueType; return dest;
+                }
+                if (objectType.kind == IRValueKind::Text && member->member == "find_from") {
+                    if (node.arguments.size() != 2)throw std::runtime_error("text.find_from requires needle and start");
+                    const auto source = lowerExpr(member->object);
+                    const auto needle = lowerExprWithExpected(node.arguments[0], makeIRTextType());
+                    const auto start = lowerExpr(node.arguments[1]);
+                    IRInstruction size; size.op = IROpcode::ByteCount; size.dest = allocateVReg();
+                    size.args = { source }; size.valueType = makeIRIntType(); emit(size);
+                    IRInstruction remainder; remainder.op = IROpcode::Sub; remainder.dest = allocateVReg();
+                    remainder.args = { size.dest,start }; remainder.valueType = makeIRIntType(); emit(remainder);
+                    IRInstruction subview; subview.op = IROpcode::TextSlice; subview.dest = allocateVReg();
+                    subview.args = { source,start,remainder.dest }; subview.valueType = makeIRTextType(); emit(subview);
+                    IRInstruction relative; relative.op = IROpcode::TextFindText; relative.dest = allocateVReg();
+                    relative.args = { subview.dest,needle }; relative.valueType = makeIRIntType(); emit(relative);
+                    const auto minusOne = emitConst(IROpcode::ConstInt, "-1");
+                    IRInstruction found; found.op = IROpcode::Ne; found.dest = allocateVReg();
+                    found.args = { relative.dest,minusOne }; found.valueType = makeIRBoolType(); emit(found);
+                    IRInstruction adjustment; adjustment.op = IROpcode::Mul; adjustment.dest = allocateVReg();
+                    adjustment.args = { start,found.dest }; adjustment.valueType = makeIRIntType(); emit(adjustment);
+                    IRInstruction absolute; absolute.op = IROpcode::Add; absolute.dest = allocateVReg();
+                    absolute.args = { relative.dest,adjustment.dest }; absolute.valueType = makeIRIntType(); emit(absolute);
+                    lastValueType_ = makeIRIntType(); return absolute.dest;
                 }
                 if (objectType.kind == IRValueKind::Text && member->member == "codepoint_at") {
                     if (node.arguments.size() != 1)throw std::runtime_error("text.codepoint_at requires one byte index");
@@ -11373,7 +11420,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                               throw std::runtime_error("E0523 import cycle involving: " + target.string());
                                           if (visited.contains(target))continue;
                                           if (visited.size() >= 1024)throw std::runtime_error("E0524 source import graph exceeds file limit");
-                                          std::error_code ec;
+                                          ec.clear();
                                           if (!fs::is_regular_file(target, ec))throw std::runtime_error("E0525 missing local source import: " + target.string());
                                           if (fs::file_size(target, ec) > 8 * 1024 * 1024 || ec)throw std::runtime_error("E0526 import source size/metadata rejected: " + target.string());
                                           visited.insert(target); active.insert(target);
