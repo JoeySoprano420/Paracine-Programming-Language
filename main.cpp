@@ -97,6 +97,7 @@ namespace pcn {
         Identifier,
         Number,
         String,
+        Character,
         Keyword,
         Symbol,
         Newline,
@@ -234,6 +235,44 @@ namespace pcn {
 
                 if (ch == '#') {
                     while (!isAtEnd() && peek() != '\n') advance();
+                    continue;
+                }
+
+                if (ch == '\'') {
+                    advance(); // opening character delimiter
+                    if (isAtEnd() || peek() == '\n' || peek() == '\'')
+                        throw lexicalError("E0115", "empty or unterminated character literal", loc);
+                    std::uint32_t codepoint = 0;
+                    if (peek() == '\\') {
+                        advance();
+                        if (isAtEnd())throw lexicalError("E0115", "unterminated character escape", loc);
+                        const char esc = advance();
+                        switch (esc) {
+                        case 'n': codepoint = '\n'; break;
+                        case 'r': codepoint = '\r'; break;
+                        case 't': codepoint = '\t'; break;
+                        case '0': codepoint = 0; break;
+                        case '\\': codepoint = '\\'; break;
+                        case '\'': codepoint = '\''; break;
+                        case '"': codepoint = '"'; break;
+                        default: throw lexicalError("E0116", "unknown character escape", loc);
+                        }
+                    }
+                    else {
+                        const auto lead = static_cast<unsigned char>(advance());
+                        if (lead < 0x80)codepoint = lead;
+                        else {
+                            const unsigned extra = lead <= 0xDF ? 1u : lead <= 0xEF ? 2u : 3u;
+                            codepoint = lead & (extra == 1 ? 0x1Fu : extra == 2 ? 0x0Fu : 0x07u);
+                            for (unsigned n = 0; n < extra; ++n)
+                                codepoint = (codepoint << 6) | (static_cast<unsigned char>(advance()) & 0x3Fu);
+                        }
+                    }
+                    if (isAtEnd() || peek() != '\'')
+                        throw lexicalError("E0115", "character literal must contain exactly one Unicode scalar value", loc);
+                    advance();
+                    tokens.push_back({ TokenKind::Character, std::to_string(codepoint), loc });
+                    emittedAnyToken = true;
                     continue;
                 }
 
@@ -432,7 +471,10 @@ namespace pcn {
         void advanceLineBreak(std::vector<Token>& tokens, bool emitToken) {
             const SourceLocation loc{ line_, column_ };
             if (!isAtEnd() && peek() == '\n') advance();
-            if (emitToken && (tokens.empty() || tokens.back().kind != TokenKind::Newline)) {
+            // Only significant source text terminates a logical statement.
+            // Blank/comment-only lines at the start of a file must not create
+            // phantom NEWLINE tokens, and repeated blank lines coalesce.
+            if (emitToken && !tokens.empty() && tokens.back().kind != TokenKind::Newline) {
                 tokens.push_back({ TokenKind::Newline, "\\n", loc });
             }
             ++line_;
@@ -524,6 +566,12 @@ namespace pcn {
         SourceLocation location;
     };
 
+
+    struct CharExpr {
+        std::uint32_t codepoint = 0;
+        SourceSpan span;
+        SourceLocation location;
+    };
 
     struct StringExpr {
         std::string value;
@@ -664,11 +712,46 @@ namespace pcn {
     };
 
     struct Expr {
-        using Node = std::variant<NumberExpr, StringExpr, BoolExpr, NullExpr, VariableExpr, UnaryExpr, BinaryExpr, PipelineExpr, RangeExpr, ChooseExpr, CallExpr, TryExpr, ClosureExpr, GroupExpr, MemberExpr, ConstructExpr, ArrayExpr, IndexExpr>;
+        using Node = std::variant<NumberExpr, CharExpr, StringExpr, BoolExpr, NullExpr, VariableExpr, UnaryExpr, BinaryExpr, PipelineExpr, RangeExpr, ChooseExpr, CallExpr, TryExpr, ClosureExpr, GroupExpr, MemberExpr, ConstructExpr, ArrayExpr, IndexExpr>;
         Node node;
         SourceSpan span;
         SourceLocation location;
     };
+
+    // A qualified routine path denotes a declaration, not an expression whose
+    // namespace components must be evaluated as local variables. Resolve that
+    // distinction before semantic analysis, effect inference or PCIR lowering.
+    // This accessor also handles parenthesized qualified names without allowing
+    // arbitrary member expressions to be mistaken for built-in routines.
+    static std::optional<std::string> qualifiedCalleeName(const ExprPtr& callee) {
+        if (!callee) return std::nullopt;
+        if (const auto* variable = std::get_if<VariableExpr>(&callee->node))
+            return variable->name;
+        if (const auto* grouped = std::get_if<GroupExpr>(&callee->node))
+            return qualifiedCalleeName(grouped->expression);
+        if (const auto* member = std::get_if<MemberExpr>(&callee->node)) {
+            auto prefix = qualifiedCalleeName(member->object);
+            if (prefix) return *prefix + "." + member->member;
+        }
+        return std::nullopt;
+    }
+
+    // Edition-2026 built-in console API. These calls must be resolved directly
+    // at the call site. No VReg is allocated for `std` or `std.io`, since they
+    // are compile-time namespaces rather than runtime values.
+    static bool isStdIOCall(const ExprPtr& callee, bool* newLine = nullptr) {
+        const auto qualified = qualifiedCalleeName(callee);
+        if (!qualified) return false;
+        if (*qualified == "std.io.print") {
+            if (newLine) *newLine = false;
+            return true;
+        }
+        if (*qualified == "std.io.println") {
+            if (newLine) *newLine = true;
+            return true;
+        }
+        return false;
+    }
 
     struct LetStmt {
         std::string name;
@@ -746,6 +829,7 @@ namespace pcn {
         SourceSpan span;
         SourceLocation location;
         bool bindingsMutable = false;
+        std::string loopLabel;
     };
 
     struct FromStmt {
@@ -756,6 +840,7 @@ namespace pcn {
         std::vector<StmtPtr> body;
         SourceSpan span;
         SourceLocation location;
+        std::string loopLabel;
     };
 
     struct ContinueUntilStmt {
@@ -763,6 +848,7 @@ namespace pcn {
         std::vector<StmtPtr> body;
         SourceSpan span;
         SourceLocation location;
+        std::string loopLabel;
     };
 
     struct UnsafeStmt {
@@ -788,6 +874,7 @@ namespace pcn {
         std::vector<StmtPtr> body;
         SourceSpan span;
         SourceLocation location;
+        std::string loopLabel;
     };
 
     struct BreakStmt {
@@ -1624,19 +1711,29 @@ namespace pcn {
 
         Program parse() {
             Program program;
+            bool sawModule = false;
+            bool sawNonModule = false;
             skipNewlines();
             while (!isAtEnd()) {
                 if (checkKeyword("public") || checkKeyword("compile") || checkKeyword("record") || checkKeyword("enum") || checkKeyword("variant") || checkKeyword("union") || checkKeyword("module") || checkKeyword("use") || checkKeyword("import") || checkKeyword("const") || checkKeyword("capability") || checkKeyword("foreign")) {
-                    program.declarations.push_back(parseDeclaration());
+                    auto declaration = parseDeclaration();
+                    if (std::holds_alternative<ModuleDecl>(declaration.node)) {
+                        if (sawModule) throw std::runtime_error("E0220 duplicate module declaration");
+                        if (sawNonModule) throw std::runtime_error("E0221 module declaration must precede other declarations");
+                        sawModule = true;
+                    }
+                    else sawNonModule = true;
+                    program.declarations.push_back(std::move(declaration));
                     skipNewlines();
                     continue;
                 }
                 if (checkKeyword("routine")) {
+                    sawNonModule = true;
                     program.routines.push_back(parseRoutine());
                     skipNewlines();
                     continue;
                 }
-                throw std::runtime_error("unexpected top-level token: " + peek().text);
+                throw std::runtime_error("E0200 unexpected top-level " + tokenDescription(peek()));
             }
             return program;
         }
@@ -1737,11 +1834,17 @@ namespace pcn {
             return consume();
         }
 
+        // 'io' is a reserved effect word, but is also the name of std.io.
+        // Allow it only as a qualified component, not as a free variable name.
+        Token expectQualifiedComponent() {
+            if (peek().kind == TokenKind::Identifier ||
+                (peek().kind == TokenKind::Keyword && peek().text == "io")) return consume();
+            throw std::runtime_error("E0203 expected qualified name component; received " + tokenDescription(peek()));
+        }
         std::string parseQualifiedName() {
             std::string name = expectIdentifier().text;
-            while (matchSymbol("::") || matchSymbol(".")) {
-                name += "::" + expectIdentifier().text;
-            }
+            while (matchSymbol("::") || matchSymbol("."))
+                name += "::" + expectQualifiedComponent().text;
             return name;
         }
 
@@ -1767,6 +1870,7 @@ namespace pcn {
             }
             routine.constraints = parseWhereClause();
             routine.effects = parseEffectClause();
+            consumeLineBreak();
             skipNewlines();
             expectIndent();
             routine.body = parseBlockStatements();
@@ -1910,19 +2014,14 @@ namespace pcn {
         }
 
         Declaration parseModuleDeclaration(bool isPublic, bool isCompile) {
+            // Edition 2026: 'module' declares the identity of this whole source file.
+            // It is NOT a block opener. Imports, records and routines follow at column 1.
             ModuleDecl decl;
             decl.location = previous().location;
             decl.span = { decl.location, decl.location };
             decl.isPublic = isPublic;
-            decl.name = expectIdentifier().text;
+            decl.name = parseQualifiedName();
             consumeLineBreak();
-            skipNewlines();
-            expectIndent();
-            while (!checkToken(TokenKind::Dedent) && !checkToken(TokenKind::EndOfFile)) {
-                decl.declarations.push_back(parseDeclaration());
-                skipNewlines();
-            }
-            expectDedent();
             (void)isCompile;
             return Declaration{ decl, decl.span, decl.location };
         }
@@ -1976,16 +2075,36 @@ namespace pcn {
             return false;
         }
 
-        void expectIndent() {
-            if (!matchIndent()) {
-                throw std::runtime_error("expected indentation block");
+        static std::string tokenDescription(const Token& token) {
+            const char* kind = "token";
+            switch (token.kind) {
+            case TokenKind::Identifier: kind = "identifier"; break;
+            case TokenKind::Number: kind = "number"; break;
+            case TokenKind::String: kind = "string"; break;
+            case TokenKind::Character: kind = "character"; break;
+            case TokenKind::Keyword: kind = "keyword"; break;
+            case TokenKind::Symbol: kind = "symbol"; break;
+            case TokenKind::Newline: kind = "NEWLINE"; break;
+            case TokenKind::Indent: kind = "INDENT"; break;
+            case TokenKind::Dedent: kind = "DEDENT"; break;
+            case TokenKind::EndOfFile: kind = "EOF"; break;
             }
+            std::ostringstream out;
+            out << kind;
+            if (token.kind != TokenKind::Newline && token.kind != TokenKind::Indent &&
+                token.kind != TokenKind::Dedent && token.kind != TokenKind::EndOfFile)
+                out << " '" << token.text << "'";
+            out << " at " << token.location.line << ":" << token.location.column;
+            return out.str();
         }
-
+        void expectIndent() {
+            if (!matchIndent())
+                throw std::runtime_error("E0201 expected indentation block; received " + tokenDescription(peek()) +
+                    "; block body must start on the next significant line with exactly four more spaces");
+        }
         void expectDedent() {
-            if (!matchDedent()) {
-                throw std::runtime_error("expected end of indented block");
-            }
+            if (!matchDedent())
+                throw std::runtime_error("E0202 expected end of indented block; received " + tokenDescription(peek()));
         }
 
         std::vector<GenericParameter> parseGenericParameterList() {
@@ -2115,25 +2234,7 @@ namespace pcn {
 
         Routine parseRoutine() {
             expectKeyword("routine");
-            Routine routine;
-            routine.location = previous().location;
-            routine.span = { routine.location, routine.location };
-            routine.name = expectIdentifier().text;
-            routine.genericParameters = parseGenericParameterList();
-            routine.parameters = parseParameterList();
-            if (matchKeyword("gives")) {
-                routine.returnType = parseTypeName();
-            }
-            else {
-                routine.returnType = "void";
-            }
-            routine.constraints = parseWhereClause();
-            routine.effects = parseEffectClause();
-            skipNewlines();
-            expectIndent();
-            routine.body = parseBlockStatements();
-            expectDedent();
-            return routine;
+            return parseRoutineCore();
         }
 
         std::vector<StmtPtr> parseBlockStatements() {
@@ -2181,13 +2282,13 @@ namespace pcn {
                     return AstFactory::makeStmt(Stmt{ IfStmt{ value.condition, value.thenBranch, value.elseBranch, value.hasElse, span, location }, span, location }, span);
                 }
                 else if constexpr (std::is_same_v<T, EachStmt>) {
-                    return AstFactory::makeStmt(Stmt{ EachStmt{ value.bindings, value.range, value.guard, value.body, span, location, value.bindingsMutable }, span, location }, span);
+                    return AstFactory::makeStmt(Stmt{ EachStmt{ value.bindings, value.range, value.guard, value.body, span, location, value.bindingsMutable, value.loopLabel }, span, location }, span);
                 }
                 else if constexpr (std::is_same_v<T, FromStmt>) {
-                    return AstFactory::makeStmt(Stmt{ FromStmt{ value.binding, value.typeName, value.first, value.last, value.body, span, location }, span, location }, span);
+                    return AstFactory::makeStmt(Stmt{ FromStmt{ value.binding, value.typeName, value.first, value.last, value.body, span, location, value.loopLabel }, span, location }, span);
                 }
                 else if constexpr (std::is_same_v<T, ContinueUntilStmt>) {
-                    return AstFactory::makeStmt(Stmt{ ContinueUntilStmt{ value.condition, value.body, span, location }, span, location }, span);
+                    return AstFactory::makeStmt(Stmt{ ContinueUntilStmt{ value.condition, value.body, span, location, value.loopLabel }, span, location }, span);
                 }
                 else if constexpr (std::is_same_v<T, UnsafeStmt>) {
                     return AstFactory::makeStmt(Stmt{ UnsafeStmt{ value.body, span, location }, span, location }, span);
@@ -2199,7 +2300,7 @@ namespace pcn {
                     return AstFactory::makeStmt(Stmt{ FailStmt{ value.expression, span, location }, span, location }, span);
                 }
                 else if constexpr (std::is_same_v<T, WhileStmt>) {
-                    return AstFactory::makeStmt(Stmt{ WhileStmt{ value.condition, value.body, span, location }, span, location }, span);
+                    return AstFactory::makeStmt(Stmt{ WhileStmt{ value.condition, value.body, span, location, value.loopLabel }, span, location }, span);
                 }
                 else if constexpr (std::is_same_v<T, BreakStmt>) {
                     return AstFactory::makeStmt(Stmt{ BreakStmt{ value.label, span, location }, span, location }, span);
@@ -2221,6 +2322,9 @@ namespace pcn {
                 using T = std::decay_t<decltype(value)>;
                 if constexpr (std::is_same_v<T, NumberExpr>) {
                     return AstFactory::makeExpr(Expr{ NumberExpr{ value.value, span, location }, span, location }, span);
+                }
+                else if constexpr (std::is_same_v<T, CharExpr>) {
+                    return AstFactory::makeExpr(Expr{ CharExpr{ value.codepoint, span, location }, span, location }, span);
                 }
                 else if constexpr (std::is_same_v<T, StringExpr>) {
                     return AstFactory::makeExpr(Expr{ StringExpr{ value.value, span, location }, span, location }, span);
@@ -2285,6 +2389,25 @@ namespace pcn {
         }
 
         StmtPtr parseStatement() {
+            if (matchSymbol("@")) {
+                const Token label = expectIdentifier();
+                expectSymbol(":");
+                const auto body = parseStatement();
+                Stmt::Node labeled = body->node;
+                const bool validLoop = std::visit([&](auto& n) -> bool {
+                    using T = std::decay_t<decltype(n)>;
+                    if constexpr (std::is_same_v<T, WhileStmt> ||
+                        std::is_same_v<T, EachStmt> ||
+                        std::is_same_v<T, FromStmt> ||
+                        std::is_same_v<T, ContinueUntilStmt>) {
+                        n.loopLabel = label.text;
+                        return true;
+                    }
+                    return false;
+                    }, labeled);
+                if (!validLoop) throw std::runtime_error("E0240 @" + label.text + ": may label only a loop");
+                return makeStmt(std::move(labeled), body->span, body->location);
+            }
             if (matchKeyword("let")) {
                 auto location = previous().location;
                 auto start = location;
@@ -2783,7 +2906,7 @@ namespace pcn {
                     continue;
                 }
                 if (matchSymbol(".")) {
-                    auto memberToken = expectIdentifier();
+                    auto memberToken = expectQualifiedComponent();
                     auto span = SourceSpan{ expr ? expr->span.start : memberToken.location, memberToken.location };
                     expr = makeExpr(MemberExpr{ expr, memberToken.text, span, memberToken.location }, span, memberToken.location);
                     continue;
@@ -2801,6 +2924,17 @@ namespace pcn {
                     for (;;) { arguments.push_back(parseExpression()); if (!matchSymbol(",")) break; }
                 }
                 auto close = expectSymbol(")");
+                // A module-qualified routine is a compile-time symbol, not a
+                // chain of member reads. Canonicalize the known std.io calls
+                // at the parser boundary, so no subsequent compiler stage can
+                // accidentally evaluate `std` as a runtime VariableExpr.
+                // Ordinary user object member calls retain their original AST.
+                if (isStdIOCall(expr)) {
+                    const auto symbol = qualifiedCalleeName(expr);
+                    const auto calleeSpan = expr->span;
+                    expr = makeExpr(VariableExpr{ *symbol, calleeSpan, calleeSpan.start },
+                        calleeSpan, calleeSpan.start);
+                }
                 expr = makeExpr(CallExpr{ expr, std::move(arguments), std::move(genericArguments),{ start, close.location }, location }, { start, close.location }, location);
             }
             return expr;
@@ -2856,6 +2990,12 @@ namespace pcn {
                 auto token = consume();
                 return makeExpr(NumberExpr{ token.text,{ token.location, token.location }, token.location }, { token.location, token.location }, token.location);
             }
+            if (peek().kind == TokenKind::Character) {
+                auto token = consume();
+                auto cp = static_cast<std::uint32_t>(std::stoul(token.text));
+                return makeExpr(CharExpr{ cp,{ token.location, token.location }, token.location },
+                    { token.location, token.location }, token.location);
+            }
             if (peek().kind == TokenKind::String) {
                 auto token = consume();
                 return makeExpr(StringExpr{ token.text,{ token.location, token.location }, token.location }, { token.location, token.location }, token.location);
@@ -2876,7 +3016,7 @@ namespace pcn {
                 auto token = consume();
                 auto expr = makeExpr(VariableExpr{ token.text,{ token.location, token.location }, token.location }, { token.location, token.location }, token.location);
                 while (matchSymbol(".")) {
-                    auto memberToken = expectIdentifier();
+                    auto memberToken = expectQualifiedComponent();
                     auto span = SourceSpan{ expr ? expr->span.start : token.location, memberToken.location };
                     expr = makeExpr(MemberExpr{ expr, memberToken.text, span, memberToken.location }, span, memberToken.location);
                 }
@@ -2972,6 +3112,7 @@ namespace pcn {
             return std::visit([&](const auto& n)->Value {
                 using T = std::decay_t<decltype(n)>;
                 if constexpr (std::is_same_v<T, NumberExpr>)return numericLiteral(n.value, expected);
+                else if constexpr (std::is_same_v<T, CharExpr>)return static_cast<std::int64_t>(n.codepoint);
                 else if constexpr (std::is_same_v<T, BoolExpr>)return n.value;
                 else if constexpr (std::is_same_v<T, StringExpr>)return n.value;
                 else if constexpr (std::is_same_v<T, VariableExpr>)return resolve(n.name);
@@ -3671,10 +3812,23 @@ namespace pcn {
         }
 
         bool analyzeEach(const EachStmt& node) {
-            analyzeExpr(node.range);
+            const auto iterableType = analyzeExpr(node.range);
+            std::string element;
+            SemanticType bindingType = makeUnknownType();
+            if (typeIsArray(semanticTypeName(iterableType), &element)) {
+                bindingType = semanticTypeFromName(element);
+                if (node.bindingsMutable)
+                    report(node.location, "E0612 for var over fixed arrays requires exclusive element borrowing, not yet implemented");
+            }
+            else if (node.range && std::holds_alternative<RangeExpr>(node.range->node)) {
+                bindingType = semanticTypeFromName("int");
+            }
+            else {
+                report(node.location, "E0611 iterator lowering currently supports integer ranges and fixed array<T,N>; view<T>/iterator<I,T> pending");
+            }
             pushScope();
             for (const auto& binding : node.bindings) {
-                declareSymbol(node.location, binding, { makeUnknownType(), node.bindingsMutable, false });
+                declareSymbol(node.location, binding, { bindingType, node.bindingsMutable, false });
             }
             if (node.guard) {
                 auto guardType = analyzeExpr(node.guard);
@@ -3682,8 +3836,13 @@ namespace pcn {
                     report(node.location, "for guard condition must be bool, got " + semanticTypeName(guardType));
                 }
             }
+            if (!node.loopLabel.empty() &&
+                std::find(loopLabels_.begin(), loopLabels_.end(), node.loopLabel) != loopLabels_.end())
+                report(node.location, "E0241 duplicate active loop label @" + node.loopLabel);
             ++currentLoopDepth_;
+            loopLabels_.push_back(node.loopLabel);
             auto fallsThrough = analyzeStatementList(node.body, true);
+            loopLabels_.pop_back();
             --currentLoopDepth_;
             popScope();
             return fallsThrough;
@@ -3717,8 +3876,13 @@ namespace pcn {
             }
             pushScope();
             declareSymbol(node.location, node.binding, { inductionType, false, false });
+            if (!node.loopLabel.empty() &&
+                std::find(loopLabels_.begin(), loopLabels_.end(), node.loopLabel) != loopLabels_.end())
+                report(node.location, "E0241 duplicate active loop label @" + node.loopLabel);
             ++currentLoopDepth_;
+            loopLabels_.push_back(node.loopLabel);
             auto fallsThrough = analyzeStatementList(node.body, true);
+            loopLabels_.pop_back();
             --currentLoopDepth_;
             popScope();
             return fallsThrough;
@@ -3730,8 +3894,13 @@ namespace pcn {
                 report(node.location, "continue-until condition must be bool, got " + semanticTypeName(conditionType));
             }
             pushScope();
+            if (!node.loopLabel.empty() &&
+                std::find(loopLabels_.begin(), loopLabels_.end(), node.loopLabel) != loopLabels_.end())
+                report(node.location, "E0241 duplicate active loop label @" + node.loopLabel);
             ++currentLoopDepth_;
+            loopLabels_.push_back(node.loopLabel);
             analyzeStatementList(node.body, true);
+            loopLabels_.pop_back();
             --currentLoopDepth_;
             popScope();
             return true;
@@ -3771,8 +3940,13 @@ namespace pcn {
                 popScope();
                 return true;
             }
+            if (!node.loopLabel.empty() &&
+                std::find(loopLabels_.begin(), loopLabels_.end(), node.loopLabel) != loopLabels_.end())
+                report(node.location, "E0241 duplicate active loop label @" + node.loopLabel);
             ++currentLoopDepth_;
+            loopLabels_.push_back(node.loopLabel);
             analyzeStatementList(node.body, true);
+            loopLabels_.pop_back();
             --currentLoopDepth_;
             popScope();
             return true;
@@ -3780,13 +3954,15 @@ namespace pcn {
 
         bool analyzeBreak(const BreakStmt& node) {
             if (currentLoopDepth_ == 0) report(node.location, "break outside of loop");
-            if (!node.label.empty()) report(node.location, "labeled break is parsed but label resolution is not yet implemented in this bootstrap compiler");
+            if (!node.label.empty() && std::find(loopLabels_.begin(), loopLabels_.end(), node.label) == loopLabels_.end())
+                report(node.location, "E0242 break refers to unknown enclosing loop @" + node.label);
             return false;
         }
 
         bool analyzeContinue(const ContinueStmt& node) {
             if (currentLoopDepth_ == 0) report(node.location, "continue outside of loop");
-            if (!node.label.empty()) report(node.location, "labeled continue is parsed but label resolution is not yet implemented in this bootstrap compiler");
+            if (!node.label.empty() && std::find(loopLabels_.begin(), loopLabels_.end(), node.label) == loopLabels_.end())
+                report(node.location, "E0243 continue refers to unknown enclosing loop @" + node.label);
             return false;
         }
 
@@ -4118,6 +4294,17 @@ namespace pcn {
         }
 
         SemanticType analyzeCallExpr(const CallExpr& node) {
+            if (isStdIOCall(node.callee)) {
+                if (node.arguments.size() != 1) {
+                    report(node.location, "E0350 std.io.print/println requires exactly one text argument");
+                }
+                for (const auto& arg : node.arguments) {
+                    const auto t = analyzeExpr(arg);
+                    if (t.kind != SemanticTypeKind::Text && t.kind != SemanticTypeKind::Unknown)
+                        report(node.location, "E0351 std.io.print/println requires UTF-8 text");
+                }
+                return makeVoidType();
+            }
             if (const auto* member = node.callee ? std::get_if<MemberExpr>(&node.callee->node) : nullptr) {
                 auto objectType = member->object ? analyzeExpr(member->object) : makeUnknownType();
                 if (objectType.kind == SemanticTypeKind::Text || objectType.kind == SemanticTypeKind::String)
@@ -4200,8 +4387,9 @@ namespace pcn {
 
         SemanticType analyzeComparisonBinary(const BinaryExpr& node, const SemanticType& leftType, const SemanticType& rightType) {
             const bool numericCompare = isNumericType(leftType) && isNumericType(rightType);
+            const bool charCompare = leftType.name == "char" && rightType.name == "char";
             const bool textCompare = isTextLikeType(leftType) && isTextLikeType(rightType);
-            if (!numericCompare && !textCompare && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
+            if (!numericCompare && !charCompare && !textCompare && leftType.kind != SemanticTypeKind::Unknown && rightType.kind != SemanticTypeKind::Unknown) {
                 report(node.location, "comparison operator '" + node.op + "' requires numbers or text/string operands");
             }
             if (numericCompare) checkNumericCompatibility(node, leftType, rightType);
@@ -4296,6 +4484,9 @@ namespace pcn {
                 using T = std::decay_t<decltype(node)>;
                 if constexpr (std::is_same_v<T, NumberExpr>) {
                     return makeNumberType();
+                }
+                else if constexpr (std::is_same_v<T, CharExpr>) {
+                    return semanticTypeFromName("char");
                 }
                 else if constexpr (std::is_same_v<T, StringExpr>) {
                     return makeTextType();
@@ -4831,6 +5022,7 @@ namespace pcn {
         const Routine* currentRoutine_ = nullptr;
         SemanticType currentReturnType_ = makeVoidType();
         std::size_t currentLoopDepth_ = 0;
+        std::vector<std::string> loopLabels_;
     };
 
 
@@ -5032,6 +5224,7 @@ namespace pcn {
             if (!e)return "unknown";
             return std::visit([&](const auto& n)->std::string {using T = std::decay_t<decltype(n)>;
             if constexpr (std::is_same_v<T, NumberExpr>)return "int";
+            else if constexpr (std::is_same_v<T, CharExpr>)return "char";
             else if constexpr (std::is_same_v<T, StringExpr>)return "text";
             else if constexpr (std::is_same_v<T, BoolExpr>)return "bool";
             else if constexpr (std::is_same_v<T, NullExpr>)return "null";
@@ -5065,6 +5258,7 @@ namespace pcn {
             }return nullptr;
         }
         std::string inferCallType(const CallExpr& c) {
+            if (isStdIOCall(c.callee)) return "void";
             if (auto* m = c.callee ? std::get_if<MemberExpr>(&c.callee->node) : nullptr) { auto o = inferExprType(m->object); if (o == "text" && m->member == "to_string")return "string"; if (o == "string" && m->member == "to_text")return "text"; if ((o == "text" || o == "string") && m->member == "count")return "size"; if (o == "text" && (m->member == "equals" || m->member == "starts_with" || m->member == "ends_with" || m->member == "stdout_write" || m->member == "stderr_write" || m->member == "is_ascii" || m->member == "contains"))return "bool"; if (o == "text" && (m->member == "byte_at" || m->member == "find_byte" || m->member == "find" || m->member == "hash64" || m->member == "codepoint_at" || m->member == "codepoint_count" || m->member == "compare" || m->member == "rfind"))return "int"; if ((o == "size" && m->member == "to_int") || (o == "int" && m->member == "to_size"))return m->member == "to_int" ? "int" : "size"; if (o == "string" && (m->member == "clear" || m->member == "dispose" || m->member == "append"))return "void"; }
             auto* v = c.callee ? std::get_if<VariableExpr>(&c.callee->node) : nullptr; if (v && (v->name == "ok" || v->name == "err" || v->name == "some") && c.arguments.size() == 1)return "__" + v->name + "<" + inferExprType(c.arguments[0]) + ">"; if (v && v->name == "none")return "__none"; std::map<std::string, std::string>s; if (auto* r = resolveCall(c, &s))return substituteGenericType(r->returnType, s); return "unknown";
         }
@@ -5092,7 +5286,6 @@ namespace pcn {
                 else if constexpr (std::is_same_v<T, DeferStmt>)walkExpr(n.expression, inClosure);
                 else if constexpr (std::is_same_v<T, IfStmt>) { walkExpr(n.condition, inClosure); scopes_.push_back({}); walkStatements(n.thenBranch, inClosure); scopes_.pop_back(); scopes_.push_back({}); walkStatements(n.elseBranch, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, WhileStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": loop"); walkExpr(n.condition, inClosure); scopes_.push_back({}); walkStatements(n.body, inClosure); scopes_.pop_back(); }
-                else if constexpr (std::is_same_v<T, EachStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": iterator/range loop"); walkExpr(n.range, inClosure); scopes_.push_back({}); for (const auto& b : n.bindings)declare(b, "int", n.bindingsMutable, false, "shared", n.location, point_); walkStatements(n.body, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, EachStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": iterator/range loop"); walkExpr(n.range, inClosure); scopes_.push_back({}); for (const auto& b : n.bindings)declare(b, "int", n.bindingsMutable, false, "shared", n.location, point_); if (n.guard)walkExpr(n.guard, inClosure); walkStatements(n.body, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, FromStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": directed integer loop"); walkExpr(n.first, inClosure); walkExpr(n.last, inClosure); scopes_.push_back({}); declare(n.binding, n.typeName.empty() ? "int" : n.typeName, false, false, "shared", n.location, point_); walkStatements(n.body, inClosure); scopes_.pop_back(); }
                 else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { result_->skm.structuralFacts.push_back(currentRoutine_ + ": post-test loop"); walkExpr(n.condition, inClosure); scopes_.push_back({}); walkStatements(n.body, inClosure); scopes_.pop_back(); }
@@ -5157,7 +5350,7 @@ namespace pcn {
             if (!e)return; std::visit([&](const auto& n) {using T = std::decay_t<decltype(n)>;
             if constexpr (std::is_same_v<T, UnaryExpr>)inferClosureExprEffects(n.operand, out);
             else if constexpr (std::is_same_v<T, BinaryExpr>) { inferClosureExprEffects(n.left, out); inferClosureExprEffects(n.right, out); if (n.op == "/" || n.op == "%")out.insert("trap"); }
-            else if constexpr (std::is_same_v<T, CallExpr>) { for (auto& a : n.arguments)inferClosureExprEffects(a, out); if (auto* m = n.callee ? std::get_if<MemberExpr>(&n.callee->node) : nullptr) { inferClosureExprEffects(m->object, out); if (m->member == "to_string" || m->member == "append")out.insert("alloc"); if (m->member == "append")out.insert("trap"); if (m->member == "stdout_write" || m->member == "stderr_write")out.insert("io"); if (m->member == "byte_at" || m->member == "codepoint_at" || m->member == "to_int" || m->member == "to_size")out.insert("trap"); } else if (auto* v = n.callee ? std::get_if<VariableExpr>(&n.callee->node) : nullptr) { if (v->name == "print" || v->name == "println")out.insert("io"); auto ri = routines_.find(v->name); if (ri != routines_.end())for (auto* r : ri->second)if (r->parameters.size() == n.arguments.size()) { auto ef = result_->resolvedEffects.find(keyFor(*r)); if (ef != result_->resolvedEffects.end())out.insert(ef->second.begin(), ef->second.end()); break; } } }
+            else if constexpr (std::is_same_v<T, CallExpr>) { for (auto& a : n.arguments)inferClosureExprEffects(a, out); if (isStdIOCall(n.callee)) out.insert("io"); else if (auto* m = n.callee ? std::get_if<MemberExpr>(&n.callee->node) : nullptr) { inferClosureExprEffects(m->object, out); if (m->member == "to_string" || m->member == "append")out.insert("alloc"); if (m->member == "append")out.insert("trap"); if (m->member == "stdout_write" || m->member == "stderr_write")out.insert("io"); if (m->member == "byte_at" || m->member == "codepoint_at" || m->member == "to_int" || m->member == "to_size")out.insert("trap"); } else if (auto* v = n.callee ? std::get_if<VariableExpr>(&n.callee->node) : nullptr) { if (v->name == "print" || v->name == "println")out.insert("io"); auto ri = routines_.find(v->name); if (ri != routines_.end())for (auto* r : ri->second)if (r->parameters.size() == n.arguments.size()) { auto ef = result_->resolvedEffects.find(keyFor(*r)); if (ef != result_->resolvedEffects.end())out.insert(ef->second.begin(), ef->second.end()); break; } } }
             else if constexpr (std::is_same_v<T, PipelineExpr>) { inferClosureExprEffects(n.input, out); for (auto& x : n.stages)inferClosureExprEffects(x, out); }
             else if constexpr (std::is_same_v<T, RangeExpr>) { inferClosureExprEffects(n.start, out); inferClosureExprEffects(n.end, out); inferClosureExprEffects(n.step, out); }
             else if constexpr (std::is_same_v<T, ChooseExpr>) { inferClosureExprEffects(n.subject, out); for (auto& x : n.cases) { inferClosureExprEffects(x.condition, out); inferClosureExprEffects(x.value, out); }inferClosureExprEffects(n.otherwiseValue, out); }
@@ -5176,7 +5369,6 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, RecordSetStmt>)inferClosureExprEffects(n.value, out); else if constexpr (std::is_same_v<T, ExprStmt>)inferClosureExprEffects(n.expression, out); else if constexpr (std::is_same_v<T, ReturnStmt>) { if (n.hasValue)inferClosureExprEffects(n.value, out); }
             else if constexpr (std::is_same_v<T, GiveStmt>)inferClosureExprEffects(n.value, out); else if constexpr (std::is_same_v<T, FailStmt>)inferClosureExprEffects(n.expression, out); else if constexpr (std::is_same_v<T, IfStmt>) { inferClosureExprEffects(n.condition, out); inferClosureStmtEffects(n.thenBranch, out); inferClosureStmtEffects(n.elseBranch, out); }
             else if constexpr (std::is_same_v<T, WhileStmt>) { inferClosureExprEffects(n.condition, out); inferClosureStmtEffects(n.body, out); }
-            else if constexpr (std::is_same_v<T, EachStmt>) { inferClosureExprEffects(n.range, out); inferClosureStmtEffects(n.body, out); }
             else if constexpr (std::is_same_v<T, EachStmt>) { inferClosureExprEffects(n.range, out); inferClosureExprEffects(n.guard, out); inferClosureStmtEffects(n.body, out); }
             else if constexpr (std::is_same_v<T, FromStmt>) { inferClosureExprEffects(n.first, out); inferClosureExprEffects(n.last, out); inferClosureStmtEffects(n.body, out); }
             else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { inferClosureExprEffects(n.condition, out); inferClosureStmtEffects(n.body, out); }
@@ -5201,7 +5393,6 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, ExprStmt>)scanExpr(n.expression); else if constexpr (std::is_same_v<T, ReturnStmt>) { if (n.hasValue)scanExpr(n.value); }
             else if constexpr (std::is_same_v<T, GiveStmt>)scanExpr(n.value); else if constexpr (std::is_same_v<T, FailStmt>)scanExpr(n.expression); else if constexpr (std::is_same_v<T, IfStmt>) { scanExpr(n.condition); scanStmts(n.thenBranch); scanStmts(n.elseBranch); }
             else if constexpr (std::is_same_v<T, WhileStmt>) { scanExpr(n.condition); scanStmts(n.body); }
-            else if constexpr (std::is_same_v<T, EachStmt>) { scanExpr(n.range); for (auto& x : n.bindings)locals.insert(x); scanStmts(n.body); }
             else if constexpr (std::is_same_v<T, EachStmt>) { scanExpr(n.range); for (auto& x : n.bindings)locals.insert(x); scanExpr(n.guard); scanStmts(n.body); }
             else if constexpr (std::is_same_v<T, FromStmt>) { scanExpr(n.first); scanExpr(n.last); locals.insert(n.binding); scanStmts(n.body); }
             else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { scanExpr(n.condition); scanStmts(n.body); }
@@ -5446,7 +5637,10 @@ namespace pcn {
                 }
                 else if constexpr (std::is_same_v<T, CallExpr>) {
                     for (const auto& a : node.arguments) collectExprEffects(a, facts);
-                    if (const auto* member = node.callee ? std::get_if<MemberExpr>(&node.callee->node) : nullptr) {
+                    if (isStdIOCall(node.callee)) {
+                        facts.direct.insert("io");
+                    }
+                    else if (const auto* member = node.callee ? std::get_if<MemberExpr>(&node.callee->node) : nullptr) {
                         collectExprEffects(member->object, facts);
                         if (member->member == "stdout_write" || member->member == "stderr_write") {
                             facts.direct.insert("io");
@@ -5822,6 +6016,11 @@ namespace pcn {
             if constexpr (std::is_same_v<T, NumberExpr>) {
                 return node.value;
             }
+            else if constexpr (std::is_same_v<T, CharExpr>) {
+                if (node.codepoint >= 32 && node.codepoint < 127 && node.codepoint != '\'' && node.codepoint != '\\')
+                    return std::string("'") + char(node.codepoint) + "'";
+                return "<char U+" + std::to_string(node.codepoint) + ">";
+            }
             else if constexpr (std::is_same_v<T, StringExpr>) {
                 return '"' + node.value + '"';
             }
@@ -5962,7 +6161,7 @@ namespace pcn {
                 return result;
             }
             else if constexpr (std::is_same_v<T, WhileStmt>) {
-                oss << indentText(depth) << "while " << exprToString(node.condition) << "\n";
+                oss << indentText(depth) << (node.loopLabel.empty() ? "" : "@" + node.loopLabel + ": ") << "while " << exprToString(node.condition) << "\n";
                 for (const auto& child : node.body) {
                     oss << stmtToString(child, depth + 1) << "\n";
                 }
@@ -5977,13 +6176,12 @@ namespace pcn {
                 return indentText(depth) + "continue" + (node.label.empty() ? "" : " @" + node.label);
             }
             else if constexpr (std::is_same_v<T, EachStmt>) {
-                oss << indentText(depth) << "for ";
+                oss << indentText(depth) << (node.loopLabel.empty() ? "" : "@" + node.loopLabel + ": ") << "for ";
                 if (node.bindingsMutable) oss << "var ";
                 for (std::size_t i = 0; i < node.bindings.size(); ++i) {
                     if (i != 0) oss << ", ";
                     oss << node.bindings[i];
                 }
-                oss << " in " << exprToString(node.range) << "\n";
                 oss << " in " << exprToString(node.range);
                 if (node.guard) oss << " while " << exprToString(node.guard);
                 oss << "\n";
@@ -5995,7 +6193,7 @@ namespace pcn {
                 return result;
             }
             else if constexpr (std::is_same_v<T, FromStmt>) {
-                oss << indentText(depth) << "from " << node.binding;
+                oss << indentText(depth) << (node.loopLabel.empty() ? "" : "@" + node.loopLabel + ": ") << "from " << node.binding;
                 if (!node.typeName.empty()) oss << ": " << node.typeName;
                 oss << " = " << exprToString(node.first) << " to " << exprToString(node.last) << "\n";
                 for (const auto& child : node.body) {
@@ -6006,7 +6204,7 @@ namespace pcn {
                 return result;
             }
             else if constexpr (std::is_same_v<T, ContinueUntilStmt>) {
-                oss << indentText(depth) << "continue until " << exprToString(node.condition) << "\n";
+                oss << indentText(depth) << (node.loopLabel.empty() ? "" : "@" + node.loopLabel + ": ") << "continue until " << exprToString(node.condition) << "\n";
                 for (const auto& child : node.body) {
                     oss << stmtToString(child, depth + 1) << "\n";
                 }
@@ -6097,7 +6295,7 @@ namespace pcn {
         Parameter rewriteParameter(Parameter p, const std::map<std::string, std::string>& m) { p.typeName = subst(p.typeName, m); return p; }
         ExprPtr rewriteExpr(const ExprPtr& e, const std::map<std::string, std::string>& m) {
             if (!e)return{}; auto span = e->span; return std::visit([&](const auto& n)->ExprPtr {using T = std::decay_t<decltype(n)>;
-            if constexpr (std::is_same_v<T, NumberExpr> || std::is_same_v<T, StringExpr> || std::is_same_v<T, BoolExpr> || std::is_same_v<T, NullExpr> || std::is_same_v<T, VariableExpr>)return std::make_shared<const Expr>(*e);
+            if constexpr (std::is_same_v<T, NumberExpr> || std::is_same_v<T, CharExpr> || std::is_same_v<T, StringExpr> || std::is_same_v<T, BoolExpr> || std::is_same_v<T, NullExpr> || std::is_same_v<T, VariableExpr>)return std::make_shared<const Expr>(*e);
             else if constexpr (std::is_same_v<T, UnaryExpr>) { auto x = n; x.operand = rewriteExpr(n.operand, m); return AstFactory::makeExpr(std::move(x), span); }
             else if constexpr (std::is_same_v<T, BinaryExpr>) { auto x = n; x.left = rewriteExpr(n.left, m); x.right = rewriteExpr(n.right, m); return AstFactory::makeExpr(std::move(x), span); }
             else if constexpr (std::is_same_v<T, PipelineExpr>) { auto x = n; x.input = rewriteExpr(n.input, m); for (auto& z : x.stages)z = rewriteExpr(z, m); return AstFactory::makeExpr(std::move(x), span); }
@@ -6124,7 +6322,6 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, ReturnStmt>) { if (x.hasValue)x.value = rewriteExpr(x.value, m); }
             else if constexpr (std::is_same_v<T, GiveStmt>)x.value = rewriteExpr(x.value, m);
             else if constexpr (std::is_same_v<T, IfStmt>) { x.condition = rewriteExpr(x.condition, m); x.thenBranch = rewriteStatements(x.thenBranch, m); x.elseBranch = rewriteStatements(x.elseBranch, m); }
-            else if constexpr (std::is_same_v<T, EachStmt>) { x.range = rewriteExpr(x.range, m); x.body = rewriteStatements(x.body, m); }
             else if constexpr (std::is_same_v<T, EachStmt>) { x.range = rewriteExpr(x.range, m); x.guard = rewriteExpr(x.guard, m); x.body = rewriteStatements(x.body, m); }
             else if constexpr (std::is_same_v<T, FromStmt>) { x.first = rewriteExpr(x.first, m); x.last = rewriteExpr(x.last, m); x.typeName = subst(x.typeName, m); x.body = rewriteStatements(x.body, m); }
             else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { x.condition = rewriteExpr(x.condition, m); x.body = rewriteStatements(x.body, m); }
@@ -6144,7 +6341,6 @@ namespace pcn {
             else if constexpr (std::is_same_v<T, ArraySetStmt>) { collectClosuresExpr(n.index, out); collectClosuresExpr(n.value, out); }
             else if constexpr (std::is_same_v<T, RecordSetStmt>)collectClosuresExpr(n.value, out); else if constexpr (std::is_same_v<T, ExprStmt>)collectClosuresExpr(n.expression, out); else if constexpr (std::is_same_v<T, ReturnStmt>) { if (n.hasValue)collectClosuresExpr(n.value, out); }
             else if constexpr (std::is_same_v<T, GiveStmt>)collectClosuresExpr(n.value, out); else if constexpr (std::is_same_v<T, IfStmt>) { collectClosuresExpr(n.condition, out); collectClosuresStmt(n.thenBranch, out); collectClosuresStmt(n.elseBranch, out); }
-            else if constexpr (std::is_same_v<T, EachStmt>) { collectClosuresExpr(n.range, out); collectClosuresStmt(n.body, out); }
             else if constexpr (std::is_same_v<T, EachStmt>) { collectClosuresExpr(n.range, out); collectClosuresExpr(n.guard, out); collectClosuresStmt(n.body, out); }
             else if constexpr (std::is_same_v<T, FromStmt>) { collectClosuresExpr(n.first, out); collectClosuresExpr(n.last, out); collectClosuresStmt(n.body, out); }
             else if constexpr (std::is_same_v<T, ContinueUntilStmt>) { collectClosuresExpr(n.condition, out); collectClosuresStmt(n.body, out); }
@@ -6317,6 +6513,7 @@ namespace pcn {
             loopBreakTargets_.clear();
             loopContinueTargets_.clear();
             loopScopeDepths_.clear();
+            loopLabels_.clear();
             deferScopes_.clear();
             textViewOwners_.clear();
             ownedScopes_.clear();
@@ -6784,6 +6981,7 @@ namespace pcn {
             loopContinueTargets_.push_back(condBlock);
             loopBreakTargets_.push_back(exitBlock);
             loopScopeDepths_.push_back(deferScopes_.size());
+            loopLabels_.push_back(node.loopLabel);
             currentBlock_ = bodyBlock;
             currentTerminated_ = false;
             lastValue_ = VReg::None;
@@ -6792,78 +6990,98 @@ namespace pcn {
             loopContinueTargets_.pop_back();
             loopBreakTargets_.pop_back();
             loopScopeDepths_.pop_back();
+            loopLabels_.pop_back();
 
             currentBlock_ = exitBlock;
             currentTerminated_ = false;
         }
 
         void lowerEach(const EachStmt& node) {
-            if (node.bindings.size() != 1) {
-                throw std::runtime_error("bootstrap PCIR lowering currently requires one binding in for-range loops");
-            }
-            const auto* range = node.range ? std::get_if<RangeExpr>(&node.range->node) : nullptr;
-            if (!range || !range->start || !range->end) {
-                throw std::runtime_error("bootstrap PCIR lowering currently supports for over numeric ranges only");
-            }
+            if (node.bindings.size() != 1)
+                throw std::runtime_error("E0610 for loops currently require a single element binding");
+            const auto* sourceRange = node.range ? std::get_if<RangeExpr>(&node.range->node) : nullptr;
+            const std::string iterableType = lowerExprType(node.range).name;
+            std::string elementType;
+            std::size_t elementCount = 0;
+            const bool fixedArray = typeIsArray(iterableType, &elementType, &elementCount);
+            if (!fixedArray && (!sourceRange || !sourceRange->start || !sourceRange->end))
+                throw std::runtime_error("E0611 for iterable backend supports integer ranges and fixed array<T,N>; general iterator<I,T> lowering is not implemented");
+            if (fixedArray && node.bindingsMutable)
+                throw std::runtime_error("E0612 for var over fixed arrays requires exclusive element borrowing, not yet implemented");
 
-            const std::string& binding = node.bindings.front();
-            VReg startValue = lowerExpr(range->start);
-            VReg endValue = lowerExpr(range->end);
+            const auto& binding = node.bindings.front();
+            auto priorValue = locals_.find(binding);
+            const bool hadValue = priorValue != locals_.end();
+            const VReg previousValue = hadValue ? priorValue->second : VReg::None;
+            auto priorType = localValueTypes_.find(binding);
+            const bool hadType = priorType != localValueTypes_.end();
+            const IRValueType previousType = hadType ? priorType->second : makeIRUnknownType();
+
+            // Iterate over one evaluated aggregate, never duplicate an iterable's
+            // side effects and never re-evaluate the upper endpoint.
+            VReg baseArray = VReg::None;
+            VReg firstValue = VReg::None;
+            VReg endValue = VReg::None;
+            if (fixedArray) {
+                baseArray = lowerExpr(node.range);
+                firstValue = emitConst(IROpcode::ConstInt, "0");
+                endValue = emitConst(IROpcode::ConstInt, std::to_string(elementCount));
+            }
+            else {
+                firstValue = lowerExpr(sourceRange->start);
+                endValue = lowerExpr(sourceRange->end);
+            }
             VReg induction = allocateVReg();
-            IRInstruction init;
-            init.op = IROpcode::Copy;
-            init.dest = induction;
-            init.args.push_back(startValue);
-            init.valueType = makeIRIntType();
-            emit(std::move(init));
-            locals_[binding] = induction;
-            localValueTypes_[binding] = makeIRIntType();
+            IRInstruction init; init.op = IROpcode::Copy; init.dest = induction;
+            init.args = { firstValue }; init.valueType = makeIRIntType(); emit(std::move(init));
 
             BlockID condBlock = createBlock("for.cond");
             BlockID candidateBlock = createBlock("for.candidate");
             BlockID bodyBlock = createBlock("for.body");
             BlockID stepBlock = createBlock("for.step");
+            BlockID advanceBlock = createBlock("for.advance");
             BlockID exitBlock = createBlock("for.exit");
             emitBranch(condBlock);
 
             currentBlock_ = condBlock;
             currentTerminated_ = false;
-            VReg condition = allocateVReg();
+            VReg hasCandidate = allocateVReg();
             IRInstruction compare;
-            compare.op = range->inclusive ? IROpcode::Le : IROpcode::Lt;
-            compare.dest = condition;
-            compare.args = { induction, endValue };
-            compare.valueType = makeIRBoolType();
+            compare.op = !fixedArray && sourceRange->inclusive ? IROpcode::Le : IROpcode::Lt;
+            compare.dest = hasCandidate;
+            compare.args = { induction, endValue }; compare.valueType = makeIRBoolType();
             emit(std::move(compare));
-            IRInstruction branch;
-            branch.op = IROpcode::BranchIf;
-            branch.args.push_back(condition);
-            branch.targetBlocks = { bodyBlock, exitBlock };
-            branch.targetBlocks = { candidateBlock, exitBlock };
-            branch.valueType = makeIRVoidType();
-            emit(std::move(branch));
-            currentTerminated_ = true;
+            IRInstruction condition;
+            condition.op = IROpcode::BranchIf; condition.args = { hasCandidate };
+            condition.targetBlocks = { candidateBlock, exitBlock };
+            condition.valueType = makeIRVoidType(); emit(std::move(condition)); currentTerminated_ = true;
 
             currentBlock_ = candidateBlock;
             currentTerminated_ = false;
-            if (node.guard) {
-                VReg guardValue = lowerExpr(node.guard);
-                IRInstruction guardBranch;
-                guardBranch.op = IROpcode::BranchIf;
-                guardBranch.args.push_back(guardValue);
-                guardBranch.targetBlocks = { bodyBlock, exitBlock };
-                guardBranch.valueType = makeIRVoidType();
-                emit(std::move(guardBranch));
-                currentTerminated_ = true;
+            if (fixedArray) {
+                IRInstruction get; get.op = IROpcode::ArrayIndex; get.dest = allocateVReg();
+                get.typeName = iterableType; get.valueType = irValueTypeFromName(elementType);
+                get.args = { baseArray, induction }; emit(get);
+                locals_[binding] = get.dest;
+                localValueTypes_[binding] = get.valueType;
             }
             else {
-                emitBranch(bodyBlock);
+                locals_[binding] = induction;
+                localValueTypes_[binding] = makeIRIntType();
+            }
+            if (node.guard) {
+                const auto guard = lowerExpr(node.guard);
+                IRInstruction guardBranch; guardBranch.op = IROpcode::BranchIf;
+                guardBranch.args = { guard }; guardBranch.targetBlocks = { bodyBlock, exitBlock };
+                guardBranch.valueType = makeIRVoidType(); emit(std::move(guardBranch));
                 currentTerminated_ = true;
             }
+            else emitBranch(bodyBlock);
 
             loopContinueTargets_.push_back(stepBlock);
             loopBreakTargets_.push_back(exitBlock);
             loopScopeDepths_.push_back(deferScopes_.size());
+            loopLabels_.push_back(node.loopLabel);
             currentBlock_ = bodyBlock;
             currentTerminated_ = false;
             lowerStatementList(node.body);
@@ -6871,25 +7089,32 @@ namespace pcn {
 
             currentBlock_ = stepBlock;
             currentTerminated_ = false;
-            VReg one = emitConst(IROpcode::ConstInt, "1");
-            VReg next = allocateVReg();
-            IRInstruction add;
-            add.op = IROpcode::Add;
-            add.dest = next;
-            add.args = { induction, one };
-            add.valueType = makeIRIntType();
-            emit(std::move(add));
-            IRInstruction update;
-            update.op = IROpcode::Copy;
-            update.dest = induction;
-            update.args.push_back(next);
-            update.valueType = makeIRIntType();
-            emit(std::move(update));
+            // Inclusive numeric ranges must stop BEFORE forming MAX + 1.
+            if (!fixedArray && sourceRange->inclusive) {
+                IRInstruction atEnd; atEnd.op = IROpcode::Eq; atEnd.dest = allocateVReg();
+                atEnd.args = { induction, endValue }; atEnd.valueType = makeIRBoolType(); emit(atEnd);
+                IRInstruction decide; decide.op = IROpcode::BranchIf;
+                decide.args = { atEnd.dest }; decide.targetBlocks = { exitBlock, advanceBlock };
+                decide.valueType = makeIRVoidType(); emit(std::move(decide));
+                currentTerminated_ = true;
+            }
+            else emitBranch(advanceBlock);
+
+            currentBlock_ = advanceBlock;
+            currentTerminated_ = false;
+            const VReg one = emitConst(IROpcode::ConstInt, "1");
+            IRInstruction add; add.op = IROpcode::Add; add.dest = allocateVReg();
+            add.args = { induction, one }; add.valueType = makeIRIntType(); emit(add);
+            IRInstruction update; update.op = IROpcode::Copy; update.dest = induction;
+            update.args = { add.dest }; update.valueType = makeIRIntType(); emit(update);
             emitBranch(condBlock);
 
             loopContinueTargets_.pop_back();
             loopBreakTargets_.pop_back();
             loopScopeDepths_.pop_back();
+            loopLabels_.pop_back();
+            if (hadValue) locals_[binding] = previousValue; else locals_.erase(binding);
+            if (hadType) localValueTypes_[binding] = previousType; else localValueTypes_.erase(binding);
             currentBlock_ = exitBlock;
             currentTerminated_ = false;
         }
@@ -6922,6 +7147,12 @@ namespace pcn {
             cmpAscending.valueType = makeIRBoolType();
             emit(std::move(cmpAscending));
 
+            auto before = locals_.find(node.binding);
+            const bool hadBefore = before != locals_.end();
+            const VReg priorValue = hadBefore ? before->second : VReg::None;
+            auto beforeType = localValueTypes_.find(node.binding);
+            const bool hadBeforeType = beforeType != localValueTypes_.end();
+            const IRValueType priorType = hadBeforeType ? beforeType->second : makeIRUnknownType();
             locals_[node.binding] = induction;
             localValueTypes_[node.binding] = makeIRIntType();
 
@@ -6937,6 +7168,7 @@ namespace pcn {
             loopContinueTargets_.push_back(postBlock);
             loopBreakTargets_.push_back(exitBlock);
             loopScopeDepths_.push_back(deferScopes_.size());
+            loopLabels_.push_back(node.loopLabel);
 
             currentBlock_ = bodyBlock;
             currentTerminated_ = false;
@@ -7008,6 +7240,9 @@ namespace pcn {
             loopContinueTargets_.pop_back();
             loopBreakTargets_.pop_back();
             loopScopeDepths_.pop_back();
+            loopLabels_.pop_back();
+            if (hadBefore) locals_[node.binding] = priorValue; else locals_.erase(node.binding);
+            if (hadBeforeType) localValueTypes_[node.binding] = priorType; else localValueTypes_.erase(node.binding);
 
             currentBlock_ = exitBlock;
             currentTerminated_ = false;
@@ -7022,6 +7257,7 @@ namespace pcn {
             loopContinueTargets_.push_back(condBlock);
             loopBreakTargets_.push_back(exitBlock);
             loopScopeDepths_.push_back(deferScopes_.size());
+            loopLabels_.push_back(node.loopLabel);
 
             currentBlock_ = bodyBlock;
             currentTerminated_ = false;
@@ -7042,21 +7278,30 @@ namespace pcn {
             loopContinueTargets_.pop_back();
             loopBreakTargets_.pop_back();
             loopScopeDepths_.pop_back();
+            loopLabels_.pop_back();
 
             currentBlock_ = exitBlock;
             currentTerminated_ = false;
         }
 
-        void lowerBreak(const BreakStmt&) {
-            if (loopBreakTargets_.empty()) throw std::runtime_error("internal error: break without loop target");
-            emitPendingDefers(loopScopeDepths_.back());
-            emitBranch(loopBreakTargets_.back());
+        std::size_t resolveLoopJumpTarget(const std::string& label) const {
+            if (loopLabels_.empty()) throw std::runtime_error("E0244 loop jump outside of a loop");
+            if (label.empty()) return loopLabels_.size() - 1;
+            for (std::size_t index = loopLabels_.size(); index != 0; --index)
+                if (loopLabels_[index - 1] == label) return index - 1;
+            throw std::runtime_error("E0245 unresolved loop target @" + label);
         }
 
-        void lowerContinue(const ContinueStmt&) {
-            if (loopContinueTargets_.empty()) throw std::runtime_error("internal error: continue without loop target");
-            emitPendingDefers(loopScopeDepths_.back());
-            emitBranch(loopContinueTargets_.back());
+        void lowerBreak(const BreakStmt& node) {
+            const auto index = resolveLoopJumpTarget(node.label);
+            emitPendingDefers(loopScopeDepths_.at(index));
+            emitBranch(loopBreakTargets_.at(index));
+        }
+
+        void lowerContinue(const ContinueStmt& node) {
+            const auto index = resolveLoopJumpTarget(node.label);
+            emitPendingDefers(loopScopeDepths_.at(index));
+            emitBranch(loopContinueTargets_.at(index));
         }
 
         void lowerUnsafe(const UnsafeStmt& node) {
@@ -7195,6 +7440,10 @@ namespace pcn {
                     lastValueType_ = makeIRIntType();
                     return emitConst(IROpcode::ConstInt, node.value);
                 }
+                else if constexpr (std::is_same_v<T, CharExpr>) {
+                    lastValueType_ = makeIRIntType();
+                    return emitConst(IROpcode::ConstInt, std::to_string(node.codepoint));
+                }
                 else if constexpr (std::is_same_v<T, StringExpr>) {
                     lastValueType_ = makeIRTextType();
                     return emitConst(IROpcode::ConstText, node.value);
@@ -7209,7 +7458,7 @@ namespace pcn {
                 }
                 else if constexpr (std::is_same_v<T, VariableExpr>) {
                     lastValueType_ = lowerExprType(expr);
-                    return lowerVariable(node.name);
+                    return lowerVariable(node.name, node.location);
                 }
                 else if constexpr (std::is_same_v<T, UnaryExpr>) {
                     lastValueType_ = lowerExprType(expr);
@@ -7396,6 +7645,9 @@ namespace pcn {
                 else if constexpr (std::is_same_v<T, NumberExpr>) {
                     return node.value.find('.') != std::string::npos ? makeIRFloatType("double") : makeIRIntType();
                 }
+                else if constexpr (std::is_same_v<T, CharExpr>) {
+                    return makeIRIntType();
+                }
                 else if constexpr (std::is_same_v<T, StringExpr>) {
                     return makeIRTextType();
                 }
@@ -7424,6 +7676,7 @@ namespace pcn {
                     return binaryValueType(node.op);
                 }
                 else if constexpr (std::is_same_v<T, CallExpr>) {
+                    if (isStdIOCall(node.callee)) return makeIRVoidType();
                     if (const auto* m = node.callee ? std::get_if<MemberExpr>(&node.callee->node) : nullptr) {
                         auto objectType = lowerExprType(m->object);
                         if (objectType.kind == IRValueKind::Text && m->member == "to_string")return makeIRStringType();
@@ -7488,14 +7741,23 @@ namespace pcn {
             IRInstruction inst; inst.op = op; inst.dest = allocateVReg(); if (payload != VReg::None) inst.args.push_back(payload); inst.valueType = type; emit(inst); lastValueType_ = type; return inst.dest;
         }
 
-        VReg lowerVariable(const std::string& name) {
-            auto it = locals_.find(name);
-            if (it != locals_.end()) return it->second;
-            if (auto g = globalConstants_.find(name); g != globalConstants_.end())
+        // IR invariant: every VReg read must have a producer or be a routine parameter.
+        // Never synthesize an uninitialized VReg for a missing name. Previously this
+        // fallback produced "operand vN has no definition in PCIR" during verification.
+        VReg lowerVariable(const std::string& name, SourceLocation location = {}) {
+            if (const auto it = locals_.find(name); it != locals_.end()) {
+                if (it->second == VReg::None)
+                    throw std::runtime_error("E0601 PCIR lowering: local '" + name +
+                        "' has no value at " + std::to_string(location.line) + ":" +
+                        std::to_string(location.column));
+                return it->second;
+            }
+            if (const auto g = globalConstants_.find(name); g != globalConstants_.end())
                 return lowerExprWithExpected(g->second.second, irValueTypeFromName(g->second.first));
-            VReg value = allocateVReg();
-            locals_[name] = value;
-            return value;
+            throw std::runtime_error("E0601 PCIR lowering: unresolved variable '" + name +
+                "' at " + std::to_string(location.line) + ":" +
+                std::to_string(location.column) +
+                ". No register was allocated. Check symbol binding in semantic analysis / specialization.");
         }
 
         VReg lowerUnary(const UnaryExpr& node) {
@@ -7607,6 +7869,37 @@ namespace pcn {
         }
 
         VReg lowerCall(const CallExpr& node) {
+            bool newLine = false;
+            if (isStdIOCall(node.callee, &newLine)) {
+                if (node.arguments.size() != 1)throw std::runtime_error("E0350 std.io.print/println requires one text argument");
+                const auto payload = lowerExprWithExpected(node.arguments.front(), makeIRTextType());
+                IRInstruction write; write.op = IROpcode::TextStreamWrite;
+                write.dest = allocateVReg(); write.args = { payload };
+                write.valueType = makeIRBoolType(); write.literalText = "stdout";
+                emit(std::move(write));
+                VReg result = VReg::None;
+                if (newLine) {
+                    auto newlineValue = emitConst(IROpcode::ConstText, "\n");
+                    IRInstruction line; line.op = IROpcode::TextStreamWrite;
+                    line.dest = allocateVReg(); line.args = { newlineValue };
+                    line.valueType = makeIRBoolType(); line.literalText = "stdout";
+                    result = line.dest;
+                    emit(std::move(line));
+                }
+                lastValueType_ = makeIRVoidType();
+                return result;
+            }
+            // A qualified std.io call is always resolved as a module routine,
+            // never as a method whose receiver is a runtime variable named std.
+            // Unknown std.io names receive a precise diagnostic rather than
+            // falling through and misdiagnosing `std` as an unresolved variable.
+            if (const auto path = qualifiedCalleeName(node.callee);
+                path && path->rfind("std.io.", 0) == 0) {
+                throw std::runtime_error("E0352 PCIR lowering: unknown std.io routine '" +
+                    *path + "' at " + std::to_string(node.location.line) + ":" +
+                    std::to_string(node.location.column) +
+                    ". Supported bootstrap routines are std.io.print and std.io.println.");
+            }
             IRInstruction inst;
             if (const auto* member = node.callee ? std::get_if<MemberExpr>(&node.callee->node) : nullptr) {
                 auto objectType = lowerExprType(member->object);
@@ -7835,7 +8128,7 @@ namespace pcn {
                 }
                 auto lt = localValueTypes_.find(variable->name);
                 if (lt != localValueTypes_.end() && lt->second.kind == IRValueKind::Closure) {
-                    auto dest = allocateVReg(); inst.dest = dest; inst.op = IROpcode::CallClosure; inst.args.push_back(lowerVariable(variable->name)); inst.typeName = lt->second.name;
+                    auto dest = allocateVReg(); inst.dest = dest; inst.op = IROpcode::CallClosure; inst.args.push_back(lowerVariable(variable->name, variable->location)); inst.typeName = lt->second.name;
                     for (const auto& argument : node.arguments) { auto v = lowerExpr(argument); inst.args.push_back(v); inst.argumentTypes.push_back(argumentTypeName(argument)); inst.argumentValueTypes.push_back(lastValueType_); }
                     auto rt = routineReturnTypes_.find(lt->second.name + "$call"); inst.returnType = rt == routineReturnTypes_.end() ? "unknown" : rt->second; inst.valueType = irValueTypeFromName(inst.returnType); emit(inst); lastValueType_ = inst.valueType; return dest;
                 }
@@ -8020,6 +8313,7 @@ namespace pcn {
         std::vector<BlockID> loopBreakTargets_;
         std::vector<BlockID> loopContinueTargets_;
         std::vector<std::size_t> loopScopeDepths_;
+        std::vector<std::string> loopLabels_;
         std::vector<std::vector<ExprPtr>> deferScopes_;
         std::vector<std::vector<VReg>> ownedScopes_;
         std::vector<VReg> rootOwnedParams_;
@@ -8086,8 +8380,29 @@ namespace pcn {
                     for (auto v : inst.args) used.push_back(static_cast<std::uint32_t>(v));
                 }
             }
-            for (auto v : used) if (!defined.contains(v))
-                errors.push_back(fn.name + ": operand v" + std::to_string(v) + " has no definition in PCIR");
+            // Preserve the strict def/use check and report the exact consumer.
+            // Register IDs alone are not useful when diagnosing a lowering defect.
+            for (const auto& block : fn.blocks) {
+                for (std::size_t i = 0; i < block.instructions.size(); ++i) {
+                    const auto& inst = block.instructions[i];
+                    for (auto r : inst.args) {
+                        const auto id = static_cast<std::uint32_t>(r);
+                        if (!defined.contains(id))
+                            errors.push_back(fn.name + ": operand v" + std::to_string(id) +
+                                " has no definition in PCIR (" + block.labelName +
+                                ", instruction " + std::to_string(i) +
+                                ", opcode #" + std::to_string(static_cast<int>(inst.op)) + ")");
+                    }
+                }
+                for (const auto& phi : block.phiNodes)
+                    for (const auto& [pred, value] : phi.phiInputs) {
+                        const auto id = static_cast<std::uint32_t>(value);
+                        if (!defined.contains(id))
+                            errors.push_back(fn.name + ": operand v" + std::to_string(id) +
+                                " has no definition in PCIR (PHI in " + block.labelName +
+                                " from bb_" + std::to_string(static_cast<std::uint32_t>(pred)) + ")");
+                    }
+            }
             for (const auto& block : fn.blocks) {
                 if (block.id == BlockID::None) errors.push_back(fn.name + ": block has invalid id 0");
                 bool terminated = false;
@@ -9914,7 +10229,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                                               patchLocal(b, done, b.size());
                                                               break;
                                                           }
-                                                          case PMIROpcode::MakeAggregate: { auto lay = abi.layout(i.valueType); initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); for (std::size_t n = 0; n < i.srcSlots.size(); ++n) { const std::string field = n < i.argumentTypes.size() ? i.argumentTypes[n] : std::to_string(n); auto f = findField(lay, field); auto fl = abi.layout(f.typeName); storeValueInto(b, fn, i.srcSlots[n], 11, f.offset, fl); }break; }
+                                                          case PMIROpcode::MakeAggregate: { auto lay = abi.layout(i.valueType); initRichDest(b, fn, i.destSlot); for (std::size_t n = 0; n < i.srcSlots.size(); ++n) { const std::string field = n < i.argumentTypes.size() ? i.argumentTypes[n] : std::to_string(n); auto f = findField(lay, field); auto fl = abi.layout(f.typeName); /* Rich field copies advance R11; reload the aggregate base for EVERY field. */ loadSlot(b, 11, fn, i.destSlot); storeValueInto(b, fn, i.srcSlots[n], 11, f.offset, fl); }break; }
                                                           case PMIROpcode::ExtractField: { if (i.srcSlots.empty())throw std::runtime_error("aggregate.field missing source"); auto owner = abi.layout(i.typeName.empty() ? fn.slots.at(i.srcSlots[0]).type.name : i.typeName); auto f = findField(owner, i.literalText); auto fl = abi.layout(f.typeName); loadSlot(b, 10, fn, i.srcSlots[0]); loadValueFrom(b, fn, i.destSlot, 10, f.offset, fl); break; }
                                                           case PMIROpcode::ArrayIndex: {
                                                               if (i.srcSlots.size() != 2)throw std::runtime_error("PMIR array index requires array and index");
@@ -9964,7 +10279,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                                           case PMIROpcode::ResultIsErr: { if (i.srcSlots.empty())throw std::runtime_error("result.is_err missing source"); auto lay = abi.layout(i.typeName.empty() ? fn.slots.at(i.srcSlots[0]).type.name : i.typeName); loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 0, 10, static_cast<std::int32_t>(lay.tagOffset), 1, false); storeSlot(b, 0, fn, i.destSlot); break; }
                                                           case PMIROpcode::ResultTry: { if (i.srcSlots.empty())throw std::runtime_error("result.try missing source"); auto srcLay = abi.layout(i.typeName.empty() ? fn.slots.at(i.srcSlots[0]).type.name : i.typeName); loadSlot(b, 10, fn, i.srcSlots[0]); loadMem(b, 0, 10, static_cast<std::int32_t>(srcLay.tagOffset), 1, false); b.insert(b.end(), { 0x48,0x85,0xC0 }); auto ok = emitLocalJcc(b, 0x84); if (!fn.richReturn)throw std::runtime_error("result.try error propagation requires rich result return ABI"); auto dstLay = abi.layout(fn.returnValueType); loadRbp(b, 11, negDisp(fn.sretCellOffset)); movImm(b, 0, 1); storeMem(b, 11, static_cast<std::int32_t>(dstLay.tagOffset), 0, 1); auto errLay = abi.layout(srcLay.errType); movReg(b, 0, 10); if (srcLay.payloadOffset) { movImm(b, 9, srcLay.payloadOffset); b.insert(b.end(), { 0x4C,0x01,0xC8 }); }movReg(b, 10, 0); movReg(b, 0, 11); if (dstLay.payloadOffset) { movImm(b, 9, dstLay.payloadOffset); b.insert(b.end(), { 0x4C,0x01,0xC8 }); }movReg(b, 11, 0); copyFixed(b, 10, 11, errLay.size); loadRbp(b, 0, negDisp(fn.sretCellOffset)); epilogue(b); auto okAt = b.size(); patchLocal(b, ok, okAt); loadSlot(b, 10, fn, i.srcSlots[0]); auto okLay = abi.layout(srcLay.okType); loadValueFrom(b, fn, i.destSlot, 10, srcLay.payloadOffset, okLay); break; }
                                                           case PMIROpcode::OptionSome:case PMIROpcode::OptionNone: { auto lay = abi.layout(i.valueType); if (lay.kind == ABIRepresentationKind::OptionBoolNiche) { movImm(b, 0, i.op == PMIROpcode::OptionNone ? 2 : 0); if (i.op == PMIROpcode::OptionSome && !i.srcSlots.empty())loadSlot(b, 0, fn, i.srcSlots[0]); storeSlot(b, 0, fn, i.destSlot); break; }if (lay.kind == ABIRepresentationKind::OptionCharNiche) { if (i.op == PMIROpcode::OptionNone)movImm(b, 0, 0x00110000u); else loadSlot(b, 0, fn, i.srcSlots.at(0)); storeSlot(b, 0, fn, i.destSlot); break; }initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); if (lay.kind == ABIRepresentationKind::OptionPointerNiche) { if (i.op == PMIROpcode::OptionNone)zeroFixed(b, 11, lay.size); else { auto vl = abi.layout(lay.valueType); storeValueInto(b, fn, i.srcSlots.at(0), 11, 0, vl); }break; }movImm(b, 0, i.op == PMIROpcode::OptionSome ? 1 : 0); storeMem(b, 11, 0, 0, 1); if (i.op == PMIROpcode::OptionSome) { auto vl = abi.layout(lay.valueType); storeValueInto(b, fn, i.srcSlots.at(0), 11, lay.payloadOffset, vl); }break; }
-                                                          case PMIROpcode::MakeClosure: { auto lay = abi.layout(i.valueType); initRichDest(b, fn, i.destSlot); loadSlot(b, 11, fn, i.destSlot); for (std::size_t n = 0; n < i.srcSlots.size() && n < lay.fields.size(); ++n) { auto fl = abi.layout(lay.fields[n].typeName); storeValueInto(b, fn, i.srcSlots[n], 11, lay.fields[n].offset, fl); }break; }
+                                                          case PMIROpcode::MakeClosure: { auto lay = abi.layout(i.valueType); initRichDest(b, fn, i.destSlot); for (std::size_t n = 0; n < i.srcSlots.size() && n < lay.fields.size(); ++n) { auto fl = abi.layout(lay.fields[n].typeName); /* Do not accumulate offsets across rich captures. */ loadSlot(b, 11, fn, i.destSlot); storeValueInto(b, fn, i.srcSlots[n], 11, lay.fields[n].offset, fl); }break; }
                                                           case PMIROpcode::Return: {
                                                               if (fn.richReturn) { if (i.srcSlots.empty())throw std::runtime_error("rich return missing source"); auto lay = abi.layout(fn.returnValueType); loadSlot(b, 10, fn, i.srcSlots[0]); loadRbp(b, 11, negDisp(fn.sretCellOffset)); copyFixed(b, 10, 11, lay.size); movReg(b, 0, 11); epilogue(b); }
                                                               else {
@@ -11378,6 +11693,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           if (!u->alias.empty())throw std::runtime_error("E0521 import aliases require namespace-aware module lowering");
                                           if (u->path.size() != 1 || u->path[0].empty())throw std::runtime_error("E0522 malformed source import");
                                           const auto& name = u->path[0];
+                                          if (name == "std::io") continue; // built-in console module, no .pcn file needed
                                           fs::path relative;
                                           std::vector<std::string> components;
                                           std::size_t start = 0;
@@ -11621,6 +11937,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                                   throw std::runtime_error("unsupported import");
                                               fs::path relative;
                                               const std::string& name = u->path[0];
+                                              if (name == "std::io") continue; // built-in no-file dependency
                                               for (std::size_t start = 0; start < name.size();) {
                                                   auto end = name.find("::", start);
                                                   auto component = name.substr(start, end == std::string::npos ? std::string::npos : end - start);
@@ -11798,6 +12115,30 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   if (!before.empty()) {
                                       std::ostringstream oss; oss << "internal compiler error: invalid PCIR before optimization";
                                       for (const auto& e : before) oss << "\n  " << e;
+                                      // Forensic trace is bounded so a large failing module cannot
+                                      // exhaust the diagnostic channel. It never changes the IR.
+                                      std::size_t shown = 0;
+                                      oss << "\n  PCIR trace (first 80 instructions):";
+                                      for (const auto& fn : out.pcir.functions) {
+                                          oss << "\n    function " << fn.name << ":";
+                                          for (const auto& block : fn.blocks) {
+                                              oss << "\n      " << block.labelName << ":";
+                                              for (const auto& inst : block.instructions) {
+                                                  if (shown++ >= 80) break;
+                                                  oss << "\n        " << (inst.dest == VReg::None ? std::string("-") :
+                                                      "v" + std::to_string(static_cast<std::uint32_t>(inst.dest)))
+                                                      << " = opcode#" << static_cast<int>(inst.op) << "(";
+                                                  for (std::size_t k = 0; k < inst.args.size(); ++k) {
+                                                      if (k) oss << ",";
+                                                      oss << "v" << static_cast<std::uint32_t>(inst.args[k]);
+                                                  }
+                                                  oss << ")";
+                                              }
+                                              if (shown >= 80) break;
+                                          }
+                                          if (shown >= 80) break;
+                                      }
+                                      if (shown >= 80) oss << "\n        ... trace truncated ...";
                                       throw std::runtime_error(oss.str());
                                   }
                                   markPhase("PCIR verify pre");
@@ -12183,7 +12524,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                               // --- Developer workflows: conservative formatting, deterministic packaging,
                               //     compiler-phase profiling, project creation and environment diagnostics. ---
                               // These tools don't change the language's supported semantic surface.
-                              static constexpr const char* kCompilerBuild = "Paracine 2026 development toolchain (non-1.0)";
+                              static constexpr const char* kCompilerBuild = "Paracine 2026 iterative-stdlib-upgrade-20261106.1 (development; non-1.0)";
 
                               static std::string canonicalFormat(const std::string& source) {
                                   // Whitespace-only normalization: line-ending normalization, trailing-space
@@ -12398,6 +12739,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       "  paracine link [file.pcn] [third-party.obj/.lib/.res ...] [-o file.exe] [--entry main] [--dll] [--libpath dir] [--linker lld-link]\n"
                                       "  paracine run <file.pcn> [-O0|-O1|-O2|-O3] [--entry name]\n"
                                       "  paracine check <file.pcn> [--json]\n"
+                                      "  paracine tokens <file.pcn>  # lexer / INDENT / DEDENT debugging\n"
                                       "  paracine sage <file.pcn> [-o file.skm]\n"
                                       "  paracine test <file.pcn>\n"
                                       "  paracine emit cpp|obj|exe <file.pcn> [-o file]\n"
@@ -12419,7 +12761,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       "  paracine build|pe|obj <file.pcn> --cache [--cache-dir PATH] [-O0..-O3]\n"
                                       "  paracine bench <file.pcn> [--iterations N] [-O0..-O3]\n"
                                       "  paracine init <empty-directory>\n"
-                                      "  paracine doctor | version\n"
+                                      "  paracine doctor | version | probe-stdio | capabilities\n"
                                       "  paracine selftest\n"
                                       "  paracine verify-bin <file.obj|file.exe> [...]\n"
                                       "  paracine clean <file.pcn>\n\n"
@@ -12609,6 +12951,175 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       const auto artifacts = compileAll(src, CompilerOptions{}, false);
                                       if (!hasDiagnostic(artifacts.analysis, fragment)) throw std::runtime_error(std::string("missing diagnostic for ") + context);
                                       };
+                                  test("IR lowerer rejects missing symbol without ghost register", [&] {
+                                      const auto src = "routine main() gives int\n    give missing_value\n";
+                                      const auto program = Parser(Lexer(src).tokenize()).parse();
+                                      try { (void)IRLowerer {}.lower(program); }
+                                      catch (const std::exception& e) {
+                                          const std::string what = e.what();
+                                          if (what.find("E0601") != std::string::npos &&
+                                              what.find("missing_value") != std::string::npos &&
+                                              what.find("2:10") != std::string::npos) return;
+                                          throw;
+                                      }
+                                      throw std::runtime_error("unresolved variable silently created a ghost PCIR VReg");
+                                      });
+                                  test("PCIR verifier retains strict undefined-register check", [&] {
+                                      IRFunction fn;
+                                      fn.name = "main";
+                                      fn.returnType = "int";
+                                      fn.totalVregs = 3;
+                                      IRBasicBlock block;
+                                      block.id = static_cast<BlockID>(1);
+                                      block.labelName = "bb_1_entry";
+                                      IRInstruction ret;
+                                      ret.op = IROpcode::Return;
+                                      ret.args.push_back(static_cast<VReg>(3));
+                                      ret.valueType = makeIRIntType();
+                                      block.instructions.push_back(ret);
+                                      fn.blocks.push_back(block);
+                                      IRProgram p;
+                                      p.functions.push_back(fn);
+                                      const auto errors = PCIRVerifier{}.verify(p);
+                                      if (std::none_of(errors.begin(), errors.end(), [](const std::string& e) {
+                                          return e.find("operand v3 has no definition") != std::string::npos;
+                                          })) throw std::runtime_error("verifier failed to reject undefined operand v3");
+                                      });
+                                  test("symbol resolution and stdout PCIR integration", [&] {
+                                      const auto src = "module hello\n\nimport std.io\n\n"
+                                          "routine add(a: int, b: int) gives int\n    give a + b\n\n"
+                                          "routine main() gives int with io\n    let x: int = 20\n"
+                                          "    let y: int = 22\n    std.io.println(\"Hello, World!\")\n"
+                                          "    give add(x, y)\n";
+                                      auto a = compileAll(src, CompilerOptions{}, false);
+                                      if (!a.analysis.succeeded()) throw std::runtime_error("unexpected semantic diagnostics");
+                                      if (!PCIRVerifier{}.verify(a.pcir).empty()) throw std::runtime_error("invalid PCIR");
+                                      });
+                                  test("qualified std.io.println PCIR never evaluates std namespace", [&] {
+                                      const std::string source = "module hello\n\nimport std.io\n\n"
+                                          "routine main() gives int with io\n"
+                                          "    std.io.println(\"Hello, World!\")\n"
+                                          "    give 0\n";
+                                      for (int opt : { 0, 3 }) {
+                                          CompilerOptions options; options.optimizationLevel = opt;
+                                          auto result = compileAll(source, options, false);
+                                          if (!result.analysis.succeeded())
+                                              throw std::runtime_error("std.io semantic resolution unexpectedly failed");
+                                          const auto errors = PCIRVerifier{}.verify(result.pcir);
+                                          if (!errors.empty()) throw std::runtime_error("std.io produced invalid PCIR");
+                                          if (result.pcir.functions.size() != 1)
+                                              throw std::runtime_error("expected one compiled main routine");
+                                          int writes = 0;
+                                          for (const auto& block : result.pcir.functions.front().blocks)
+                                              for (const auto& inst : block.instructions) {
+                                                  if (inst.op == IROpcode::TextStreamWrite) ++writes;
+                                                  if (inst.op == IROpcode::ExtractField)
+                                                      throw std::runtime_error("namespace incorrectly lowered as field access");
+                                              }
+                                          if (writes != 2)
+                                              throw std::runtime_error("println must lower text and newline writes");
+                                      }
+                                      });
+                                  test("std.io calls have atomic qualified-symbol AST", [&] {
+                                      const std::string source = "module hello\n\nimport std.io\n\n"
+                                          "routine main() gives int with io\n"
+                                          "    std.io.println(\"Hello, World!\")\n"
+                                          "    give 0\n";
+                                      auto parsed = Parser(Lexer(source).tokenize()).parse();
+                                      if (parsed.routines.size() != 1 || parsed.routines[0].body.empty())
+                                          throw std::runtime_error("missing parsed main body");
+                                      const auto* statement = std::get_if<ExprStmt>(&parsed.routines[0].body[0]->node);
+                                      const auto* call = statement && statement->expression
+                                          ? std::get_if<CallExpr>(&statement->expression->node) : nullptr;
+                                      const auto* callee = call && call->callee
+                                          ? std::get_if<VariableExpr>(&call->callee->node) : nullptr;
+                                      if (!callee || callee->name != "std.io.println")
+                                          throw std::runtime_error("std.io callee was not canonicalized to a module symbol");
+                                      if (callee->location.line != 6 || callee->location.column != 5)
+                                          throw std::runtime_error("qualified callee lost source origin");
+                                      });
+                                  test("ordinary member methods remain member expressions", [&] {
+                                      auto parsed = Parser(Lexer("routine main() gives int\n"
+                                          "    let text_value: text = \"abc\"\n"
+                                          "    text_value.stdout_write()\n"
+                                          "    give 0\n").tokenize()).parse();
+                                      if (parsed.routines.size() != 1 || parsed.routines[0].body.size() < 2)
+                                          throw std::runtime_error("ordinary member test parse failed");
+                                      const auto* statement = std::get_if<ExprStmt>(&parsed.routines[0].body[1]->node);
+                                      const auto* call = statement && statement->expression
+                                          ? std::get_if<CallExpr>(&statement->expression->node) : nullptr;
+                                      if (!call || !std::holds_alternative<MemberExpr>(call->callee->node))
+                                          throw std::runtime_error("ordinary object method was incorrectly canonicalized");
+                                      });
+                                  test("qualified std.io matcher accepts parenthesized callee", [&] {
+                                      const std::string source = "module hello\n\nimport std.io\n\n"
+                                          "routine main() gives int with io\n"
+                                          "    (std.io.println)(\"Hello, World!\")\n"
+                                          "    give 0\n";
+                                      auto result = compileAll(source, CompilerOptions{}, false);
+                                      if (!result.analysis.succeeded() || !PCIRVerifier{}.verify(result.pcir).empty())
+                                          throw std::runtime_error("parenthesized qualified call rejected");
+                                      });
+                                  test("module header with flat routine", [&] {
+                                      const auto p = Parser(Lexer("module hello\n\nroutine main() gives int\n    give 42\n").tokenize()).parse();
+                                      if (p.routines.size() != 1 || p.declarations.size() != 1)
+                                          throw std::runtime_error("flat module header failed");
+                                      });
+                                  test("module + std.io import + with io + println", [&] {
+                                      const auto src = "module hello\n\nimport std.io\n\nroutine main() gives int with io\n    std.io.println(\"Hello, World!\")\n    give 0\n";
+                                      const auto tokens = Lexer(src).tokenize();
+                                      if (std::count_if(tokens.begin(), tokens.end(), [](const Token& t) {return t.kind == TokenKind::Indent; }) != 1)
+                                          throw std::runtime_error("expected exactly one INDENT");
+                                      const auto p = Parser(tokens).parse();
+                                      if (p.routines.size() != 1)throw std::runtime_error("routine not parsed");
+                                      expectSemanticSuccess(src, "hello std.io semantics");
+                                      });
+                                  test("duplicate module header rejected", [&] {
+                                      try { (void)Parser(Lexer("module one\nmodule two\n").tokenize()).parse(); }
+                                      catch (const std::exception& e) {
+                                          if (std::string_view(e.what()).find("E0220") != std::string_view::npos)return;
+                                          throw;
+                                      }
+                                      throw std::runtime_error("duplicate module accepted");
+                                      });
+                                  test("blank and comment-only lines do not insert leading NEWLINE", [&] {
+                                      const auto ts = Lexer("\n# comment\n\nroutine main() gives int\n\n    # body comment\n    give 0\n").tokenize();
+                                      if (ts.empty() || ts.front().text != "routine")
+                                          throw std::runtime_error("unexpected leading layout token");
+                                      if (std::count_if(ts.begin(), ts.end(), [](const Token& t) {return t.kind == TokenKind::Indent; }) != 1)
+                                          throw std::runtime_error("comment affected indentation");
+                                      (void)Parser(ts).parse();
+                                      });
+                                  test("routine header with effect list and trailing comments", [&] {
+                                      const auto src = "routine main() gives int with io, alloc # effects\n    give 0\n";
+                                      const auto p = Parser(Lexer(src).tokenize()).parse();
+                                      if (p.routines.size() != 1 || p.routines[0].effects.size() != 2)
+                                          throw std::runtime_error("effects clause consumed body tokens");
+                                      });
+                                  test("missing indented body names exact token", [&] {
+                                      try { (void)Parser(Lexer("routine main() gives int\ngive 0\n").tokenize()).parse(); }
+                                      catch (const std::exception& e) {
+                                          if (std::string_view(e.what()).find("E0201") != std::string_view::npos &&
+                                              std::string_view(e.what()).find("at 2:1") != std::string_view::npos)return;
+                                          throw;
+                                      }
+                                      throw std::runtime_error("missing body indentation accepted");
+                                      });
+                                  test("nested layout emits exactly two levels", [&] {
+                                      const auto ts = Lexer("routine main() gives int\n    if true\n        give 1\n    give 0\n").tokenize();
+                                      const auto indents = std::count_if(ts.begin(), ts.end(), [](const Token& t) {return t.kind == TokenKind::Indent; });
+                                      const auto dedents = std::count_if(ts.begin(), ts.end(), [](const Token& t) {return t.kind == TokenKind::Dedent; });
+                                      if (indents != 2 || dedents != 2)throw std::runtime_error("nested INDENT/DEDENT imbalance");
+                                      (void)Parser(ts).parse();
+                                      });
+                                  test("character literals and Unicode decoding", [&] {
+                                      const auto ts = Lexer("routine main() gives int\n    let zero: char = '0'\n    let check: char = '\\n'\n    give 0\n").tokenize();
+                                      if (std::count_if(ts.begin(), ts.end(), [](const Token& t) {return t.kind == TokenKind::Character; }) != 2)
+                                          throw std::runtime_error("character tokens missing");
+                                      (void)Parser(ts).parse();
+                                      expectSemanticSuccess("routine main() gives int\n    let digit: char = '0'\n    if digit == '0'\n        give 1\n    give 0\n", "char comparison");
+                                      });
+                                  test("character rejects multiple values", [&] { reject("routine main() gives int\n    let bad = 'ab'\n    give 0\n"); });
                                   test("UTF-8 source acceptance", [&] { (void)Lexer("# caf\xc3\xa9\n").tokenize(); });
                                   test("invalid UTF-8 rejection", [&] { reject(std::string("# ") + char(0xc0) + "\n"); });
                                   test("mismatched delimiters rejection", [&] { reject("routine main() gives int\n    give ([)]\n"); });
@@ -12860,6 +13371,137 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       catch (...) { rejected = true; }
                                       if (!rejected)throw std::runtime_error("corrupted header accepted");
                                       });
+                                  test("labeled from-to outer continue uses saved endpoint", [&] {
+                                      const auto artifacts = compileAll(
+                                          "routine main() gives int\n"
+                                          "    var total: int = 0\n"
+                                          "    @outer: from i: int = 1 to 3\n"
+                                          "        @inner: from j: int = 1 to 4\n"
+                                          "            if j == 2\n"
+                                          "                continue @outer\n"
+                                          "            total += 1\n"
+                                          "    give total\n", CompilerOptions{});
+                                      if (!artifacts.analysis.succeeded()) throw std::runtime_error("labeled continue rejected by semantic analysis");
+                                      if (PCIRInterpreter(artifacts.pcir).run("") != 3)
+                                          throw std::runtime_error("labeled continue PCIR result differs from expected 3");
+                                      });
+                                  test("labeled nested break exits selected loop", [&] {
+                                      const auto artifacts = compileAll(
+                                          "routine main() gives int\n"
+                                          "    var total: int = 0\n"
+                                          "    @outer: from i: int = 1 to 3\n"
+                                          "        @inner: from j: int = 1 to 4\n"
+                                          "            if j == 2\n"
+                                          "                break @outer\n"
+                                          "            total += 1\n"
+                                          "    give total\n", CompilerOptions{});
+                                      if (!artifacts.analysis.succeeded()) throw std::runtime_error("labeled break rejected by semantic analysis");
+                                      if (PCIRInterpreter(artifacts.pcir).run("") != 1)
+                                          throw std::runtime_error("labeled break PCIR result differs from expected 1");
+                                      });
+                                  test("invalid labels rejected with semantic diagnostics", [&] {
+                                      expectSemanticDiagnostic("routine main() gives int\n    from i = 1 to 2\n        break @missing\n    give 0\n", "unknown enclosing loop", "invalid labeled break");
+                                      expectSemanticDiagnostic("routine main() gives int\n    @same: from i = 1 to 2\n        @same: from j = 1 to 3\n            break\n    give 0\n", "duplicate active loop label", "duplicate active label");
+                                      });
+                                  test("non-loop labels rejected by parser", [&] {
+                                      bool rejected = false;
+                                      try { (void)Parser(Lexer("routine main() gives int\n    @bad: if true\n        give 1\n    give 0\n").tokenize()).parse(); }
+                                      catch (const std::exception& ex) { rejected = std::string(ex.what()).find("E0240") != std::string::npos; }
+                                      if (!rejected) throw std::runtime_error("expected E0240 for non-loop label");
+                                      });
+                                  test("guarded for survives closure discovery and textual output", [&] {
+                                      const std::string src = "routine main() gives int\n    var sum: int = 0\n    @scan: for n in 0..=5 while n < 3\n        sum += n\n    give sum\n";
+                                      const auto artifacts = compileAll(src, CompilerOptions{});
+                                      if (!artifacts.analysis.succeeded()) throw std::runtime_error("guarded for semantic rejection");
+                                      if (PCIRInterpreter(artifacts.pcir).run("") != 3)
+                                          throw std::runtime_error("guarded for PCIR wrong value");
+                                      });
+                                  test("fixed-array iteration and stopping guard", [&] {
+                                      for (int opt : {0, 3}) {
+                                          CompilerOptions options; options.optimizationLevel = opt;
+                                          auto artifacts = compileAll(
+                                              "routine main() gives int\n"
+                                              "    let nums: array<int,4> = [2, 4, 9, 1]\n"
+                                              "    var total: int = 0\n"
+                                              "    for number in nums while number < 8\n"
+                                              "        total += number\n"
+                                              "    give total\n", options);
+                                          if (!artifacts.analysis.succeeded())throw std::runtime_error("array guard semantic failure");
+                                          if (PCIRInterpreter(artifacts.pcir).run("") != 6)
+                                              throw std::runtime_error("array guard PCIR execution mismatch");
+                                      }
+                                      });
+                                  test("fixed-array iteration over literal", [&] {
+                                      auto artifacts = compileAll("routine main() gives int\n    var total: int = 0\n    for n in [3, 4, 5]\n        total += n\n    give total\n", CompilerOptions{});
+                                      if (!artifacts.analysis.succeeded())throw std::runtime_error("array literal semantic failure");
+                                      if (PCIRInterpreter(artifacts.pcir).run("") != 12)
+                                          throw std::runtime_error("array literal iteration mismatch");
+                                      });
+                                  test("for inclusive maximum endpoint does not advance past end", [&] {
+                                      auto artifacts = compileAll(
+                                          "routine main() gives int\n"
+                                          "    var count: int = 0\n"
+                                          "    for n in 9223372036854775806..=9223372036854775807\n"
+                                          "        count += 1\n"
+                                          "    give count\n", CompilerOptions{});
+                                      if (!artifacts.analysis.succeeded())throw std::runtime_error("inclusive maximum rejected");
+                                      if (PCIRInterpreter(artifacts.pcir).run("") != 2)
+                                          throw std::runtime_error("inclusive numeric range wrapped at MAX");
+                                      });
+                                  test("array loop variable cannot escape lexical scope", [&] {
+                                      expectSemanticDiagnostic("routine main() gives int\n    for n in [1, 2]\n        println(n)\n    give n\n", "unknown name: n", "loop binding out of scope");
+                                      });
+                                  test("array iteration lowered to executing x64 machine code", [&] {
+                                      auto a = compileAll("routine main() gives int\n    let x: array<int,4> = [2, 4, 9, 1]\n    var sum: int = 0\n    for n in x while n < 8\n        sum += n\n    give sum\n", CompilerOptions{});
+                                      if (!a.analysis.succeeded())throw std::runtime_error("array native semantic rejection");
+#if defined(__linux__) && defined(__x86_64__)
+                                      if (executeEmittedMachineTextIsolated(a.machine) != 6)throw std::runtime_error("array native machine mismatch");
+#endif
+                                      });
+                                  test("labeled continue lowered to executing x64 machine code", [&] {
+                                      auto a = compileAll("routine main() gives int\n    var n: int = 0\n    @outer: from i: int = 1 to 3\n        @inner: from j: int = 1 to 2\n            n += 1\n            if j == 1\n                continue @outer\n    give n\n", CompilerOptions{});
+                                      if (!a.analysis.succeeded())throw std::runtime_error("labeled native semantic rejection");
+#if defined(__linux__) && defined(__x86_64__)
+                                      if (executeEmittedMachineTextIsolated(a.machine) != 3)throw std::runtime_error("labeled native machine mismatch");
+#endif
+                                      });
+                                  test("unsupported view iterator diagnosed in semantic phase", [&] {
+                                      expectSemanticDiagnostic("routine accumulate(items: view<int>) gives int\n    var sum: int = 0\n    for n in items\n        sum += n\n    give sum\n", "E0611 iterator lowering", "unsupported view iterator");
+                                      });
+                                  test("mutable for-array iteration fails closed", [&] {
+                                      expectSemanticDiagnostic("routine main() gives int\n    var nums: array<int,2> = [1, 2]\n    for var n in nums\n        n += 1\n    give 0\n", "E0612 for var", "array mutable element borrowing");
+                                      });
+                                  test("labeled continue-until jump always visits post-test", [&] {
+                                      auto artifacts = compileAll(
+                                          "routine main() gives int\n"
+                                          "    var count: int = 0\n"
+                                          "    @outer: continue until count >= 3\n"
+                                          "        count += 1\n"
+                                          "        if count < 3\n"
+                                          "            continue @outer\n"
+                                          "    give count\n", CompilerOptions{});
+                                      if (!artifacts.analysis.succeeded()) throw std::runtime_error("labeled post-test semantic rejection");
+                                      if (PCIRInterpreter(artifacts.pcir).run("") != 3) throw std::runtime_error("labeled post-test interpreter mismatch");
+#if defined(__linux__) && defined(__x86_64__)
+                                      if (executeEmittedMachineTextIsolated(artifacts.machine) != 3) throw std::runtime_error("labeled post-test native mismatch");
+#endif
+                                      });
+                                  test("labeled while break exits target loop", [&] {
+                                      auto artifacts = compileAll(
+                                          "routine main() gives int\n"
+                                          "    var count: int = 0\n"
+                                          "    @outer: while count < 10\n"
+                                          "        from i: int = 1 to 3\n"
+                                          "            count += 1\n"
+                                          "            if count == 4\n"
+                                          "                break @outer\n"
+                                          "    give count\n", CompilerOptions{});
+                                      if (!artifacts.analysis.succeeded()) throw std::runtime_error("labeled while semantic rejection");
+                                      if (PCIRInterpreter(artifacts.pcir).run("") != 4) throw std::runtime_error("labeled while interpreter mismatch");
+#if defined(__linux__) && defined(__x86_64__)
+                                      if (executeEmittedMachineTextIsolated(artifacts.machine) != 4) throw std::runtime_error("labeled while native mismatch");
+#endif
+                                      });
                                   test("optimizer converges with copy propagation and branch folding", [&] {
                                       auto artifacts = compileAll(
                                           "routine main() gives int\n"
@@ -12917,6 +13559,27 @@ int main(int argc, char** argv) {
             if (args.size() != 1)throw std::runtime_error("selftest takes no arguments");
             return pcn::runCompilerSelfTests(std::cout);
         }
+        if (args[0] == "capabilities") {
+            if (args.size() != 1) throw std::runtime_error("capabilities takes no arguments");
+            // Implementation status, not the normative Paracine language definition.
+            std::cout << pcn::kCompilerBuild << "\n"
+                << "IMPLEMENTED / TESTED IN THIS DEVELOPMENT BUILD:\n"
+                << "  UTF-8 lexer, four-space layout, module header, core routines\n"
+                << "  direct std.io.println text output, arithmetic and typed source checks\n"
+                << "  inclusive from-to, post-test continue-until, labeled loop jumps\n"
+                << "  for over integer ranges and fixed array<T,N> with stopping guards\n"
+                << "  partial records/variants/closures/generics/results/ownership checks\n"
+                << "  verified PCIR -> PMIR -> x64 -> COFF/PE32+ for covered cases\n"
+                << "PARTIAL / NOT FULLY IMPLEMENTED:\n"
+                << "  arbitrary iterator<I,T>/view<T> loop lowering and mutable array element borrowing\n"
+                << "  complete library networking, TLS, threading, synchronization, async I/O\n"
+                << "  comprehensive ABI interoperability, native linker and C++20 exporter\n"
+                << "  full SAGE proofs, advanced ownership cases, PDB/CFG and all target-hardening metadata\n"
+                << "  Unicode NFC normalization and full standard-library breadth\n"
+                << "STATUS: development implementation, not Paracine 1.0 conforming\n";
+            return 0;
+        }
+
         if (args[0] == "verify-bin") {
             if (args.size() < 2)throw std::runtime_error("usage: paracine verify-bin <file.obj|file.exe> [...]");
             for (std::size_t i = 1; i < args.size(); ++i) {
@@ -12938,6 +13601,38 @@ int main(int argc, char** argv) {
         if (args[0] == "link")return pcn::runExternalCOFFLink(args);
         if (args[0] == "version" || args[0] == "--version") {
             std::cout << pcn::kCompilerBuild << "\n"; return 0;
+        }
+        if (args[0] == "probe-stdio") {
+            if (args.size() != 1)throw std::runtime_error("probe-stdio takes no arguments");
+            // Standalone, in-memory proof that this executable implements the
+            // fixed qualified-name lowering path. No project paths or caches.
+            const std::string probe = "module hello\n\nimport std.io\n\n"
+                "routine main() gives int with io\n"
+                "    std.io.println(\"Hello, World!\")\n"
+                "    give 0\n";
+            for (const int level : { 0, 3 }) {
+                pcn::CompilerOptions options;
+                options.optimizationLevel = level;
+                auto result = pcn::compileAll(probe, options, false);
+                if (!result.analysis.succeeded()) {
+                    throw std::runtime_error("probe-stdio: semantic analysis failed at -O" + std::to_string(level));
+                }
+                auto errors = pcn::PCIRVerifier{}.verify(result.pcir);
+                if (!errors.empty()) {
+                    throw std::runtime_error("probe-stdio: invalid PCIR at -O" + std::to_string(level) + ": " + errors.front());
+                }
+                std::size_t streamWrites = 0;
+                for (const auto& fn : result.pcir.functions)
+                    for (const auto& bb : fn.blocks)
+                        for (const auto& insn : bb.instructions)
+                            if (insn.op == pcn::IROpcode::TextStreamWrite) ++streamWrites;
+                if (streamWrites != 2)
+                    throw std::runtime_error("probe-stdio: expected two stream writes at -O" + std::to_string(level));
+                std::cout << "PASS -O" << level << ": std.io.println -> 2 PCIR text.stream_write operations\n";
+            }
+            std::cout << "Build: " << pcn::kCompilerBuild << "\n"
+                << "Qualified std.io namespace lowering: PASS\n";
+            return 0;
         }
         if (args[0] == "doctor") {
             if (args.size() != 1)throw std::runtime_error("doctor does not accept arguments");
@@ -13014,6 +13709,29 @@ int main(int argc, char** argv) {
         if (sourceArg.empty()) throw std::runtime_error("command requires a .pcn source file");
         std::filesystem::path sourcePath = sourceArg;
         std::string source = pcn::readSourceFile(sourcePath);
+        if (command == "tokens") {
+            const auto stream = pcn::Lexer(source).tokenize();
+            for (const auto& tok : stream) {
+                std::cout << tok.location.line << ':' << tok.location.column << ' ';
+                switch (tok.kind) {
+                case pcn::TokenKind::Identifier: std::cout << "IDENTIFIER"; break;
+                case pcn::TokenKind::Number: std::cout << "NUMBER"; break;
+                case pcn::TokenKind::String: std::cout << "STRING"; break;
+                case pcn::TokenKind::Character: std::cout << "CHARACTER"; break;
+                case pcn::TokenKind::Keyword: std::cout << "KEYWORD"; break;
+                case pcn::TokenKind::Symbol: std::cout << "SYMBOL"; break;
+                case pcn::TokenKind::Newline: std::cout << "NEWLINE"; break;
+                case pcn::TokenKind::Indent: std::cout << "INDENT"; break;
+                case pcn::TokenKind::Dedent: std::cout << "DEDENT"; break;
+                case pcn::TokenKind::EndOfFile: std::cout << "EOF"; break;
+                }
+                if (tok.kind == pcn::TokenKind::Identifier || tok.kind == pcn::TokenKind::Keyword ||
+                    tok.kind == pcn::TokenKind::Symbol || tok.kind == pcn::TokenKind::Number)
+                    std::cout << " [" << tok.text << ']';
+                std::cout << '\n';
+            }
+            return 0;
+        }
         if (command == "deps") {
             std::vector<std::pair<std::filesystem::path, std::string>> inputs;
             const auto digest = pcn::dependencyContentHash(sourcePath, source, &inputs);
