@@ -1,0 +1,7 @@
+module bitwise_math
+
+routine main() gives int
+    let base: int = 5 << 3
+    var mask: int = 2 ^ 0
+    mask = mask | base
+    give mask

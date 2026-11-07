@@ -1,0 +1,244 @@
+{
+  "tests": [
+    {
+      "name": "LegacyRegression",
+      "optimization": 0,
+      "expected": 0,
+      "observed": 0,
+      "passed": true
+    },
+    {
+      "name": "LegacyRegression",
+      "optimization": 3,
+      "expected": 0,
+      "observed": 0,
+      "passed": true
+    },
+    {
+      "name": "LexerRegression",
+      "optimization": 0,
+      "expected": 0,
+      "observed": 0,
+      "passed": true
+    },
+    {
+      "name": "LexerRegression",
+      "optimization": 3,
+      "expected": 0,
+      "observed": 0,
+      "passed": true
+    },
+    {
+      "name": "ParserExpansionRegression",
+      "optimization": 0,
+      "expected": 0,
+      "observed": 0,
+      "passed": true
+    },
+    {
+      "name": "ParserExpansionRegression",
+      "optimization": 3,
+      "expected": 0,
+      "observed": 0,
+      "passed": true
+    },
+    {
+      "name": "generated_01",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_01",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_02",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_02",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_03",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_03",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_04",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_04",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_05",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_05",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_06",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_06",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_07",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_07",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_08",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_08",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_09",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_09",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_10",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_10",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_11",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_11",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_12",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_12",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_13",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_13",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_14",
+      "optimization": 0,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    },
+    {
+      "name": "generated_14",
+      "optimization": 3,
+      "expected": 42,
+      "observed": 42,
+      "passed": true
+    }
+  ],
+  "passed": 34,
+  "total": 34
+}

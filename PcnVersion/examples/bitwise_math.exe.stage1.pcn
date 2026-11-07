@@ -1,0 +1,7 @@
+module bitwise_math
+import std.io
+routine main() gives int with io
+    let base: int =  5 << 3
+    var mask: int =  2 ^ 0
+    mask =  mask | base
+    give  mask
