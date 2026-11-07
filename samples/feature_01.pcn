@@ -1,0 +1,7 @@
+module feature1
+routine main() gives int
+    let greeting: text = "Hello"
+    let short: text = greeting.slice(0, 3)
+    if short.equals("Hel")
+        give 42
+    give 1

@@ -1,0 +1,4 @@
+module invalid_mix
+routine main() gives int
+    let weight: float = 1
+    give 42

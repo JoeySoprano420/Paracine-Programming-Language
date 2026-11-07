@@ -1,0 +1,7 @@
+module feature4
+routine main() gives int
+    let amount: double = 20.5
+    let total: double = amount * 2.0
+    if total > 40.0
+        give 42
+    give 1

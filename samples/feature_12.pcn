@@ -1,0 +1,7 @@
+module feature12
+import std.fs
+routine main() gives int with io, alloc, trap
+    let path: text = "test.txt"
+    if std.fs.write_text(path, "OK")
+        give 42
+    give 1

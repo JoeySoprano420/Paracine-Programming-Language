@@ -1,0 +1,5 @@
+module underscore_integer
+
+routine main() gives int
+    let value: int = 4_2
+    give value
