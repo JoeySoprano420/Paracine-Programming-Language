@@ -1,0 +1,20 @@
+module gui_counter
+
+import std.gui as gui
+import std.error as errors
+
+routine main() gives result<void, errors.system_error>
+    var window = try gui.create_window("Paracine Runtime Integration", 400, 180)
+    try gui.create_button(var window, 101, "Count", 24, 24, 120, 40)
+    try gui.create_label(var window, 102, "0", 24, 80, 120, 32)
+    try gui.show(var window)
+    loop
+        let event = try gui.next_event()
+        if gui.is_button_clicked(event, window, 101)
+            try gui.set_text(var window, 102, "1")
+        if gui.is_close_requested(event, window)
+            break
+        if gui.is_quit(event)
+            break
+    try gui.destroy(move window)
+    give

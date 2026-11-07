@@ -1,0 +1,23 @@
+module invalid_input
+
+import std.io as io
+import std.text as texts
+import std.error as errors
+
+routine main() gives result<void, errors.system_error>
+    var input = try io.stdin_reader()
+    choose io.read_line(var input, 16)
+        when ok(unexpected)
+            fail errors.make(errors.invalid_argument)
+        when err(problem)
+            if not errors.is_kind(problem, errors.invalid_encoding)
+                fail problem
+    try io.write_stdout("invalid_encoding\n")
+    try io.discard_line(var input)
+    choose try io.read_line(var input, 16)
+        when some(line)
+            try io.write_stdout(texts.as_text(line))
+            try io.write_stdout("\n")
+        when nothing
+            fail errors.make(errors.invalid_argument)
+    give

@@ -1,0 +1,21 @@
+module tcp_timeout
+
+import std.net as net
+import std.env as env
+import std.text as texts
+import std.time as time
+import std.io as io
+import std.error as errors
+
+routine main() gives result<void, errors.system_error>
+    let endpoint = try env.get_required("PCN_ENDPOINT")
+    let address = try net.parse_address(texts.as_text(endpoint))
+    var stream = try net.tcp_connect_until(address, time.after_ms(5000))
+    choose net.read_to_end(var stream, 1024, time.after_ms(300))
+        when ok(unexpected)
+            fail errors.make(errors.invalid_argument)
+        when err(problem)
+            if not errors.is_kind(problem, errors.timed_out)
+                fail problem
+    try io.write_stdout("timed_out\n")
+    give

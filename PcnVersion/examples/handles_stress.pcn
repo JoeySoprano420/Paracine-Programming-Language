@@ -1,0 +1,31 @@
+module handles_stress
+
+import std.fs as fs
+import std.mem as mem
+import std.io as io
+import std.error as errors
+
+routine write_one() gives result<void, errors.system_error>
+    var target = try fs.open("handles.bin", fs.create_or_truncate())
+    try fs.write_all(var target, mem.bytes("x\n"))
+    try fs.close(move target)
+    give
+
+routine main() gives result<void, errors.system_error>
+    var input = try io.stdin_reader()
+    try write_one()
+    try io.write_stdout("ready\n")
+    try io.flush_stdout()
+    let begin = try io.read_line(var input, 16)
+    from index: int = 1 to 256
+        try write_one()
+        try write_scoped()
+    try io.write_stdout("done\n")
+    try io.flush_stdout()
+    let finish = try io.read_line(var input, 16)
+    give
+
+routine write_scoped() gives result<void, errors.system_error>
+    var target = try fs.open("handles.bin", fs.create_or_truncate())
+    try fs.write_all(var target, mem.bytes("x\n"))
+    give

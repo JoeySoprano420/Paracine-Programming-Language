@@ -1,0 +1,10 @@
+module reject_consumed_file
+
+import std.fs as fs
+import std.error as errors
+
+routine main() gives result<void, errors.system_error>
+    var target = try fs.open("never.bin", fs.create_new())
+    try fs.close(move target)
+    let invalid_size = try fs.size_of(target)
+    give

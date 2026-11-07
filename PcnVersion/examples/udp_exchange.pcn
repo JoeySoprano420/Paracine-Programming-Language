@@ -1,0 +1,19 @@
+module udp_exchange
+
+import std.net as net
+import std.env as env
+import std.text as texts
+import std.time as time
+import std.mem as mem
+import std.io as io
+import std.error as errors
+
+routine main() gives result<void, errors.system_error>
+    let endpoint = try env.get_required("PCN_ENDPOINT")
+    let destination = try net.parse_address(texts.as_text(endpoint))
+    let local = try net.parse_address("127.0.0.1:0")
+    var socket = try net.udp_bind(local)
+    try net.send_datagram(var socket, mem.bytes(""), destination, time.after_ms(5000))
+    let reply = try net.recv_datagram_owned(var socket, 65535, time.after_ms(5000))
+    try io.write_stdout_bytes(mem.view_of(reply.data))
+    give

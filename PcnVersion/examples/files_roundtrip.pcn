@@ -1,0 +1,27 @@
+module files_roundtrip
+
+import std.fs as fs
+import std.mem as mem
+import std.io as io
+import std.error as errors
+
+routine main() gives result<void, errors.system_error>
+    choose fs.open("existing.bin", fs.create_new())
+        when ok(unexpected)
+            try fs.close(move unexpected)
+            fail errors.make(errors.invalid_argument)
+        when err(problem)
+            if not errors.is_kind(problem, errors.already_exists)
+                fail problem
+    try io.write_stdout("already_exists\n")
+    let data = try fs.read_bytes("payload.bin", 1048576)
+    var target = try fs.open("artifact.bin", fs.create_new())
+    try fs.write_all(var target, mem.view_of(data))
+    try fs.sync_data(var target)
+    try fs.close(move target)
+    try fs.rename("artifact.bin", "actual.bin", fs.no_replace)
+    var appended = try fs.open("actual.bin", fs.append_existing())
+    try fs.write_all(var appended, mem.bytes("\nTAIL\n"))
+    try fs.sync_data(var appended)
+    try fs.close(move appended)
+    give

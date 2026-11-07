@@ -1,0 +1,27 @@
+module process_timeout
+
+import std.process as process
+import std.env as env
+import std.text as texts
+import std.io as io
+import std.time as time
+import std.error as errors
+
+routine main() gives result<void, errors.system_error>
+    let executable = try env.get_required("PCN_HELPER_EXE")
+    let script = try env.get_required("PCN_HELPER_SCRIPT")
+    var cmd = try process.command(texts.as_text(executable))
+    try process.arg(var cmd, texts.as_text(script))
+    try process.arg(var cmd, "sleep-tree")
+    choose process.capture(move cmd, 1048576, time.after_ms(3000))
+        when ok(unexpected)
+            fail errors.make(errors.invalid_argument)
+        when err(failure)
+            if not errors.is_kind(failure.error, errors.timed_out)
+                fail failure.error
+            choose failure.cleanup_error
+                when some(problem)
+                    fail problem
+                when nothing
+                    try io.write_stdout("timed_out\n")
+    give

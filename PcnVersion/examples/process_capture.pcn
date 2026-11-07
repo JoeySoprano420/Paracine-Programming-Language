@@ -1,0 +1,33 @@
+module process_capture
+
+import std.process as process
+import std.env as env
+import std.text as texts
+import std.mem as mem
+import std.io as io
+import std.time as time
+import std.error as errors
+
+routine main() gives result<void, errors.system_error>
+    let executable = try env.get_required("PCN_HELPER_EXE")
+    let script = try env.get_required("PCN_HELPER_SCRIPT")
+    var cmd = try process.command(texts.as_text(executable))
+    try process.arg(var cmd, texts.as_text(script))
+    try process.arg(var cmd, "echo")
+    try process.arg(var cmd, "alpha beta")
+    try process.arg(var cmd, "quote\"inside")
+    try process.arg(var cmd, "trail\\")
+    try process.arg(var cmd, "")
+    try process.arg(var cmd, "東京")
+    try process.arg(var cmd, "&|<>")
+    try process.set_stdin_bytes(var cmd, mem.bytes("payload\n"))
+    choose process.capture(move cmd, 1048576, time.after_ms(10000))
+        when ok(output)
+            if process.code(output.status) != 7
+                fail errors.make(errors.invalid_argument)
+            try io.write_stdout_bytes(mem.view_of(output.stdout))
+            try io.write_stderr_bytes(mem.view_of(output.stderr))
+        when err(failure)
+            fail failure.error
+    try io.write_stdout("\nchild_exit=7\n")
+    give

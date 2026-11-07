@@ -1,0 +1,20 @@
+module interactive_input
+
+import std.io as io
+import std.text as texts
+import std.error as errors
+
+routine main() gives result<void, errors.system_error>
+    var input = try io.stdin_reader()
+    try io.write_stdout("name> ")
+    try io.flush_stdout()
+    loop
+        choose try io.read_line(var input, 4096)
+            when some(line)
+                try io.write_stdout("echo:")
+                try io.write_stdout(texts.as_text(line))
+                try io.write_stdout("\n")
+            when nothing
+                break
+    try io.write_stdout("eof\n")
+    give
