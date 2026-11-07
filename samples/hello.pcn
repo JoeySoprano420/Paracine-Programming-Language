@@ -1,7 +1,0 @@
-module hello
-
-import std.io
-
-routine main() gives int with io
-    std.io.println("Hello, World!")
-    give 0

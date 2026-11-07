@@ -1,6 +1,0 @@
-module feature7
-import std.io
-routine main() gives int
-    let message: text = "Hello"
-    std.io.println(message)
-    give 42

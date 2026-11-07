@@ -1,7 +1,0 @@
-module feature8
-routine main() gives int
-    var x: int = 41
-    x |= 2
-    x ^= 1
-    x <<= 1
-    give 42

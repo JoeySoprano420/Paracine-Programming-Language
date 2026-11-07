@@ -1,7 +1,0 @@
-module post_test_loop
-
-routine main() gives int
-    var count: int = 0
-    continue until count >= 7
-        count += 1
-    give count * 6

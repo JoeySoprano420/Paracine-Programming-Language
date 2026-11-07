@@ -1,6 +1,0 @@
-module feature3
-routine main() gives int
-    let c: char = 'A'
-    if c == 'A'
-        give 42
-    give 1

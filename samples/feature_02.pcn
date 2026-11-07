@@ -1,8 +1,0 @@
-module feature2
-routine main() gives int
-    let greeting: text = "Hello"
-    let owned: string = greeting.to_string()
-    let converted: text = owned.to_text()
-    if converted.starts_with("Hell")
-        give 42
-    give 1

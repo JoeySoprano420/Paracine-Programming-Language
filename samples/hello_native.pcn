@@ -1,7 +1,0 @@
-module hello_native
-
-import std.io
-
-routine main() gives int
-    std.io.println("Hello from the Paracine-written compiler!")
-    give 42

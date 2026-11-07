@@ -1,7 +1,0 @@
-module char_probe
-
-routine main() gives int
-    let c: char = '0'
-    if c < '9'
-        give 0
-    give 1

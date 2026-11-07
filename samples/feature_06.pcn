@@ -1,7 +1,0 @@
-module feature6
-import std.fs
-routine main() gives int
-    let exists: bool = std.fs.exists("some.txt")
-    if exists
-        give 42
-    give 42

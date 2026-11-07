@@ -1,7 +1,0 @@
-module feature9
-routine main() gives int
-    let message: text = "Hello"
-    let n: int = message.count().to_int()
-    if n == 5
-        give 42
-    give 1

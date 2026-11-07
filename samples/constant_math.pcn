@@ -1,7 +1,0 @@
-module constant_math
-
-routine main() gives int
-    var base: int = 6 * 7
-    base += 3
-    base -= 3
-    give base + 0

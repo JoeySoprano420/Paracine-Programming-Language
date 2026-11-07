@@ -1,7 +1,0 @@
-module feature10
-routine is_correct(n: int) gives bool
-    give n == 42
-routine main() gives int
-    if is_correct(42)
-        give 42
-    give 1

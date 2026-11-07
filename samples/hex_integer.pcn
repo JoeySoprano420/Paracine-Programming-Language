@@ -1,5 +1,0 @@
-module hex_integer
-
-routine main() gives int
-    let value: int = 0x2A
-    give value

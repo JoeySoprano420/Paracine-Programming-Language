@@ -1,8 +1,0 @@
-module feature5
-routine inc(x: long) gives long
-    give x + 1
-routine main() gives int
-    let n: long = 41
-    if inc(n) == 42
-        give 42
-    give 1
