@@ -1,0 +1,15 @@
+module cat_file
+
+import std.io
+import std.fs
+
+routine main(args: view<text>) gives int with io, alloc, trap
+    if args.count == 0
+        std.io.println("Usage: cat_file <filename>")
+        give 2
+    if not std.fs.exists(args[0])
+        std.io.println("The input file does not exist")
+        give 3
+    let contents: string = std.fs.read_text(args[0])
+    std.io.print(contents.to_text())
+    give 0

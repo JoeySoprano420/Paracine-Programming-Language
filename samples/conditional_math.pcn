@@ -1,0 +1,11 @@
+module conditional_math
+
+import std.io
+
+routine main() gives int
+    var subtotal: int = 6 * 7
+    subtotal += 5
+    if subtotal >= 47
+        give subtotal - 5
+    else
+        give 1
