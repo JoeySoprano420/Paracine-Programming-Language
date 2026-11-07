@@ -1,0 +1,677 @@
+module tiny_compiler
+
+import std.io
+import std.fs
+
+# Tiny subset compiler. This complete executable is written in Paracine.
+# Input grammar (one routine, constant int expressions):
+#   [module name]
+#   routine main() gives int
+#       [let name: int = expression]*
+#       give expression
+# Expression precedence: parentheses, unary +/- , * / %, + -.
+# Four name slots are deliberately fixed: no dynamic collections are needed.
+# New: var, reassignment and +=/-=/*=/ /=/%= (constant-folded), plus comments.
+# Output: optimized .pcn source with one constant give.
+# Input: UTF-8 filename from main(args: view<text>), through std.fs.read_text.
+
+record Parser
+    source: text
+    offset: int
+    error: int
+    error_offset: int
+    bindings: int
+    name0: text
+    name1: text
+    name2: text
+    name3: text
+    value0: int
+    value1: int
+    value2: int
+    value3: int
+    mutable0: bool
+    mutable1: bool
+    mutable2: bool
+    mutable3: bool
+    name4: text
+    value4: int
+    mutable4: bool
+    name5: text
+    value5: int
+    mutable5: bool
+    name6: text
+    value6: int
+    mutable6: bool
+    name7: text
+    value7: int
+    mutable7: bool
+
+record CompileResult
+    ok: bool
+    value: int
+    error: int
+    offset: int
+
+routine source_length(s: Parser) gives int with trap
+    give s.source.count().to_int()
+
+routine character(s: Parser) gives int with trap
+    if s.offset >= source_length(s)
+        give -1
+    give s.source.byte_at(s.offset)
+
+routine fail_at(var s: Parser, code: int) gives void
+    if s.error == 0
+        s.error = code
+        s.error_offset = s.offset
+
+routine next_char(var s: Parser) gives void
+    s.offset = s.offset + 1
+
+routine is_space(c: int) gives bool
+    give c == 32 or c == 9 or c == 13
+
+routine is_digit(c: int) gives bool
+    give c >= 48 and c <= 57
+
+routine is_alpha(c: int) gives bool
+    give (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+
+routine is_alpha_number(c: int) gives bool
+    give is_alpha(c) or is_digit(c)
+
+routine skip_horizontal(var s: Parser) gives void with trap
+    while is_space(character(s))
+        next_char(s)
+
+# Skip empty and comment-only physical lines without swallowing any code indentation.
+routine skip_empty_lines(var s: Parser) gives void with trap
+    var again: bool = true
+    while again
+        var pos: int = s.offset
+        var checking: bool = true
+        while checking and pos < source_length(s)
+            let c: int = s.source.byte_at(pos)
+            if c == 32 or c == 9 or c == 13
+                pos += 1
+            else
+                checking = false
+        if pos >= source_length(s)
+            s.offset = pos
+            again = false
+        else
+            let first: int = s.source.byte_at(pos)
+            if first == 10
+                s.offset = pos + 1
+            else
+                if first == 35
+                    s.offset = pos
+                    while character(s) != 10 and character(s) != -1
+                        next_char(s)
+                    if character(s) == 10
+                        next_char(s)
+                else
+                    again = false
+
+routine scan_word(var s: Parser) gives text with trap
+    skip_horizontal(s)
+    let start: int = s.offset
+    if not is_alpha(character(s))
+        fail_at(s, 1)
+        give ""
+    while is_alpha_number(character(s))
+        next_char(s)
+    give s.source.slice(start, s.offset - start)
+
+routine word_is(var s: Parser, wanted: text) gives bool with trap
+    let saved: int = s.offset
+    skip_horizontal(s)
+    if not is_alpha(character(s))
+        s.offset = saved
+        give false
+    let start: int = s.offset
+    while is_alpha_number(character(s))
+        next_char(s)
+    if s.source.slice(start, s.offset - start).equals(wanted)
+        give true
+    s.offset = saved
+    give false
+
+routine require_word(var s: Parser, wanted: text) gives void with trap
+    if not word_is(s, wanted)
+        fail_at(s, 2)
+
+routine take_char(var s: Parser, wanted: int) gives bool with trap
+    skip_horizontal(s)
+    if character(s) != wanted
+        give false
+    next_char(s)
+    give true
+
+routine require_char(var s: Parser, wanted: int) gives void with trap
+    if not take_char(s, wanted)
+        fail_at(s, 3)
+
+routine end_line(var s: Parser) gives void with trap
+    skip_horizontal(s)
+    if character(s) == 35
+        while character(s) != 10 and character(s) != -1
+            next_char(s)
+    if character(s) == 10
+        next_char(s)
+    else
+        if character(s) != -1
+            fail_at(s, 4)
+
+routine begin_indented(var s: Parser, depth: int) gives void with trap
+    skip_empty_lines(s)
+    var spaces: int = 0
+    while character(s) == 32
+        spaces += 1
+        next_char(s)
+    if spaces != depth
+        fail_at(s, 5)
+    if character(s) == 9
+        fail_at(s, 5)
+
+routine begin_statement(var s: Parser) gives void with trap
+    begin_indented(s, 4)
+
+routine read_integer(var s: Parser) gives int with trap
+    skip_horizontal(s)
+    if not is_digit(character(s))
+        fail_at(s, 6)
+        give 0
+    var value: int = 0
+    while is_digit(character(s))
+        let digit: int = character(s) - 48
+        # Limit literals to 32-bit signed range for this first bootstrap compiler.
+        if value > 214748364 or (value == 214748364 and digit > 7)
+            fail_at(s, 7)
+            give 0
+        value = value * 10 + digit
+        next_char(s)
+    give value
+
+routine checked_int(var s: Parser, value: int) gives int
+    if value < -2147483647 or value > 2147483647
+        fail_at(s, 13)
+        give 0
+    give value
+
+routine resolve_name(var s: Parser, name: text) gives int
+    if s.bindings > 0 and name.equals(s.name0)
+        give s.value0
+    if s.bindings > 1 and name.equals(s.name1)
+        give s.value1
+    if s.bindings > 2 and name.equals(s.name2)
+        give s.value2
+    if s.bindings > 3 and name.equals(s.name3)
+        give s.value3
+    if s.bindings > 4 and name.equals(s.name4)
+        give s.value4
+    if s.bindings > 5 and name.equals(s.name5)
+        give s.value5
+    if s.bindings > 6 and name.equals(s.name6)
+        give s.value6
+    if s.bindings > 7 and name.equals(s.name7)
+        give s.value7
+    fail_at(s, 8)
+    give 0
+
+routine primary(var s: Parser) gives int with trap
+    skip_horizontal(s)
+    if s.error != 0
+        give 0
+    if take_char(s, 40)
+        let result: int = expression(s)
+        require_char(s, 41)
+        give result
+    if is_digit(character(s))
+        give read_integer(s)
+    if is_alpha(character(s))
+        let name: text = scan_word(s)
+        give resolve_name(s, name)
+    fail_at(s, 9)
+    give 0
+
+routine unary(var s: Parser) gives int with trap
+    if take_char(s, 45)
+        give checked_int(s, -unary(s))
+    if take_char(s, 43)
+        give unary(s)
+    give primary(s)
+
+routine product(var s: Parser) gives int with trap
+    var value: int = unary(s)
+    var active: bool = true
+    while active and s.error == 0
+        if take_char(s, 42)
+            let right: int = unary(s)
+            value = checked_int(s, value * right)
+        else
+            if take_char(s, 47)
+                let right: int = unary(s)
+                if right == 0
+                    fail_at(s, 10)
+                else
+                    value = checked_int(s, value / right)
+            else
+                if take_char(s, 37)
+                    let right: int = unary(s)
+                    if right == 0
+                        fail_at(s, 10)
+                    else
+                        value = checked_int(s, value % right)
+                else
+                    active = false
+    give value
+
+routine expression(var s: Parser) gives int with trap
+    var value: int = product(s)
+    var active: bool = true
+    while active and s.error == 0
+        if take_char(s, 43)
+            value = checked_int(s, value + product(s))
+        else
+            if take_char(s, 45)
+                value = checked_int(s, value - product(s))
+            else
+                active = false
+    give value
+
+# The Stage-1 subset uses comparisons only as compile-time if conditions.
+# Runtime conditionals are still compiled directly by the full Stage-0 compiler.
+routine comparison(var s: Parser) gives bool with trap
+    if word_is(s, "true")
+        give true
+    if word_is(s, "false")
+        give false
+    if word_is(s, "not")
+        give not comparison(s)
+    let left: int = expression(s)
+    skip_horizontal(s)
+    let operator: int = character(s)
+    if operator != 60 and operator != 62 and operator != 61 and operator != 33
+        fail_at(s, 16)
+        give false
+    next_char(s)
+    let equal_sign: bool = take_char(s, 61)
+    if (operator == 61 or operator == 33) and not equal_sign
+        fail_at(s, 16)
+        give false
+    let right: int = expression(s)
+    if operator == 60
+        if equal_sign
+            give left <= right
+        give left < right
+    if operator == 62
+        if equal_sign
+            give left >= right
+        give left > right
+    if operator == 61
+        give left == right
+    give left != right
+
+routine remember(var s: Parser, name: text, value: int, mutable: bool) gives void
+    var duplicate: bool = false
+    if s.bindings > 0 and name.equals(s.name0)
+        duplicate = true
+    if s.bindings > 1 and name.equals(s.name1)
+        duplicate = true
+    if s.bindings > 2 and name.equals(s.name2)
+        duplicate = true
+    if s.bindings > 3 and name.equals(s.name3)
+        duplicate = true
+    if s.bindings > 4 and name.equals(s.name4)
+        duplicate = true
+    if s.bindings > 5 and name.equals(s.name5)
+        duplicate = true
+    if s.bindings > 6 and name.equals(s.name6)
+        duplicate = true
+    if s.bindings > 7 and name.equals(s.name7)
+        duplicate = true
+    if duplicate
+        fail_at(s, 14)
+    else
+        if s.bindings == 0
+            s.name0 = name
+            s.value0 = value
+            s.mutable0 = mutable
+        else
+            if s.bindings == 1
+                s.name1 = name
+                s.value1 = value
+                s.mutable1 = mutable
+            else
+                if s.bindings == 2
+                    s.name2 = name
+                    s.value2 = value
+                    s.mutable2 = mutable
+                else
+                    if s.bindings == 3
+                        s.name3 = name
+                        s.value3 = value
+                        s.mutable3 = mutable
+                    else
+                        if s.bindings == 4
+                            s.name4 = name
+                            s.value4 = value
+                            s.mutable4 = mutable
+                        else
+                            if s.bindings == 5
+                                s.name5 = name
+                                s.value5 = value
+                                s.mutable5 = mutable
+                            else
+                                if s.bindings == 6
+                                    s.name6 = name
+                                    s.value6 = value
+                                    s.mutable6 = mutable
+                                else
+                                    if s.bindings == 7
+                                        s.name7 = name
+                                        s.value7 = value
+                                        s.mutable7 = mutable
+                                    else
+                                        fail_at(s, 11)
+        if s.error == 0
+            s.bindings = s.bindings + 1
+
+# Assignment is forbidden for let constants. A var still has a compile-time
+# value in this restricted compiler, so assignments update its constant value.
+routine assign_name(var s: Parser, name: text, value: int) gives void
+    var matched: bool = false
+    if s.bindings > 0 and name.equals(s.name0)
+        matched = true
+        if s.mutable0
+            s.value0 = value
+        else
+            fail_at(s, 15)
+    if s.bindings > 1 and name.equals(s.name1)
+        matched = true
+        if s.mutable1
+            s.value1 = value
+        else
+            fail_at(s, 15)
+    if s.bindings > 2 and name.equals(s.name2)
+        matched = true
+        if s.mutable2
+            s.value2 = value
+        else
+            fail_at(s, 15)
+    if s.bindings > 3 and name.equals(s.name3)
+        matched = true
+        if s.mutable3
+            s.value3 = value
+        else
+            fail_at(s, 15)
+    if s.bindings > 4 and name.equals(s.name4)
+        matched = true
+        if s.mutable4
+            s.value4 = value
+        else
+            fail_at(s, 15)
+    if s.bindings > 5 and name.equals(s.name5)
+        matched = true
+        if s.mutable5
+            s.value5 = value
+        else
+            fail_at(s, 15)
+    if s.bindings > 6 and name.equals(s.name6)
+        matched = true
+        if s.mutable6
+            s.value6 = value
+        else
+            fail_at(s, 15)
+    if s.bindings > 7 and name.equals(s.name7)
+        matched = true
+        if s.mutable7
+            s.value7 = value
+        else
+            fail_at(s, 15)
+    if not matched
+        fail_at(s, 8)
+
+routine assignment(var s: Parser) gives void with trap
+    let name: text = scan_word(s)
+    skip_horizontal(s)
+    var operation: int = 61
+    let code: int = character(s)
+    if code == 43 or code == 45 or code == 42 or code == 47 or code == 37
+        operation = code
+        next_char(s)
+    require_char(s, 61)
+    let right: int = expression(s)
+    end_line(s)
+    var result: int = right
+    if operation != 61
+        let left: int = resolve_name(s, name)
+        if operation == 43
+            result = checked_int(s, left + right)
+        if operation == 45
+            result = checked_int(s, left - right)
+        if operation == 42
+            result = checked_int(s, left * right)
+        if operation == 47
+            if right == 0
+                fail_at(s, 10)
+            else
+                result = checked_int(s, left / right)
+        if operation == 37
+            if right == 0
+                fail_at(s, 10)
+            else
+                result = checked_int(s, left % right)
+    if s.error == 0
+        assign_name(s, name, result)
+
+routine compile_subset(source: text) gives CompileResult with trap
+    var s: Parser = Parser{source: source, offset: 0, error: 0, error_offset: 0, bindings: 0, name0: "", name1: "", name2: "", name3: "", value0: 0, value1: 0, value2: 0, value3: 0, mutable0: false, mutable1: false, mutable2: false, mutable3: false, name4: "", value4: 0, mutable4: false, name5: "", value5: 0, mutable5: false, name6: "", value6: 0, mutable6: false, name7: "", value7: 0, mutable7: false}
+    # Accept UTF-8 BOM and CRLF (Windows source files) without a wrapper.
+    if source.count().to_int() >= 3
+        if source.byte_at(0) == 239 and source.byte_at(1) == 187 and source.byte_at(2) == 191
+            s.offset = 3
+    skip_empty_lines(s)
+    if word_is(s, "module")
+        let name: text = scan_word(s)
+        if s.error == 0
+            while take_char(s, 46)
+                let part: text = scan_word(s)
+        end_line(s)
+        skip_empty_lines(s)
+    var scanning_imports: bool = true
+    while scanning_imports and s.error == 0
+        if word_is(s, "import")
+            let imported: text = scan_word(s)
+            while take_char(s, 46)
+                let part: text = scan_word(s)
+            end_line(s)
+            skip_empty_lines(s)
+        else
+            scanning_imports = false
+    require_word(s, "routine")
+    require_word(s, "main")
+    require_char(s, 40)
+    require_char(s, 41)
+    require_word(s, "gives")
+    require_word(s, "int")
+    end_line(s)
+    var done: bool = false
+    var value: int = 0
+    while not done and s.error == 0
+        begin_statement(s)
+        var declaration: bool = false
+        var mutable: bool = false
+        if word_is(s, "let")
+            declaration = true
+        else
+            if word_is(s, "var")
+                declaration = true
+                mutable = true
+        if declaration
+            let name: text = scan_word(s)
+            require_char(s, 58)
+            require_word(s, "int")
+            require_char(s, 61)
+            let initial: int = expression(s)
+            end_line(s)
+            if s.error == 0
+                remember(s, name, initial, mutable)
+        else
+            if word_is(s, "give")
+                value = expression(s)
+                end_line(s)
+                done = true
+            else
+                if word_is(s, "if")
+                    let condition: bool = comparison(s)
+                    end_line(s)
+                    begin_indented(s, 8)
+                    require_word(s, "give")
+                    let then_value: int = expression(s)
+                    end_line(s)
+                    begin_indented(s, 4)
+                    require_word(s, "else")
+                    end_line(s)
+                    begin_indented(s, 8)
+                    require_word(s, "give")
+                    let else_value: int = expression(s)
+                    end_line(s)
+                    if condition
+                        value = then_value
+                    else
+                        value = else_value
+                    done = true
+                else
+                    assignment(s)
+    skip_empty_lines(s)
+    if s.error == 0 and s.offset != source_length(s)
+        fail_at(s, 12)
+    give CompileResult{ok: s.error == 0, value: value, error: s.error, offset: s.error_offset}
+
+routine digit_text(n: int) gives text
+    if n == 0
+        give "0"
+    if n == 1
+        give "1"
+    if n == 2
+        give "2"
+    if n == 3
+        give "3"
+    if n == 4
+        give "4"
+    if n == 5
+        give "5"
+    if n == 6
+        give "6"
+    if n == 7
+        give "7"
+    if n == 8
+        give "8"
+    give "9"
+
+routine decimal(value: int) gives string with alloc, trap
+    var text_value = "".to_string()
+    if value < 0
+        text_value.append("-")
+    var magnitude: int = value
+    if magnitude < 0
+        magnitude = -magnitude
+    var divisor: int = 1000000000
+    var started: bool = false
+    while divisor > 0
+        let digit: int = magnitude / divisor
+        if digit != 0 or started or divisor == 1
+            text_value.append(digit_text(digit))
+            started = true
+        magnitude %= divisor
+        divisor /= 10
+    give text_value
+
+routine error_message(code: int) gives text
+    if code == 1
+        give "expected an identifier"
+    if code == 2
+        give "expected keyword or routine header"
+    if code == 3
+        give "expected punctuation"
+    if code == 4
+        give "expected end of statement line"
+    if code == 5
+        give "expected exactly four spaces before a statement"
+    if code == 6
+        give "expected an integer literal"
+    if code == 7
+        give "integer literal exceeds the 32-bit limit"
+    if code == 8
+        give "unknown constant name"
+    if code == 9
+        give "expected integer, identifier or parenthesized expression"
+    if code == 10
+        give "division or modulo by zero"
+    if code == 11
+        give "only eight constant bindings are supported"
+    if code == 12
+        give "unexpected source after give expression"
+    if code == 13
+        give "constant expression exceeds supported signed 32-bit range"
+    if code == 14
+        give "duplicate constant binding"
+    if code == 15
+        give "cannot assign to immutable let binding"
+    if code == 16
+        give "if condition requires one comparison: == != < <= > >="
+    give "invalid subset program"
+
+routine generated_source(result: CompileResult) gives string with alloc, trap
+    var generated = "module generated\nroutine main() gives int\n    give ".to_string()
+    let value_text: string = decimal(result.value)
+    generated.append(value_text.to_text())
+    generated.append("\n")
+    give generated
+
+routine emit_compiled(result: CompileResult) gives int with alloc, trap, io
+    if not result.ok
+        var message = "tiny compiler error E".to_string()
+        message.append(decimal(result.error).to_text())
+        message.append(" at byte ")
+        message.append(decimal(result.offset).to_text())
+        message.append(": ")
+        message.append(error_message(result.error))
+        message.append("\n")
+        if not message.to_text().stderr_write()
+            give 2
+        give 1
+    let rendered: string = generated_source(result)
+    if not rendered.to_text().stdout_write()
+        give 3
+    give 0
+
+routine main(args: view<text>) gives int with alloc, trap, io
+    # TinyParacine remains written entirely in Paracine.
+    # Stage-0 now supplies command-line UTF-8 arguments and file reading.
+    if args.count != 1 and args.count != 3
+        if not "Usage: tiny_compiler_cli <source.pcn> [-o generated.pcn]\n".stderr_write()
+            give 3
+        give 2
+    if args.count == 3 and not args[1].equals("-o")
+        if not "Expected -o <output.pcn>\n".stderr_write()
+            give 3
+        give 2
+    if not std.fs.exists(args[0])
+        if not "Input file does not exist\n".stderr_write()
+            give 3
+        give 2
+    let source: string = std.fs.read_text(args[0])
+    let result: CompileResult = compile_subset(source.to_text())
+    if args.count == 3
+        if not result.ok
+            give emit_compiled(result)
+        let generated: string = generated_source(result)
+        if not std.fs.write_text(args[2], generated.to_text())
+            if not "Failed to write generated source file\n".stderr_write()
+                give 3
+            give 4
+        give 0
+    give emit_compiled(result)
