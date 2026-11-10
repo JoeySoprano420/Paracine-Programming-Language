@@ -209,6 +209,8 @@ namespace pcn {
                             if (indent != current + kIndentWidth) {
                                 throw lexicalError("E0101", "indentation skips a structural level", { line_, startColumn });
                             }
+                            if (indentStack_.size() >= 128)
+                                throw lexicalError("E0103", "maximum structural nesting depth (128) exceeded", { line_, startColumn });
                             indentStack_.push_back(indent);
                             tokens.push_back({ TokenKind::Indent, "<indent>",{ line_, startColumn } });
                         }
@@ -268,6 +270,7 @@ namespace pcn {
                         case '\\': codepoint = '\\'; break;
                         case '\'': codepoint = '\''; break;
                         case '"': codepoint = '"'; break;
+                        case 'u': codepoint = readUnicodeEscape(loc); break;
                         default: throw lexicalError("E0116", "unknown character escape", loc);
                         }
                     }
@@ -303,7 +306,9 @@ namespace pcn {
                             case 't': value.push_back('\t'); break;
                             case '\\': value.push_back('\\'); break;
                             case '"': value.push_back('"'); break;
-                            default: value.push_back(escaped); break;
+                            case '0': value.push_back('\0'); break;
+                            case 'u': appendUnicodeScalar(value, readUnicodeEscape(loc)); break;
+                            default: throw lexicalError("E0116", "unknown string escape", loc);
                             }
                         }
                         else {
@@ -376,6 +381,8 @@ namespace pcn {
                     }
 
                     if (symbol == "(" || symbol == "[" || symbol == "{") {
+                        if (groupingStack_.size() >= 256)
+                            throw lexicalError("E0118", "maximum grouping depth (256) exceeded", symbolLoc);
                         groupingStack_.push_back(symbol[0]);
                         ++delimiterDepth_;
                     }
@@ -461,6 +468,47 @@ namespace pcn {
 
         std::runtime_error lexicalError(const std::string& code, const std::string& message, SourceLocation loc) const {
             return std::runtime_error(code + " at " + std::to_string(loc.line) + ":" + std::to_string(loc.column) + ": " + message);
+        }
+
+        static void appendUnicodeScalar(std::string& out, std::uint32_t cp) {
+            if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+                throw std::runtime_error("E0116 invalid Unicode scalar escape");
+            if (cp < 0x80) out.push_back(static_cast<char>(cp));
+            else if (cp < 0x800) {
+                out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+            else if (cp < 0x10000) {
+                out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+                out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+            else {
+                out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+                out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+        }
+
+        std::uint32_t readUnicodeEscape(SourceLocation loc) {
+            if (isAtEnd() || advance() != '{')
+                throw lexicalError("E0116", "expected '{' after Unicode escape", loc);
+            std::uint32_t scalar = 0;
+            int digits = 0;
+            while (!isAtEnd() && peek() != '}') {
+                const unsigned char c = static_cast<unsigned char>(advance());
+                const int digit = c >= '0' && c <= '9' ? c - '0' :
+                    c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                    c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+                if (digit < 0 || ++digits > 6)
+                    throw lexicalError("E0116", "Unicode escape requires 1-6 hexadecimal digits", loc);
+                scalar = (scalar << 4) | static_cast<std::uint32_t>(digit);
+            }
+            if (digits == 0 || isAtEnd() || advance() != '}' ||
+                scalar > 0x10FFFF || (scalar >= 0xD800 && scalar <= 0xDFFF))
+                throw lexicalError("E0116", "invalid Unicode scalar escape", loc);
+            return scalar;
         }
 
         bool isAtEnd() const { return index_ >= source_.size(); }
@@ -767,8 +815,8 @@ namespace pcn {
     }
 
     static bool isStdFSExists(const ExprPtr& callee) {
-        const auto q=qualifiedCalleeName(callee);
-        return q && *q=="std.fs.exists";
+        const auto q = qualifiedCalleeName(callee);
+        return q && *q == "std.fs.exists";
     }
     static bool isStdFSWriteText(const ExprPtr& callee) {
         const auto q = qualifiedCalleeName(callee);
@@ -1056,6 +1104,16 @@ namespace pcn {
         SourceLocation location;
     };
 
+    // Transparent, compile-time-only type alias. The parser canonicalizes usages
+    // before semantic analysis; the native backend never needs alias runtime data.
+    struct AliasDecl {
+        std::string name;
+        std::string targetType;
+        bool isPublic = false;
+        SourceSpan span;
+        SourceLocation location;
+    };
+
     struct UseDecl {
         std::vector<std::string> path;
         std::string alias;
@@ -1098,7 +1156,7 @@ namespace pcn {
     };
 
     struct Declaration {
-        using Node = std::variant<Routine, RecordDecl, EnumDecl, UnionDecl, VariantDecl, ModuleDecl, UseDecl, ConstDecl, CapabilityDecl, ForeignDecl>;
+        using Node = std::variant<Routine, RecordDecl, EnumDecl, UnionDecl, VariantDecl, ModuleDecl, UseDecl, AliasDecl, ConstDecl, CapabilityDecl, ForeignDecl>;
         Node node;
         SourceSpan span;
         SourceLocation location;
@@ -1749,32 +1807,51 @@ namespace pcn {
             : tokens_(std::move(tokens)) {}
 
         Program parse() {
-            Program program;
-            bool sawModule = false;
-            bool sawNonModule = false;
-            skipNewlines();
-            while (!isAtEnd()) {
-                if (checkKeyword("public") || checkKeyword("compile") || checkKeyword("record") || checkKeyword("enum") || checkKeyword("variant") || checkKeyword("union") || checkKeyword("module") || checkKeyword("use") || checkKeyword("import") || checkKeyword("const") || checkKeyword("capability") || checkKeyword("foreign")) {
-                    auto declaration = parseDeclaration();
-                    if (std::holds_alternative<ModuleDecl>(declaration.node)) {
-                        if (sawModule) throw std::runtime_error("E0220 duplicate module declaration");
-                        if (sawNonModule) throw std::runtime_error("E0221 module declaration must precede other declarations");
-                        sawModule = true;
+            try {
+                Program program;
+                bool sawModule = false;
+                bool sawNonModule = false;
+                skipNewlines();
+                while (!isAtEnd()) {
+                    if (checkKeyword("public") || checkKeyword("compile") || checkKeyword("record") || checkKeyword("enum") || checkKeyword("variant") || checkKeyword("union") || checkKeyword("module") || checkKeyword("use") || checkKeyword("import") || checkKeyword("alias") || checkKeyword("const") || checkKeyword("capability") || checkKeyword("foreign")) {
+                        auto declaration = parseDeclaration();
+                        if (std::holds_alternative<ModuleDecl>(declaration.node)) {
+                            if (sawModule) throw std::runtime_error("E0220 duplicate module declaration");
+                            if (sawNonModule) throw std::runtime_error("E0221 module declaration must precede other declarations");
+                            sawModule = true;
+                        }
+                        else sawNonModule = true;
+                        program.declarations.push_back(std::move(declaration));
+                        skipNewlines();
+                        continue;
                     }
-                    else sawNonModule = true;
-                    program.declarations.push_back(std::move(declaration));
-                    skipNewlines();
-                    continue;
+                    if (checkKeyword("routine")) {
+                        sawNonModule = true;
+                        program.routines.push_back(parseRoutine());
+                        skipNewlines();
+                        continue;
+                    }
+                    throw std::runtime_error("E0200 unexpected top-level " + tokenDescription(peek()));
                 }
-                if (checkKeyword("routine")) {
-                    sawNonModule = true;
-                    program.routines.push_back(parseRoutine());
-                    skipNewlines();
-                    continue;
-                }
-                throw std::runtime_error("E0200 unexpected top-level " + tokenDescription(peek()));
+                return program;
             }
-            return program;
+            catch (const std::runtime_error& error) {
+                const std::string message = error.what();
+                if (message.find(" at ") != std::string::npos) throw;
+                std::ostringstream out;
+                // Keep an existing diagnostic identifier, when available.
+                if (message.size() >= 5 && message[0] == 'E' &&
+                    std::all_of(message.begin() + 1, message.begin() + 5,
+                        [](unsigned char c) { return std::isdigit(c) != 0; })) {
+                    out << message.substr(0, 5) << " at " << peek().location.line
+                        << ":" << peek().location.column << ": " << message.substr(5);
+                }
+                else {
+                    out << "E0200 at " << peek().location.line << ":" << peek().location.column
+                        << ": " << message;
+                }
+                throw std::runtime_error(out.str());
+            }
         }
 
         Declaration parseDeclaration() {
@@ -1804,6 +1881,9 @@ namespace pcn {
             if (matchKeyword("use") || matchKeyword("import")) {
                 return parseUseDeclaration();
             }
+            if (matchKeyword("alias")) {
+                return parseAliasDeclaration(isPublic);
+            }
             if (matchKeyword("const")) {
                 return parseConstDeclaration(isPublic, isCompile);
             }
@@ -1814,6 +1894,8 @@ namespace pcn {
         }
 
     private:
+        std::unordered_map<std::string, std::string> typeAliases_;
+        std::size_t unaryNesting_ = 0;
         const Token& peek() const { return tokens_[index_]; }
         const Token& peek(std::size_t offset) const {
             std::size_t pos = index_ + offset;
@@ -2080,6 +2162,28 @@ namespace pcn {
             return Declaration{ decl, decl.span, decl.location };
         }
 
+        Declaration parseAliasDeclaration(bool isPublic) {
+            AliasDecl decl;
+            decl.location = previous().location;
+            decl.span = { decl.location, decl.location };
+            decl.isPublic = isPublic;
+            decl.name = expectIdentifier().text;
+            if (typeAliases_.contains(decl.name))
+                throw std::runtime_error("E0231 duplicate type alias '" + decl.name + "'");
+            // Prevent a type alias from redefining the predeclared primitive model.
+            if (isBuiltinTypeName(decl.name) || decl.name == "never")
+                throw std::runtime_error("E0232 alias cannot redefine builtin type '" + decl.name + "'");
+            expectSymbol("=");
+            // Alias targets are canonical type expressions (not arbitrary values).
+            // This also expands already declared aliases inside generic arguments.
+            decl.targetType = parseTypeName();
+            if (decl.targetType == decl.name)
+                throw std::runtime_error("E0233 recursive type alias '" + decl.name + "'");
+            consumeLineBreak();
+            typeAliases_.emplace(decl.name, decl.targetType);
+            return Declaration{ decl, decl.span, decl.location };
+        }
+
         Declaration parseConstDeclaration(bool isPublic, bool isCompile) {
             ConstDecl decl;
             decl.location = previous().location;
@@ -2203,6 +2307,7 @@ namespace pcn {
                     parameter.typeName = parseTypeName();
                     params.push_back(parameter);
                     if (matchSymbol(",")) {
+                        if (checkSymbol(")")) break;
                         continue;
                     }
                     break;
@@ -2218,7 +2323,11 @@ namespace pcn {
                 std::string tuple = "(";
                 bool first = true;
                 while (!checkSymbol(")")) {
-                    if (!first) { expectSymbol(","); tuple += ","; }
+                    if (!first) {
+                        expectSymbol(",");
+                        if (checkSymbol(")")) break; // trailing tuple comma
+                        tuple += ",";
+                    }
                     tuple += parseTypeName();
                     first = false;
                 }
@@ -2229,8 +2338,19 @@ namespace pcn {
                 throw std::runtime_error("expected type name");
             }
             std::string name = consume().text;
+            bool qualified = false;
             while (matchSymbol("::")) {
+                qualified = true;
                 name += "::" + expectIdentifier().text;
+            }
+            // Aliases are transparent and cannot themselves accept new generic
+            // arguments. This fails closed instead of silently ignoring them.
+            if (!qualified) {
+                if (auto alias = typeAliases_.find(name); alias != typeAliases_.end()) {
+                    if (checkSymbol("<"))
+                        throw std::runtime_error("E0234 type alias '" + name + "' is not generic");
+                    return alias->second;
+                }
             }
             if (matchSymbol("<")) {
                 name += "<";
@@ -2439,14 +2559,14 @@ namespace pcn {
                 const bool validLoop = std::visit([&](auto& n) -> bool {
                     using T = std::decay_t<decltype(n)>;
                     if constexpr (std::is_same_v<T, WhileStmt> ||
-                                  std::is_same_v<T, EachStmt> ||
-                                  std::is_same_v<T, FromStmt> ||
-                                  std::is_same_v<T, ContinueUntilStmt>) {
+                        std::is_same_v<T, EachStmt> ||
+                        std::is_same_v<T, FromStmt> ||
+                        std::is_same_v<T, ContinueUntilStmt>) {
                         n.loopLabel = label.text;
                         return true;
                     }
                     return false;
-                }, labeled);
+                    }, labeled);
                 if (!validLoop) throw std::runtime_error("E0240 @" + label.text + ": may label only a loop");
                 return makeStmt(std::move(labeled), body->span, body->location);
             }
@@ -2844,7 +2964,7 @@ namespace pcn {
             while (matchSymbol("<") || matchSymbol("<=") || matchSymbol(">") || matchSymbol(">=")) {
                 std::string op = previous().text;
                 auto location = previous().location;
-                auto right = parseTerm();
+                auto right = parseRange();
                 expr = makeExpr(BinaryExpr{ op, expr, right,{ expr ? expr->span.start : location, right ? right->span.end : location }, location }, { expr ? expr->span.start : location, right ? right->span.end : location }, location);
             }
             return expr;
@@ -2898,6 +3018,16 @@ namespace pcn {
         }
 
         ExprPtr parseUnary() {
+            struct RecursionGuard {
+                std::size_t& count;
+                explicit RecursionGuard(std::size_t& n) : count(n) {
+                    if (++count > 256) {
+                        --count;
+                        throw std::runtime_error("E0250 maximum expression nesting depth (256) exceeded");
+                    }
+                }
+                ~RecursionGuard() { --count; }
+            } guard(unaryNesting_);
             if (matchKeyword("try")) {
                 auto location = previous().location;
                 auto operand = parseUnary();
@@ -3302,7 +3432,7 @@ namespace pcn {
         // with generic specialization, so every declaration and local annotation
         // has the same spelling, nesting, and container-arity rules.
         bool validateTypeReference(const std::string& spelling, SourceLocation loc,
-                                   const std::unordered_set<std::string>& generics = {}) {
+            const std::unordered_set<std::string>& generics = {}) {
             if (spelling.empty()) return true; // inferred annotation
             if (spelling.find("::") != std::string::npos) return true; // imported path: resolved by package loader
             CanonicalTypeExpr parsed;
@@ -3338,9 +3468,9 @@ namespace pcn {
                     return true;
                 }
                 const std::unordered_map<std::string, std::size_t> genericArity = {
-                    {"result",2}, {"option",1}, {"array",2}, {"span",1},
-                    {"ref",1}, {"mut",1}, {"buffer",1}, {"atomic",1},
-                    {"vec",2}, {"map",2}, {"set",1}
+                    { "result",2 },{ "option",1 },{ "array",2 },{ "span",1 },
+                    { "ref",1 },{ "mut",1 },{ "buffer",1 },{ "atomic",1 },
+                    { "vec",2 },{ "map",2 },{ "set",1 }
                 };
                 const auto arity = genericArity.find(t.head);
                 if (arity == genericArity.end() && t.head != "view" && t.head != "raw") {
@@ -3350,22 +3480,22 @@ namespace pcn {
                 const bool allowBare = t.head == "view" || t.head == "raw";
                 if (t.args.size() != expected && !(allowBare && t.args.empty())) {
                     report(loc, "E0322 type '" + t.head + "' requires " +
-                                std::to_string(expected) + " type argument(s); got " + std::to_string(t.args.size()));
+                        std::to_string(expected) + " type argument(s); got " + std::to_string(t.args.size()));
                     return false;
                 }
                 bool valid = true;
-                for (std::size_t i=0; i<t.args.size(); ++i) {
+                for (std::size_t i = 0; i < t.args.size(); ++i) {
                     if ((t.head == "array" || t.head == "vec") && i == 1) {
                         const auto& size = t.args[i].head;
                         const bool digits = !t.args[i].tuple && t.args[i].args.empty() && !size.empty() &&
-                            std::all_of(size.begin(),size.end(),[](unsigned char c){return std::isdigit(c) != 0;});
-                        if (!digits) {report(loc,"E0323 fixed-array/vector size must be a nonnegative integer constant"); valid=false;}
+                            std::all_of(size.begin(), size.end(), [](unsigned char c) {return std::isdigit(c) != 0; });
+                        if (!digits) { report(loc, "E0323 fixed-array/vector size must be a nonnegative integer constant"); valid = false; }
                         continue;
                     }
                     valid = validate(t.args[i]) && valid;
                 }
                 return valid;
-            };
+                };
             return validate(parsed);
         }
 
@@ -3381,7 +3511,7 @@ namespace pcn {
             for (const auto& parameter : r.parameters) {
                 validateTypeReference(parameter.typeName, parameter.location, generics);
                 if (parameter.typeName == "void" || parameter.typeName == "never")
-                    report(parameter.location,"E0324 parameter '"+parameter.name+"' cannot have type "+parameter.typeName);
+                    report(parameter.location, "E0324 parameter '" + parameter.name + "' cannot have type " + parameter.typeName);
             }
         }
 
@@ -3389,36 +3519,44 @@ namespace pcn {
             for (const auto& routine : program.routines) validateRoutineTypes(routine);
             for (const auto& declaration : program.declarations) {
                 std::visit([&](const auto& node) {
-                    using T=std::decay_t<decltype(node)>;
+                    using T = std::decay_t<decltype(node)>;
                     if constexpr (std::is_same_v<T, RecordDecl> || std::is_same_v<T, UnionDecl>) {
                         std::unordered_set<std::string> names;
                         for (const auto& field : node.fields) {
                             if (!names.insert(field.name).second)
-                                report(field.location,"E0325 duplicate field '"+field.name+"' in "+node.name);
-                            validateTypeReference(field.typeName,field.location);
+                                report(field.location, "E0325 duplicate field '" + field.name + "' in " + node.name);
+                            validateTypeReference(field.typeName, field.location);
                             if (field.typeName == "void" || field.typeName == "never")
-                                report(field.location,"E0324 stored field '"+field.name+"' cannot have type "+field.typeName);
+                                report(field.location, "E0324 stored field '" + field.name + "' cannot have type " + field.typeName);
                         }
-                    } else if constexpr (std::is_same_v<T, VariantDecl>) {
+                    }
+                    else if constexpr (std::is_same_v<T, VariantDecl>) {
                         std::unordered_set<std::string> names;
                         for (const auto& c : node.cases) {
                             if (!names.insert(c.name).second)
-                                report(c.location,"E0325 duplicate variant case '"+c.name+"' in "+node.name);
-                            for (const auto& field : c.fields) validateTypeReference(field.typeName,field.location);
-                        }
-                    } else if constexpr (std::is_same_v<T, ConstDecl>) {
-                        validateTypeReference(node.typeName,node.location);
-                    } else if constexpr (std::is_same_v<T, Routine>) {
-                        validateRoutineTypes(node);
-                    } else if constexpr (std::is_same_v<T, ForeignDecl>) {
-                        validateRoutineTypes(node.routine);
-                    } else if constexpr (std::is_same_v<T, CapabilityDecl>) {
-                        for (const auto& member : node.members) {
-                            validateTypeReference(member.returnType,member.location);
-                            for (const auto& p : member.parameters) validateTypeReference(p.typeName,p.location);
+                                report(c.location, "E0325 duplicate variant case '" + c.name + "' in " + node.name);
+                            for (const auto& field : c.fields) validateTypeReference(field.typeName, field.location);
                         }
                     }
-                }, declaration.node);
+                    else if constexpr (std::is_same_v<T, AliasDecl>) {
+                        validateTypeReference(node.targetType, node.location);
+                    }
+                    else if constexpr (std::is_same_v<T, ConstDecl>) {
+                        validateTypeReference(node.typeName, node.location);
+                    }
+                    else if constexpr (std::is_same_v<T, Routine>) {
+                        validateRoutineTypes(node);
+                    }
+                    else if constexpr (std::is_same_v<T, ForeignDecl>) {
+                        validateRoutineTypes(node.routine);
+                    }
+                    else if constexpr (std::is_same_v<T, CapabilityDecl>) {
+                        for (const auto& member : node.members) {
+                            validateTypeReference(member.returnType, member.location);
+                            for (const auto& p : member.parameters) validateTypeReference(p.typeName, p.location);
+                        }
+                    }
+                    }, declaration.node);
             }
             validateValueContainment(program);
         }
@@ -3429,68 +3567,69 @@ namespace pcn {
         // layout engine and prevents accidental infinite recursive expansion.
         void validateValueContainment(const Program& program) {
             struct Edge { std::string target; SourceLocation loc; };
-            std::map<std::string,std::vector<Edge>> edges;
-            std::function<void(const std::string&,const std::string&,SourceLocation)> collect =
-                [&](const std::string& owner,const std::string& type,SourceLocation loc) {
-                    CanonicalTypeExpr parsed;
-                    try { parsed=CanonicalTypeParser(type).parse(); }
-                    catch (...) { return; } // already diagnosed as malformed
-                    std::function<void(const CanonicalTypeExpr&)> scan=[&](const CanonicalTypeExpr& t) {
-                        static const std::unordered_set<std::string> indirect={
-                            "raw","ref","mut","view","span","buffer","string","map","set"
-                        };
-                        if (indirect.contains(t.head)) return;
-                        const auto it=nominalTypes_.find(t.head);
-                        if (it!=nominalTypes_.end() &&
-                            (it->second.info.kind=="record" || it->second.info.kind=="union" ||
-                             it->second.info.kind=="variant")) {
-                            edges[owner].push_back({t.head,loc}); return;
-                        }
-                        if (t.head=="array" && t.args.size()==2 &&
-                            t.args[1].head=="0") return; // zero elements carry no contained values
-                        for (std::size_t i=0;i<t.args.size();++i) {
-                            if ((t.head=="array" || t.head=="vec") && i==1) continue;
-                            scan(t.args[i]);
-                        }
+            std::map<std::string, std::vector<Edge>> edges;
+            std::function<void(const std::string&, const std::string&, SourceLocation)> collect =
+                [&](const std::string& owner, const std::string& type, SourceLocation loc) {
+                CanonicalTypeExpr parsed;
+                try { parsed = CanonicalTypeParser(type).parse(); }
+                catch (...) { return; } // already diagnosed as malformed
+                std::function<void(const CanonicalTypeExpr&)> scan = [&](const CanonicalTypeExpr& t) {
+                    static const std::unordered_set<std::string> indirect = {
+                        "raw","ref","mut","view","span","buffer","string","map","set"
                     };
-                    scan(parsed);
-                };
-            for (const auto& declaration:program.declarations) {
-                std::visit([&](const auto& node) {
-                    using T=std::decay_t<decltype(node)>;
-                    if constexpr (std::is_same_v<T,RecordDecl> || std::is_same_v<T,UnionDecl>) {
-                        edges.try_emplace(node.name);
-                        for (const auto& field:node.fields)collect(node.name,field.typeName,field.location);
-                    } else if constexpr (std::is_same_v<T,VariantDecl>) {
-                        edges.try_emplace(node.name);
-                        for (const auto& tag:node.cases)
-                            for (const auto& field:tag.fields)collect(node.name,field.typeName,field.location);
+                    if (indirect.contains(t.head)) return;
+                    const auto it = nominalTypes_.find(t.head);
+                    if (it != nominalTypes_.end() &&
+                        (it->second.info.kind == "record" || it->second.info.kind == "union" ||
+                            it->second.info.kind == "variant")) {
+                        edges[owner].push_back({ t.head,loc }); return;
                     }
-                },declaration.node);
+                    if (t.head == "array" && t.args.size() == 2 &&
+                        t.args[1].head == "0") return; // zero elements carry no contained values
+                    for (std::size_t i = 0; i < t.args.size(); ++i) {
+                        if ((t.head == "array" || t.head == "vec") && i == 1) continue;
+                        scan(t.args[i]);
+                    }
+                    };
+                scan(parsed);
+                };
+            for (const auto& declaration : program.declarations) {
+                std::visit([&](const auto& node) {
+                    using T = std::decay_t<decltype(node)>;
+                    if constexpr (std::is_same_v<T, RecordDecl> || std::is_same_v<T, UnionDecl>) {
+                        edges.try_emplace(node.name);
+                        for (const auto& field : node.fields)collect(node.name, field.typeName, field.location);
+                    }
+                    else if constexpr (std::is_same_v<T, VariantDecl>) {
+                        edges.try_emplace(node.name);
+                        for (const auto& tag : node.cases)
+                            for (const auto& field : tag.fields)collect(node.name, field.typeName, field.location);
+                    }
+                    }, declaration.node);
             }
-            std::map<std::string,int> state;
+            std::map<std::string, int> state;
             std::vector<std::string> stack;
             std::set<std::string> seen;
-            std::function<void(const std::string&)> dfs=[&](const std::string& name) {
-                state[name]=1; stack.push_back(name);
-                for (const auto& edge:edges[name]) {
-                    if (state[edge.target]==0)dfs(edge.target);
-                    else if (state[edge.target]==1) {
-                        const auto begin=std::find(stack.begin(),stack.end(),edge.target);
+            std::function<void(const std::string&)> dfs = [&](const std::string& name) {
+                state[name] = 1; stack.push_back(name);
+                for (const auto& edge : edges[name]) {
+                    if (state[edge.target] == 0)dfs(edge.target);
+                    else if (state[edge.target] == 1) {
+                        const auto begin = std::find(stack.begin(), stack.end(), edge.target);
                         std::ostringstream cycle;
-                        for (auto at=begin;at!=stack.end();++at) {
-                            if (at!=begin)cycle << " -> ";
+                        for (auto at = begin; at != stack.end(); ++at) {
+                            if (at != begin)cycle << " -> ";
                             cycle << *at;
                         }
                         cycle << " -> " << edge.target;
                         if (seen.insert(cycle.str()).second)
-                            report(edge.loc,"E0329 infinitely recursive value layout: "+cycle.str()+
+                            report(edge.loc, "E0329 infinitely recursive value layout: " + cycle.str() +
                                 "; introduce an explicit indirection (raw/ref/view) to break containment");
                     }
                 }
-                stack.pop_back();state[name]=2;
-            };
-            for (const auto& [name,children]:edges)if (state[name]==0)dfs(name);
+                stack.pop_back(); state[name] = 2;
+                };
+            for (const auto& [name, children] : edges)if (state[name] == 0)dfs(name);
         }
 
         void registerNominal(const std::string& name, const std::string& kind, bool isPublic, bool isCompileTime, SourceLocation location) {
@@ -3618,6 +3757,12 @@ namespace pcn {
                     DeclarationInfo info{ node.alias.empty() ? node.path.back() : node.alias, "use", false, false, joinPath(node.path) };
                     result_.declarations.push_back(std::move(info));
                 }
+                else if constexpr (std::is_same_v<T, AliasDecl>) {
+                    auto& scope = declarationScopes_.back();
+                    if (!scope.insert(node.name).second)
+                        report(node.location, "E0231 duplicate top-level declaration: " + node.name);
+                    result_.declarations.push_back({ node.name, "alias", node.isPublic, false, node.targetType });
+                }
                 else if constexpr (std::is_same_v<T, ConstDecl>) {
                     DeclarationInfo info{ node.name, "const", node.isPublic, node.isCompileTime, node.typeName };
                     result_.declarations.push_back(std::move(info));
@@ -3646,10 +3791,10 @@ namespace pcn {
                 using T = std::decay_t<decltype(node)>;
                 if constexpr (std::is_same_v<T, ConstDecl>) {
                     if (node.value) {
-                        const auto actual=analyzeExpr(node.value);
-                        const auto expected=semanticTypeFromName(node.typeName);
-                        if (!node.typeName.empty() && !isAssignableTo(expected,actual))
-                            report(node.location,"E0327 constant '"+node.name+"' type mismatch: expected "+node.typeName+", got "+semanticTypeName(actual));
+                        const auto actual = analyzeExpr(node.value);
+                        const auto expected = semanticTypeFromName(node.typeName);
+                        if (!node.typeName.empty() && !isAssignableTo(expected, actual))
+                            report(node.location, "E0327 constant '" + node.name + "' type mismatch: expected " + node.typeName + ", got " + semanticTypeName(actual));
                     }
                 }
                 else if constexpr (std::is_same_v<T, ModuleDecl>) {
@@ -3865,7 +4010,7 @@ namespace pcn {
 
         bool analyzeLet(const LetStmt& node) {
             if (!node.typeName.empty())
-                validateTypeReference(node.typeName,node.location,
+                validateTypeReference(node.typeName, node.location,
                     currentRoutine_ ? genericNamesFor(*currentRoutine_) : std::unordered_set<std::string>{});
             if (!node.initializer) {
                 report(node.location, "let binding requires an initializer");
@@ -3891,7 +4036,7 @@ namespace pcn {
 
         bool analyzeVar(const VarStmt& node) {
             if (!node.typeName.empty())
-                validateTypeReference(node.typeName,node.location,
+                validateTypeReference(node.typeName, node.location,
                     currentRoutine_ ? genericNamesFor(*currentRoutine_) : std::unordered_set<std::string>{});
             SemanticType declaredType = semanticTypeFromName(node.typeName);
             if (node.initializer) {
@@ -4072,12 +4217,15 @@ namespace pcn {
                 bindingType = semanticTypeFromName(element);
                 if (node.bindingsMutable)
                     report(node.location, "E0612 for var over fixed arrays requires exclusive element borrowing, not yet implemented");
-            } else if (const auto& name=semanticTypeName(iterableType); name.starts_with("view<") && name.ends_with(">")) {
-                bindingType=semanticTypeFromName(name.substr(5,name.size()-6));
-                if(node.bindingsMutable)report(node.location,"E0612 for var over view requires an exclusive span, not a shared view");
-            } else if (node.range && std::holds_alternative<RangeExpr>(node.range->node)) {
+            }
+            else if (const auto& name = semanticTypeName(iterableType); name.starts_with("view<") && name.ends_with(">")) {
+                bindingType = semanticTypeFromName(name.substr(5, name.size() - 6));
+                if (node.bindingsMutable)report(node.location, "E0612 for var over view requires an exclusive span, not a shared view");
+            }
+            else if (node.range && std::holds_alternative<RangeExpr>(node.range->node)) {
                 bindingType = semanticTypeFromName("int");
-            } else {
+            }
+            else {
                 report(node.location, "E0611 iterable requires integer range, array<T,N>, or view<T>; generic iterators are not implemented");
             }
             pushScope();
@@ -4555,22 +4703,22 @@ namespace pcn {
                 return makeNumberType();
             }
             if (isStdFSExists(node.callee)) {
-                if (node.arguments.size()!=1 || (node.arguments.size()==1 && semanticTypeName(analyzeExpr(node.arguments[0]))!="text"))
-                    report(node.location,"E0365 std.fs.exists requires exactly one UTF-8 text path");
+                if (node.arguments.size() != 1 || (node.arguments.size() == 1 && semanticTypeName(analyzeExpr(node.arguments[0])) != "text"))
+                    report(node.location, "E0365 std.fs.exists requires exactly one UTF-8 text path");
                 return makeBoolType();
             }
             if (isStdFSWriteText(node.callee)) {
-                if (node.arguments.size()!=2)report(node.location,"E0370 std.fs.write_text(path, contents) requires two text arguments");
-                for (const auto& arg: node.arguments) {
-                    const auto ty=analyzeExpr(arg);
-                    if (ty.kind!=SemanticTypeKind::Text && ty.kind!=SemanticTypeKind::Unknown)
-                        report(node.location,"E0371 std.fs.write_text accepts UTF-8 text, not " + semanticTypeName(ty));
+                if (node.arguments.size() != 2)report(node.location, "E0370 std.fs.write_text(path, contents) requires two text arguments");
+                for (const auto& arg : node.arguments) {
+                    const auto ty = analyzeExpr(arg);
+                    if (ty.kind != SemanticTypeKind::Text && ty.kind != SemanticTypeKind::Unknown)
+                        report(node.location, "E0371 std.fs.write_text accepts UTF-8 text, not " + semanticTypeName(ty));
                 }
                 return makeBoolType();
             }
             if (isStdFSReadText(node.callee)) {
-                if (node.arguments.size()!=1 || (node.arguments.size()==1 && semanticTypeName(analyzeExpr(node.arguments[0]))!="text"))
-                    report(node.location,"E0360 std.fs.read_text requires one UTF-8 text path");
+                if (node.arguments.size() != 1 || (node.arguments.size() == 1 && semanticTypeName(analyzeExpr(node.arguments[0])) != "text"))
+                    report(node.location, "E0360 std.fs.read_text requires one UTF-8 text path");
                 return makeStringType();
             }
             if (isStdIOReadAll(node.callee)) {
@@ -4663,7 +4811,7 @@ namespace pcn {
             if ((leftType.kind != SemanticTypeKind::Bool && leftType.kind != SemanticTypeKind::Unknown) ||
                 (rightType.kind != SemanticTypeKind::Bool && rightType.kind != SemanticTypeKind::Unknown)) {
                 report(node.location, "E0328 logical operator '" + node.op + "' requires bool operands (received " +
-                                      semanticTypeName(leftType) + " and " + semanticTypeName(rightType) + ")");
+                    semanticTypeName(leftType) + " and " + semanticTypeName(rightType) + ")");
             }
             return (leftType.kind == SemanticTypeKind::Bool || rightType.kind == SemanticTypeKind::Bool || leftType.kind == SemanticTypeKind::Unknown || rightType.kind == SemanticTypeKind::Unknown)
                 ? makeBoolType()
@@ -4886,11 +5034,11 @@ namespace pcn {
                     auto idx = analyzeExpr(node.index);
                     std::string element; std::size_t count = 0;
                     const bool isView = base.name.starts_with("view<") && base.name.ends_with(">");
-                    if (isView) element = base.name.substr(5,base.name.size()-6);
+                    if (isView) element = base.name.substr(5, base.name.size() - 6);
                     if (!isView && !typeIsArray(base.name, &element, &count)) { report(node.location, "indexing requires array<T,N> or view<T>"); return makeUnknownType(); }
                     if (!isIntegerLikeNumericType(idx) ||
                         (std::get_if<NumberExpr>(&node.index->node) &&
-                         std::get<NumberExpr>(node.index->node).value.find_first_of(".eE") != std::string::npos))
+                            std::get<NumberExpr>(node.index->node).value.find_first_of(".eE") != std::string::npos))
                         report(node.location, "E0310 array index must be an integer");
                     if (!isView) if (auto* lit = std::get_if<NumberExpr>(&node.index->node)) {
                         if (lit->value.find('.') != std::string::npos)report(node.location, "array index must be integer");
@@ -5936,7 +6084,8 @@ namespace pcn {
                     for (const auto& a : node.arguments) collectExprEffects(a, facts);
                     if (isStdFSReadText(node.callee) || isStdFSExists(node.callee) || isStdFSWriteText(node.callee) || isStdIOReadAll(node.callee) || isStdProcessRun(node.callee)) {
                         facts.direct.insert("io"); facts.direct.insert("alloc"); facts.direct.insert("trap");
-                    } else if (isStdIOCall(node.callee)) {
+                    }
+                    else if (isStdIOCall(node.callee)) {
                         facts.direct.insert("io");
                     }
                     else if (const auto* member = node.callee ? std::get_if<MemberExpr>(&node.callee->node) : nullptr) {
@@ -6770,6 +6919,9 @@ namespace pcn {
                     std::string alias = node.alias.empty() ? (node.path.empty() ? std::string{} : node.path.back()) : node.alias;
                     output.push_back({ qualify(alias), "use", false, false, joinPath(node.path) });
                 }
+                else if constexpr (std::is_same_v<T, AliasDecl>) {
+                    output.push_back({ qualify(node.name), "alias", node.isPublic, false, node.targetType });
+                }
                 else if constexpr (std::is_same_v<T, ConstDecl>) {
                     output.push_back({ qualify(node.name), "const", node.isPublic, node.isCompileTime, node.typeName });
                 }
@@ -6892,7 +7044,7 @@ namespace pcn {
             if (name.rfind("result<", 0) == 0) return { IRValueKind::Result, name };
             if (name.rfind("option<", 0) == 0) return { IRValueKind::Option, name };
             if (name.rfind("closure$", 0) == 0) return { IRValueKind::Closure, name };
-            if (!name.empty() && (name.front() == '(' || nominalTypeNames_.count(name) || typeIsArray(name) || name.rfind("view<",0)==0 || name.rfind("span<",0)==0)) return { IRValueKind::Aggregate, name };
+            if (!name.empty() && (name.front() == '(' || nominalTypeNames_.count(name) || typeIsArray(name) || name.rfind("view<", 0) == 0 || name.rfind("span<", 0) == 0)) return { IRValueKind::Aggregate, name };
             if (name.empty()) return makeIRUnknownType();
             return { IRValueKind::Function, name };
         }
@@ -7315,9 +7467,9 @@ namespace pcn {
             std::string elementType;
             std::size_t elementCount = 0;
             const bool fixedArray = typeIsArray(iterableType, &elementType, &elementCount);
-            const bool isView=iterableType.starts_with("view<") && iterableType.ends_with(">");
-            if(isView)elementType=iterableType.substr(5,iterableType.size()-6);
-            const bool indexed=fixedArray||isView;
+            const bool isView = iterableType.starts_with("view<") && iterableType.ends_with(">");
+            if (isView)elementType = iterableType.substr(5, iterableType.size() - 6);
+            const bool indexed = fixedArray || isView;
             if (!indexed && (!sourceRange || !sourceRange->start || !sourceRange->end))
                 throw std::runtime_error("E0611 for iterable backend supports integer ranges and fixed array<T,N>; general iterator<I,T> lowering is not implemented");
             if (indexed && node.bindingsMutable)
@@ -7339,12 +7491,14 @@ namespace pcn {
             if (indexed) {
                 baseArray = lowerExpr(node.range);
                 firstValue = emitConst(IROpcode::ConstInt, "0");
-                if(isView) {
-                    IRInstruction len;len.op=IROpcode::ExtractField;len.dest=allocateVReg();
-                    len.args={baseArray};len.literalText="count";len.typeName=iterableType;
-                    len.valueType=makeIRIntType();emit(len);endValue=len.dest;
-                } else endValue = emitConst(IROpcode::ConstInt, std::to_string(elementCount));
-            } else {
+                if (isView) {
+                    IRInstruction len; len.op = IROpcode::ExtractField; len.dest = allocateVReg();
+                    len.args = { baseArray }; len.literalText = "count"; len.typeName = iterableType;
+                    len.valueType = makeIRIntType(); emit(len); endValue = len.dest;
+                }
+                else endValue = emitConst(IROpcode::ConstInt, std::to_string(elementCount));
+            }
+            else {
                 firstValue = lowerExpr(sourceRange->start);
                 endValue = lowerExpr(sourceRange->end);
             }
@@ -7381,7 +7535,8 @@ namespace pcn {
                 get.args = { baseArray, induction }; emit(get);
                 locals_[binding] = get.dest;
                 localValueTypes_[binding] = get.valueType;
-            } else {
+            }
+            else {
                 locals_[binding] = induction;
                 localValueTypes_[binding] = makeIRIntType();
             }
@@ -7391,7 +7546,8 @@ namespace pcn {
                 guardBranch.args = { guard }; guardBranch.targetBlocks = { bodyBlock, exitBlock };
                 guardBranch.valueType = makeIRVoidType(); emit(std::move(guardBranch));
                 currentTerminated_ = true;
-            } else emitBranch(bodyBlock);
+            }
+            else emitBranch(bodyBlock);
 
             loopContinueTargets_.push_back(stepBlock);
             loopBreakTargets_.push_back(exitBlock);
@@ -7412,7 +7568,8 @@ namespace pcn {
                 decide.args = { atEnd.dest }; decide.targetBlocks = { exitBlock, advanceBlock };
                 decide.valueType = makeIRVoidType(); emit(std::move(decide));
                 currentTerminated_ = true;
-            } else emitBranch(advanceBlock);
+            }
+            else emitBranch(advanceBlock);
 
             currentBlock_ = advanceBlock;
             currentTerminated_ = false;
@@ -7860,7 +8017,7 @@ namespace pcn {
                 else if constexpr (std::is_same_v<T, IndexExpr>) {
                     const auto arrType = lowerExprType(node.object);
                     std::string elem; std::size_t count = 0;
-                    if (arrType.name.starts_with("view<") && arrType.name.ends_with(">")) elem = arrType.name.substr(5,arrType.name.size()-6);
+                    if (arrType.name.starts_with("view<") && arrType.name.ends_with(">")) elem = arrType.name.substr(5, arrType.name.size() - 6);
                     else if (!typeIsArray(arrType.name, &elem, &count))throw std::runtime_error("PCIR array index requires array<T,N> or view<T>");
                     auto a = lowerExpr(node.object), idx = lowerExpr(node.index);
                     IRInstruction inst; inst.op = IROpcode::ArrayIndex; inst.dest = allocateVReg();
@@ -8040,7 +8197,7 @@ namespace pcn {
                 else if constexpr (std::is_same_v<T, IndexExpr>) {
                     const auto arr = lowerExprType(node.object);
                     std::string elem;
-                    if (arr.name.starts_with("view<") && arr.name.ends_with(">")) return irValueTypeFromName(arr.name.substr(5, arr.name.size()-6));
+                    if (arr.name.starts_with("view<") && arr.name.ends_with(">")) return irValueTypeFromName(arr.name.substr(5, arr.name.size() - 6));
                     return typeIsArray(arr.name, &elem) ? irValueTypeFromName(elem) : makeIRUnknownType();
                 }
                 else if constexpr (std::is_same_v<T, ConstructExpr>) {
@@ -8203,26 +8360,26 @@ namespace pcn {
                 lastValueType_ = makeIRIntType(); return dest;
             }
             if (isStdFSExists(node.callee)) {
-                if (node.arguments.size()!=1)throw std::runtime_error("E0365 std.fs.exists expects one text path");
-                const auto path=lowerExprWithExpected(node.arguments.front(),makeIRTextType());
-                IRInstruction inst; inst.op=IROpcode::FsExists; inst.dest=allocateVReg();
-                inst.args={path}; inst.valueType=makeIRBoolType();
-                auto dest=inst.dest; emit(std::move(inst));lastValueType_=makeIRBoolType(); return dest;
+                if (node.arguments.size() != 1)throw std::runtime_error("E0365 std.fs.exists expects one text path");
+                const auto path = lowerExprWithExpected(node.arguments.front(), makeIRTextType());
+                IRInstruction inst; inst.op = IROpcode::FsExists; inst.dest = allocateVReg();
+                inst.args = { path }; inst.valueType = makeIRBoolType();
+                auto dest = inst.dest; emit(std::move(inst)); lastValueType_ = makeIRBoolType(); return dest;
             }
             if (isStdFSWriteText(node.callee)) {
-                if(node.arguments.size()!=2)throw std::runtime_error("E0370 std.fs.write_text expects path and contents");
-                const auto path=lowerExprWithExpected(node.arguments[0],makeIRTextType());
-                const auto contents=lowerExprWithExpected(node.arguments[1],makeIRTextType());
-                IRInstruction inst; inst.op=IROpcode::FsWriteText; inst.dest=allocateVReg();
-                inst.args={path,contents}; inst.valueType=makeIRBoolType();
-                const auto dest=inst.dest;emit(std::move(inst));lastValueType_=makeIRBoolType();return dest;
+                if (node.arguments.size() != 2)throw std::runtime_error("E0370 std.fs.write_text expects path and contents");
+                const auto path = lowerExprWithExpected(node.arguments[0], makeIRTextType());
+                const auto contents = lowerExprWithExpected(node.arguments[1], makeIRTextType());
+                IRInstruction inst; inst.op = IROpcode::FsWriteText; inst.dest = allocateVReg();
+                inst.args = { path,contents }; inst.valueType = makeIRBoolType();
+                const auto dest = inst.dest; emit(std::move(inst)); lastValueType_ = makeIRBoolType(); return dest;
             }
             if (isStdFSReadText(node.callee)) {
-                if (node.arguments.size()!=1)throw std::runtime_error("E0360 std.fs.read_text expects one path");
-                const auto path=lowerExprWithExpected(node.arguments.front(),makeIRTextType());
-                IRInstruction inst; inst.op=IROpcode::FsReadText; inst.dest=allocateVReg();
-                inst.args={path}; inst.valueType=makeIRStringType();
-                auto dest=inst.dest; emit(std::move(inst));lastValueType_=makeIRStringType(); return dest;
+                if (node.arguments.size() != 1)throw std::runtime_error("E0360 std.fs.read_text expects one path");
+                const auto path = lowerExprWithExpected(node.arguments.front(), makeIRTextType());
+                IRInstruction inst; inst.op = IROpcode::FsReadText; inst.dest = allocateVReg();
+                inst.args = { path }; inst.valueType = makeIRStringType();
+                auto dest = inst.dest; emit(std::move(inst)); lastValueType_ = makeIRStringType(); return dest;
             }
             if (isStdIOReadAll(node.callee)) {
                 if (!node.arguments.empty())throw std::runtime_error("E0353 std.io.read_all takes no arguments");
@@ -8694,10 +8851,10 @@ namespace pcn {
     // explicit E-code are mapped to stable generic categories; the actual
     // message is never rewritten or discarded.
     std::string semanticDiagnosticCode(const SemanticDiagnostic& d) {
-        if (d.message.size() >= 5 && d.message[0]=='E' &&
-            std::all_of(d.message.begin()+1,d.message.begin()+5,
-                        [](unsigned char c){return std::isdigit(c)!=0;}))
-            return d.message.substr(0,5);
+        if (d.message.size() >= 5 && d.message[0] == 'E' &&
+            std::all_of(d.message.begin() + 1, d.message.begin() + 5,
+                [](unsigned char c) {return std::isdigit(c) != 0; }))
+            return d.message.substr(0, 5);
         if (d.message.find("unknown name:") != std::string::npos) return "E0301";
         if (d.message.find("unknown routine:") != std::string::npos) return "E0302";
         if (d.message.find("type mismatch") != std::string::npos) return "E0303";
@@ -8708,52 +8865,52 @@ namespace pcn {
     }
 
     std::string semanticDiagnosticHint(const SemanticDiagnostic& d) {
-        const auto code=semanticDiagnosticCode(d);
-        if (code=="E0321") return "Declare this type or correct its spelling before use.";
-        if (code=="E0322") return "Check the expected type-argument count and nesting.";
-        if (code=="E0323") return "Use a compile-time nonnegative integer for the array length.";
-        if (code=="E0325") return "Rename or remove the repeated field/case declaration.";
-        if (code=="E0326") return "Every reachable path must use 'give' to return a value.";
-        if (code=="E0328") return "Logical operators require bool on both sides; use an explicit comparison.";
-        if (code=="E0329") return "Store a pointer/borrow instead of embedding this type recursively.";
-        if (code=="E0301") return "Declare the binding in scope or correct its name.";
-        if (code=="E0302") return "Check the routine name and imported module, then call it with arguments.";
-        if (code=="E0303") return "Use an explicit type conversion; Paracine has no implicit numeric conversions.";
-        if (code=="E0304") return "Review available overloads and each parameter type.";
+        const auto code = semanticDiagnosticCode(d);
+        if (code == "E0321") return "Declare this type or correct its spelling before use.";
+        if (code == "E0322") return "Check the expected type-argument count and nesting.";
+        if (code == "E0323") return "Use a compile-time nonnegative integer for the array length.";
+        if (code == "E0325") return "Rename or remove the repeated field/case declaration.";
+        if (code == "E0326") return "Every reachable path must use 'give' to return a value.";
+        if (code == "E0328") return "Logical operators require bool on both sides; use an explicit comparison.";
+        if (code == "E0329") return "Store a pointer/borrow instead of embedding this type recursively.";
+        if (code == "E0301") return "Declare the binding in scope or correct its name.";
+        if (code == "E0302") return "Check the routine name and imported module, then call it with arguments.";
+        if (code == "E0303") return "Use an explicit type conversion; Paracine has no implicit numeric conversions.";
+        if (code == "E0304") return "Review available overloads and each parameter type.";
         return {};
     }
 
     void printSemanticDiagnostics(const SemanticAnalysisResult& analysis,
-                                  std::string_view sourcePath={}, std::string_view source={}) {
+        std::string_view sourcePath = {}, std::string_view source = {}) {
         std::vector<std::string_view> lines;
         if (!source.empty()) {
-            std::size_t start=0;
+            std::size_t start = 0;
             while (start < source.size()) {
-                const auto end=source.find('\n',start);
-                const auto actual=end==std::string_view::npos ? source.size() : end;
-                auto line=source.substr(start,actual-start);
-                if (!line.empty() && line.back()=='\r') line.remove_suffix(1);
+                const auto end = source.find('\n', start);
+                const auto actual = end == std::string_view::npos ? source.size() : end;
+                auto line = source.substr(start, actual - start);
+                if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
                 lines.push_back(line);
-                if (end==std::string_view::npos)break;
-                start=end+1;
+                if (end == std::string_view::npos)break;
+                start = end + 1;
             }
         }
         for (const auto& d : analysis.diagnostics) {
-            const auto code=semanticDiagnosticCode(d);
+            const auto code = semanticDiagnosticCode(d);
             std::cerr << "error[" << code << "]";
             if (!sourcePath.empty())std::cerr << " " << sourcePath;
             if (d.location.line)std::cerr << ":" << d.location.line << ":" << d.location.column;
             std::cerr << ": " << d.message << "\n";
             if (d.location.line > 0 && d.location.line <= lines.size()) {
-                const auto& line=lines[d.location.line-1];
-                const auto width=std::to_string(d.location.line).size();
-                std::cerr << std::string(width+1,' ') << "|\n"
-                          << d.location.line << " | " << line << "\n"
-                          << std::string(width+1,' ') << "| "
-                          << std::string(d.location.column > 0 ? std::min<std::size_t>(d.location.column-1,line.size()) : 0,' ')
-                          << "^\n";
+                const auto& line = lines[d.location.line - 1];
+                const auto width = std::to_string(d.location.line).size();
+                std::cerr << std::string(width + 1, ' ') << "|\n"
+                    << d.location.line << " | " << line << "\n"
+                    << std::string(width + 1, ' ') << "| "
+                    << std::string(d.location.column > 0 ? std::min<std::size_t>(d.location.column - 1, line.size()) : 0, ' ')
+                    << "^\n";
             }
-            if (const auto hint=semanticDiagnosticHint(d); !hint.empty())
+            if (const auto hint = semanticDiagnosticHint(d); !hint.empty())
                 std::cerr << "  help: " << hint << "\n";
         }
     }
@@ -8876,11 +9033,11 @@ namespace pcn {
                     if (inst.op == IROpcode::ProcessRun && (inst.args.size() != 1 ||
                         inst.dest == VReg::None || inst.valueType.kind != IRValueKind::Int64))
                         errors.push_back(fn.name + ": malformed process.run operation");
-                    if (inst.op == IROpcode::FsExists && (inst.args.size()!=1 || inst.dest==VReg::None || inst.valueType.kind!=IRValueKind::Bool))
+                    if (inst.op == IROpcode::FsExists && (inst.args.size() != 1 || inst.dest == VReg::None || inst.valueType.kind != IRValueKind::Bool))
                         errors.push_back(fn.name + ": malformed fs.exists operation");
-                    if (inst.op == IROpcode::FsWriteText && (inst.args.size()!=2 || inst.dest==VReg::None || inst.valueType.kind!=IRValueKind::Bool))
+                    if (inst.op == IROpcode::FsWriteText && (inst.args.size() != 2 || inst.dest == VReg::None || inst.valueType.kind != IRValueKind::Bool))
                         errors.push_back(fn.name + ": malformed fs.write_text operation");
-                    if (inst.op == IROpcode::FsReadText && (inst.args.size()!=1 || inst.dest==VReg::None || inst.valueType.kind!=IRValueKind::String))
+                    if (inst.op == IROpcode::FsReadText && (inst.args.size() != 1 || inst.dest == VReg::None || inst.valueType.kind != IRValueKind::String))
                         errors.push_back(fn.name + ": malformed fs.read_text operation");
                     if (inst.op == IROpcode::TextStreamRead && (!inst.args.empty() || inst.dest == VReg::None || inst.valueType.kind != IRValueKind::String))
                         errors.push_back(fn.name + ": malformed stdin read_all: must yield owned string");
@@ -9060,21 +9217,22 @@ namespace pcn {
         // cell and a Nop has no side effect. These are safe even in this
         // deliberately non-SSA PCIR. Never elide writes to other destinations.
         static bool removeNoOpsAndSelfCopies(IRFunction& fn) {
-            bool changed=false;
+            bool changed = false;
             for (auto& block : fn.blocks) {
-                const auto old=block.instructions.size();
-                std::erase_if(block.instructions,[](const IRInstruction& i){
-                    return i.op==IROpcode::Nop ||
-                           (i.op==IROpcode::Copy && i.dest!=VReg::None &&
-                            i.args.size()==1 && i.args[0]==i.dest);
-                });
-                changed = changed || (block.instructions.size()!=old);
+                const auto old = block.instructions.size();
+                std::erase_if(block.instructions, [](const IRInstruction& i) {
+                    return i.op == IROpcode::Nop ||
+                        (i.op == IROpcode::Copy && i.dest != VReg::None &&
+                            i.args.size() == 1 && i.args[0] == i.dest);
+                    });
+                changed = changed || (block.instructions.size() != old);
             }
             return changed;
         }
         static std::uint32_t reg(VReg r) { return static_cast<std::uint32_t>(r); }
         static std::uint32_t reg(BlockID b) { return static_cast<std::uint32_t>(b); }
-        struct Constant { std::int64_t value = 0; bool boolean = false;
+        struct Constant {
+            std::int64_t value = 0; bool boolean = false;
             bool operator==(const Constant& other) const { return value == other.value && boolean == other.boolean; }
         };
         using ConstMap = std::unordered_map<std::uint32_t, Constant>;
@@ -9157,7 +9315,7 @@ namespace pcn {
                             if (it == cells.end()) { valid = false; break; }
                             IRInstruction copy;
                             copy.op = IROpcode::Copy; copy.dest = call.dest;
-                            copy.valueType = call.valueType; copy.args = {it->second};
+                            copy.valueType = call.valueType; copy.args = { it->second };
                             replacement.push_back(std::move(copy));
                             continue;
                         }
@@ -9232,7 +9390,7 @@ namespace pcn {
                 return a / b;
             case IROpcode::Mod:
                 if (!b) return std::nullopt;
-                if (a == INT64_MIN && b == -1) return std::int64_t{0};
+                if (a == INT64_MIN && b == -1) return std::int64_t{ 0 };
                 return a % b;
             case IROpcode::BitAnd: return a & b;
             case IROpcode::BitOr: return a | b;
@@ -9262,7 +9420,7 @@ namespace pcn {
         }
         static void setCopy(IRInstruction& inst, VReg source) {
             inst.op = IROpcode::Copy;
-            inst.args = {source}; inst.targetBlocks.clear(); inst.phiInputs.clear();
+            inst.args = { source }; inst.targetBlocks.clear(); inst.phiInputs.clear();
             inst.hasImmediate = false; inst.immediate = 0;
             inst.literalText.clear();
             inst.argumentTypes.clear(); inst.argumentValueTypes.clear();
@@ -9272,17 +9430,18 @@ namespace pcn {
             const auto d = reg(i.dest);
             switch (i.op) {
             case IROpcode::ConstInt:
-                try { known[d] = {parseParacineInteger(i.literalText), false}; }
+                try { known[d] = { parseParacineInteger(i.literalText), false }; }
                 catch (...) { known.erase(d); }
                 break;
-            case IROpcode::ConstBool: known[d] = {i.immediate ? 1 : 0, true}; break;
-            case IROpcode::ConstNull: known[d] = {0, false}; break;
+            case IROpcode::ConstBool: known[d] = { i.immediate ? 1 : 0, true }; break;
+            case IROpcode::ConstNull: known[d] = { 0, false }; break;
             case IROpcode::Copy:
                 if (i.args.size() == 1) {
                     const auto f = known.find(reg(i.args[0]));
                     if (f != known.end()) { const auto saved = f->second; known[d] = saved; }
                     else known.erase(d);
-                } else known.erase(d);
+                }
+                else known.erase(d);
                 break;
             default: known.erase(d); break;
             }
@@ -9302,7 +9461,7 @@ namespace pcn {
         }
         static bool same(const ConstMap& a, const ConstMap& b) {
             if (a.size() != b.size()) return false;
-            for (const auto& [k,v] : a) {
+            for (const auto& [k, v] : a) {
                 const auto it = b.find(k);
                 if (it == b.end() || !(v == it->second)) return false;
             }
@@ -9326,7 +9485,7 @@ namespace pcn {
                     for (auto t : tail.targetBlocks) predecessors[reg(t)].insert(reg(b.id));
             }
             std::unordered_set<std::uint32_t> reachable;
-            std::vector<std::uint32_t> todo{entry};
+            std::vector<std::uint32_t> todo{ entry };
             while (!todo.empty()) {
                 auto id = todo.back(); todo.pop_back();
                 if (!reachable.insert(id).second) continue;
@@ -9383,7 +9542,7 @@ namespace pcn {
                     for (auto t : tail.targetBlocks) predecessors[reg(t)].insert(reg(b.id));
             }
             std::unordered_set<std::uint32_t> reachable;
-            std::vector<std::uint32_t> work{entry};
+            std::vector<std::uint32_t> work{ entry };
             while (!work.empty()) {
                 const auto id = work.back(); work.pop_back();
                 if (!reachable.insert(id).second) continue;
@@ -9425,7 +9584,8 @@ namespace pcn {
                             const auto it = out.find(reg(i.args[0]));
                             if (it == out.end()) out.erase(d);
                             else { const auto saved = it->second; out[d] = saved; }
-                        } else out.erase(d);
+                        }
+                        else out.erase(d);
                     }
                     if (incoming[id] != in || outgoing[id] != out) {
                         incoming[id] = std::move(in); outgoing[id] = std::move(out); changed = true;
@@ -9439,7 +9599,7 @@ namespace pcn {
         // One block, one ordered instruction stream: all simplifications use
         // only facts known at the *point of execution*.
         std::pair<bool, ConstMap> simplifyBlock(IRBasicBlock& block, ConstMap known,
-                const RegTypes& types, bool enableCSE, TextMap literalText = {}) const {
+            const RegTypes& types, bool enableCSE, TextMap literalText = {}) const {
             bool changed = false;
             std::unordered_map<std::uint32_t, std::uint64_t> versions;
             struct Cached { VReg result; std::uint64_t resultVersion; };
@@ -9451,7 +9611,7 @@ namespace pcn {
                     if (cond || inst.targetBlocks[0] == inst.targetBlocks[1]) {
                         const auto target = cond && cond->value == 0 ? inst.targetBlocks[1] : inst.targetBlocks[0];
                         inst.op = IROpcode::Branch;
-                        inst.args.clear(); inst.targetBlocks = {target};
+                        inst.args.clear(); inst.targetBlocks = { target };
                         changed = true;
                     }
                 }
@@ -9475,7 +9635,7 @@ namespace pcn {
                         const auto a = inst.args[0], b = inst.args[1];
                         const auto av = knownValue(known, a), bv = knownValue(known, b);
                         const auto zero = [](std::optional<Constant> v) { return v && v->value == 0; };
-                        const auto one  = [](std::optional<Constant> v) { return v && v->value == 1; };
+                        const auto one = [](std::optional<Constant> v) { return v && v->value == 1; };
                         std::optional<VReg> replacement;
                         std::optional<std::int64_t> literal;
                         switch (inst.op) {
@@ -9528,8 +9688,9 @@ namespace pcn {
                         && prev->second.result != inst.dest) {
                         setCopy(inst, prev->second.result);
                         changed = true;
-                    } else {
-                        expressions[expressionKey] = {inst.dest, version(inst.dest) + 1};
+                    }
+                    else {
+                        expressions[expressionKey] = { inst.dest, version(inst.dest) + 1 };
                     }
                 }
                 // Compile-time UTF-8 literal specialization: operations are
@@ -9544,7 +9705,7 @@ namespace pcn {
                         if (inst.op == IROpcode::ByteCount && inst.args.size() == 1)
                             result = static_cast<std::int64_t>(a.size());
                         else if (inst.op == IROpcode::TextIsAscii && inst.args.size() == 1) {
-                            result = std::all_of(a.begin(), a.end(), [](unsigned char ch){return ch < 0x80u;}) ? 1 : 0;
+                            result = std::all_of(a.begin(), a.end(), [](unsigned char ch) {return ch < 0x80u; }) ? 1 : 0;
                         }
                         else if (inst.op == IROpcode::TextCodepointCount && inst.args.size() == 1) {
                             std::int64_t count = 0;
@@ -9600,26 +9761,26 @@ namespace pcn {
                                 }
                             }
                         }
-                        if (inst.op==IROpcode::TextSlice && inst.args.size()==3) {
-                            const auto start=knownValue(known,inst.args[1]);
-                            const auto length=knownValue(known,inst.args[2]);
-                            if (start && length && start->value>=0 && length->value>=0 &&
-                                static_cast<std::uint64_t>(start->value)<=a.size() &&
-                                static_cast<std::uint64_t>(length->value)<=a.size()-static_cast<std::size_t>(start->value)) {
-                                const auto begin=static_cast<std::size_t>(start->value);
-                                const auto end=begin+static_cast<std::size_t>(length->value);
-                                const auto boundary=[&](std::size_t at){
-                                    return at==a.size() ||
-                                        (static_cast<unsigned char>(a[at])&0xc0u)!=0x80u;
-                                };
+                        if (inst.op == IROpcode::TextSlice && inst.args.size() == 3) {
+                            const auto start = knownValue(known, inst.args[1]);
+                            const auto length = knownValue(known, inst.args[2]);
+                            if (start && length && start->value >= 0 && length->value >= 0 &&
+                                static_cast<std::uint64_t>(start->value) <= a.size() &&
+                                static_cast<std::uint64_t>(length->value) <= a.size() - static_cast<std::size_t>(start->value)) {
+                                const auto begin = static_cast<std::size_t>(start->value);
+                                const auto end = begin + static_cast<std::size_t>(length->value);
+                                const auto boundary = [&](std::size_t at) {
+                                    return at == a.size() ||
+                                        (static_cast<unsigned char>(a[at]) & 0xc0u) != 0x80u;
+                                    };
                                 if (boundary(begin) && boundary(end)) {
-                                    inst.op=IROpcode::ConstText;
-                                    inst.literalText=a.substr(begin,end-begin);
+                                    inst.op = IROpcode::ConstText;
+                                    inst.literalText = a.substr(begin, end - begin);
                                     inst.args.clear();
                                     inst.targetBlocks.clear();
-                                    inst.valueType=makeIRTextType();
-                                    inst.typeName="text";
-                                    changed=true;
+                                    inst.valueType = makeIRTextType();
+                                    inst.typeName = "text";
+                                    changed = true;
                                 }
                             }
                         }
@@ -9635,7 +9796,8 @@ namespace pcn {
                         const auto old = literalText.find(reg(inst.args[0]));
                         if (old == literalText.end()) literalText.erase(d);
                         else { const auto text = old->second; literalText[d] = text; }
-                    } else literalText.erase(d);
+                    }
+                    else literalText.erase(d);
                 }
                 // Foreign/user calls and mutable aggregate operations form
                 // alias/effect barriers. They may change caller-visible state
@@ -9651,7 +9813,7 @@ namespace pcn {
                 learn(inst, known);
                 if (inst.dest != VReg::None) ++versions[reg(inst.dest)];
             }
-            return {changed, std::move(known)};
+            return { changed, std::move(known) };
         }
 
         bool copyPropagate(IRFunction& fn) const {
@@ -9666,7 +9828,7 @@ namespace pcn {
                         v = it->second;
                     }
                     return v;
-                };
+                    };
                 // PHI inputs are selected on predecessor edges. The local block
                 // replacement table is not valid on those edges.
                 for (auto& inst : b.instructions) {
@@ -9684,7 +9846,7 @@ namespace pcn {
                     }
                     if (inst.op == IROpcode::Copy && inst.args.size() == 1 && inst.args[0] != inst.dest &&
                         (inst.valueType.kind == IRValueKind::Int64 || inst.valueType.kind == IRValueKind::Bool ||
-                         inst.valueType.kind == IRValueKind::Float32 || inst.valueType.kind == IRValueKind::Float64)) {
+                            inst.valueType.kind == IRValueKind::Float32 || inst.valueType.kind == IRValueKind::Float64)) {
                         replacements[d] = inst.args[0];
                     }
                 }
@@ -9695,7 +9857,7 @@ namespace pcn {
             std::unordered_map<std::uint32_t, std::size_t> uses;
             for (const auto& b : fn.blocks) {
                 for (const auto& phi : b.phiNodes)
-                    for (auto [pred,v] : phi.phiInputs) { (void)pred; ++uses[reg(v)]; }
+                    for (auto [pred, v] : phi.phiInputs) { (void)pred; ++uses[reg(v)]; }
                 for (const auto& i : b.instructions) for (auto v : i.args) ++uses[reg(v)];
             }
             bool changed = false;
@@ -9712,7 +9874,7 @@ namespace pcn {
                         i.valueType.kind != IRValueKind::Float32 && i.valueType.kind != IRValueKind::Float64)
                         return false;
                     return true;
-                }), b.instructions.end());
+                    }), b.instructions.end());
                 if (b.instructions.size() != oldSize) changed = true;
             }
             return changed;
@@ -9730,10 +9892,11 @@ namespace pcn {
                     if (sameReg && phi.dest != VReg::None && first != phi.dest) {
                         IRInstruction copy;
                         copy.op = IROpcode::Copy; copy.dest = phi.dest;
-                        copy.valueType = phi.valueType; copy.args = {first};
+                        copy.valueType = phi.valueType; copy.args = { first };
                         b.instructions.insert(b.instructions.begin(), std::move(copy));
                         changed = true;
-                    } else kept.push_back(phi);
+                    }
+                    else kept.push_back(phi);
                 }
                 b.phiNodes = std::move(kept);
             }
@@ -9744,7 +9907,7 @@ namespace pcn {
             std::unordered_map<std::uint32_t, const IRBasicBlock*> blocks;
             for (const auto& b : fn.blocks) blocks[reg(b.id)] = &b;
             std::unordered_set<std::uint32_t> live;
-            std::vector<std::uint32_t> work{reg(fn.blocks.front().id)};
+            std::vector<std::uint32_t> work{ reg(fn.blocks.front().id) };
             while (!work.empty()) {
                 const auto id = work.back(); work.pop_back();
                 if (!live.insert(id).second) continue;
@@ -9757,7 +9920,7 @@ namespace pcn {
             const auto before = fn.blocks.size();
             fn.blocks.erase(std::remove_if(fn.blocks.begin(), fn.blocks.end(), [&](const IRBasicBlock& b) {
                 return !live.contains(reg(b.id));
-            }), fn.blocks.end());
+                }), fn.blocks.end());
             std::unordered_map<std::uint32_t, std::set<std::uint32_t>> preds;
             for (const auto& b : fn.blocks) {
                 if (b.instructions.empty()) continue;
@@ -9770,7 +9933,7 @@ namespace pcn {
                 const auto oldSize = phi.phiInputs.size();
                 phi.phiInputs.erase(std::remove_if(phi.phiInputs.begin(), phi.phiInputs.end(), [&](const auto& input) {
                     return !preds[reg(b.id)].contains(reg(input.first));
-                }), phi.phiInputs.end());
+                    }), phi.phiInputs.end());
                 if (oldSize != phi.phiInputs.size()) changed = true;
             }
             return changed;
@@ -10136,8 +10299,8 @@ namespace pcn {
                         if (wlen <= 0) throw std::runtime_error("E0381 process.run invalid UTF-8");
                         wide.resize(static_cast<std::size_t>(wlen));
                         if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                                command.object->text.data(), static_cast<int>(command.object->text.size()),
-                                wide.data(), wlen)) throw std::runtime_error("E0381 process.run conversion failed");
+                            command.object->text.data(), static_cast<int>(command.object->text.size()),
+                            wide.data(), wlen)) throw std::runtime_error("E0381 process.run conversion failed");
                         wide.push_back(L'\0');
                         STARTUPINFOW startup{}; startup.cb = sizeof(startup);
                         PROCESS_INFORMATION child{};
@@ -10162,43 +10325,44 @@ namespace pcn {
                         break;
                     }
                     case IROpcode::FsExists: {
-                        const auto p=get(0);
-                        if (!p.object || p.object->typeName!="text" || p.object->text.empty() || p.object->text.find('\0')!=std::string::npos)
+                        const auto p = get(0);
+                        if (!p.object || p.object->typeName != "text" || p.object->text.empty() || p.object->text.find('\0') != std::string::npos)
                             throw std::runtime_error("E0365 fs.exists requires a valid path");
                         std::error_code ec;
-                        const auto exists=std::filesystem::exists(filesystemPathFromUtf8(p.object->text),ec);
+                        const auto exists = std::filesystem::exists(filesystemPathFromUtf8(p.object->text), ec);
                         if (ec && ec != std::errc::no_such_file_or_directory)
                             throw std::runtime_error("E0366 fs.exists filesystem error");
-                        set(scalar(exists ? 1 : 0));break;
+                        set(scalar(exists ? 1 : 0)); break;
                     }
                     case IROpcode::FsWriteText: {
-                        const auto path=get(0), data=get(1);
-                        if(!path.object || path.object->typeName!="text" || path.object->text.empty() || path.object->text.find('\0')!=std::string::npos)
+                        const auto path = get(0), data = get(1);
+                        if (!path.object || path.object->typeName != "text" || path.object->text.empty() || path.object->text.find('\0') != std::string::npos)
                             throw std::runtime_error("E0370 fs.write_text invalid path");
-                        if(!data.object || data.object->typeName!="text")
+                        if (!data.object || data.object->typeName != "text")
                             throw std::runtime_error("E0371 fs.write_text invalid content");
-                        constexpr std::size_t maxBytes=64u*1024u*1024u;
-                        if(data.object->text.size()>maxBytes)throw std::runtime_error("E0372 fs.write_text exceeds 64 MiB");
-                        std::ofstream file(filesystemPathFromUtf8(path.object->text),std::ios::binary|std::ios::trunc);
-                        if(file && !data.object->text.empty())file.write(data.object->text.data(),static_cast<std::streamsize>(data.object->text.size()));
-                        if(file)file.flush();
-                        set(scalar(file.good()?1:0));break;
+                        constexpr std::size_t maxBytes = 64u * 1024u * 1024u;
+                        if (data.object->text.size() > maxBytes)throw std::runtime_error("E0372 fs.write_text exceeds 64 MiB");
+                        std::ofstream file(filesystemPathFromUtf8(path.object->text), std::ios::binary | std::ios::trunc);
+                        if (file && !data.object->text.empty())file.write(data.object->text.data(), static_cast<std::streamsize>(data.object->text.size()));
+                        if (file)file.flush();
+                        set(scalar(file.good() ? 1 : 0)); break;
                     }
                     case IROpcode::FsReadText: {
-                        const auto p=get(0);
-                        if (!p.object || p.object->typeName!="text" || p.object->text.find('\0')!=std::string::npos)
+                        const auto p = get(0);
+                        if (!p.object || p.object->typeName != "text" || p.object->text.find('\0') != std::string::npos)
                             throw std::runtime_error("E0361 fs.read_text requires a valid path");
-                        std::ifstream file(filesystemPathFromUtf8(p.object->text),std::ios::binary);
-                        if (!file)throw std::runtime_error("E0362 fs.read_text failed to open file: "+p.object->text);
-                        constexpr std::size_t limit=64u*1024u*1024u;
-                        std::string body;std::array<char,16384> chunk{};
-                        while (file) { file.read(chunk.data(),static_cast<std::streamsize>(chunk.size()));auto n=file.gcount();
-                            if(n>0){ if (static_cast<std::size_t>(n)>limit-body.size())throw std::runtime_error("E0363 fs.read_text maximum 64MiB exceeded");body.append(chunk.data(),static_cast<std::size_t>(n));}
+                        std::ifstream file(filesystemPathFromUtf8(p.object->text), std::ios::binary);
+                        if (!file)throw std::runtime_error("E0362 fs.read_text failed to open file: " + p.object->text);
+                        constexpr std::size_t limit = 64u * 1024u * 1024u;
+                        std::string body; std::array<char, 16384> chunk{};
+                        while (file) {
+                            file.read(chunk.data(), static_cast<std::streamsize>(chunk.size())); auto n = file.gcount();
+                            if (n > 0) { if (static_cast<std::size_t>(n) > limit - body.size())throw std::runtime_error("E0363 fs.read_text maximum 64MiB exceeded"); body.append(chunk.data(), static_cast<std::size_t>(n)); }
                         }
-                        if(file.bad())throw std::runtime_error("E0364 fs.read_text I/O failure");
+                        if (file.bad())throw std::runtime_error("E0364 fs.read_text I/O failure");
                         // Match Win32 native strict-UTF8 file decoding semantics.
                         (void)Lexer(body);
-                        auto value=object("string");value.object->text=std::move(body);set(value);break;
+                        auto value = object("string"); value.object->text = std::move(body); set(value); break;
                     }
                     case IROpcode::TextStreamRead: {
                         std::string data;
@@ -10562,8 +10726,8 @@ namespace pcn {
             for (const auto& b : fn.blocks)for (const auto& i : b.instructions)
                 if (i.op == IROpcode::TextStreamWrite)out.outgoingArea = std::max(out.outgoingArea, 64u);
                 else if (i.op == IROpcode::TextStreamRead)out.outgoingArea = std::max(out.outgoingArea, 96u);
-                else if (i.op == IROpcode::FsReadText || i.op == IROpcode::FsExists || i.op == IROpcode::FsWriteText)out.outgoingArea=std::max(out.outgoingArea, 160u);
-                else if (i.op == IROpcode::ProcessRun)out.outgoingArea=std::max(out.outgoingArea, 320u);
+                else if (i.op == IROpcode::FsReadText || i.op == IROpcode::FsExists || i.op == IROpcode::FsWriteText)out.outgoingArea = std::max(out.outgoingArea, 160u);
+                else if (i.op == IROpcode::ProcessRun)out.outgoingArea = std::max(out.outgoingArea, 320u);
                 else if (i.op == IROpcode::StringAppend)out.outgoingArea = std::max(out.outgoingArea, 80u);
             std::uint32_t cursor = out.totalSlots * 8u;
             if (out.richReturn) { out.sretCellOffset = cursor + 8u; cursor = out.sretCellOffset; }
@@ -10804,244 +10968,244 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                                               // process.run(command_line: text) -> int exit status, -1 on launch/wait error.
                                                               // Unicode CreateProcessW; no shell. The child inherits stdout/stderr.
                                                               // Windows UTF-16 command line limit is 32767 chars including NUL.
-                                                              if (i.srcSlots.size()!=1 || i.valueType.kind!=IRValueKind::Int64 || fn.outgoingArea<320)
+                                                              if (i.srcSlots.size() != 1 || i.valueType.kind != IRValueKind::Int64 || fn.outgoingArea < 320)
                                                                   throw std::runtime_error("malformed native process.run");
-                                                              const auto getRsp=[&](int reg,std::int32_t disp){
-                                                                  b.push_back(static_cast<std::uint8_t>(0x48|(reg>=8?4:0)));
-                                                                  b.insert(b.end(),{0x8B,static_cast<std::uint8_t>(0x84|((reg&7)<<3)),0x24});put32(b,disp);
-                                                              };
-                                                              const auto addressRsp=[&](int reg,std::int32_t disp){
-                                                                  b.push_back(static_cast<std::uint8_t>(0x48|(reg>=8?4:0)));
-                                                                  b.insert(b.end(),{0x8D,static_cast<std::uint8_t>(0x84|((reg&7)<<3)),0x24});put32(b,disp);
-                                                              };
-                                                              const auto trapIfZero=[&]{
-                                                                  b.insert(b.end(),{0x48,0x85,0xC0});auto good=emitLocalJcc(b,0x85);
-                                                                  b.insert(b.end(),{0x0F,0x0B});patchLocal(b,good,b.size());
-                                                              };
+                                                              const auto getRsp = [&](int reg, std::int32_t disp) {
+                                                                  b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 4 : 0)));
+                                                                  b.insert(b.end(), { 0x8B,static_cast<std::uint8_t>(0x84 | ((reg & 7) << 3)),0x24 }); put32(b, disp);
+                                                                  };
+                                                              const auto addressRsp = [&](int reg, std::int32_t disp) {
+                                                                  b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 4 : 0)));
+                                                                  b.insert(b.end(), { 0x8D,static_cast<std::uint8_t>(0x84 | ((reg & 7) << 3)),0x24 }); put32(b, disp);
+                                                                  };
+                                                              const auto trapIfZero = [&] {
+                                                                  b.insert(b.end(), { 0x48,0x85,0xC0 }); auto good = emitLocalJcc(b, 0x85);
+                                                                  b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, good, b.size());
+                                                                  };
                                                               // RSP+80 UTF8 ptr, +88 byte count, +96 WCHAR count, +104 heap,
                                                               // +112 WCHAR ptr, +120 DWORD child exit, +128 final result.
                                                               // STARTUPINFOW at RSP+144 (104 bytes), PROCESS_INFORMATION +256 (24).
-                                                              loadSlot(b,10,fn,i.srcSlots[0]);
-                                                              loadMem(b,0,10,0,8,false);storeRspRax(b,80);
-                                                              loadMem(b,0,10,8,8,false);storeRspRax(b,88);
-                                                              getRsp(0,88);trapIfZero();movImm(b,10,32760);
-                                                              b.insert(b.end(),{0x4C,0x39,0xD0});auto within=emitLocalJcc(b,0x86);
-                                                              b.insert(b.end(),{0x0F,0x0B});patchLocal(b,within,b.size());
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]);
+                                                              loadMem(b, 0, 10, 0, 8, false); storeRspRax(b, 80);
+                                                              loadMem(b, 0, 10, 8, 8, false); storeRspRax(b, 88);
+                                                              getRsp(0, 88); trapIfZero(); movImm(b, 10, 32760);
+                                                              b.insert(b.end(), { 0x4C,0x39,0xD0 }); auto within = emitLocalJcc(b, 0x86);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, within, b.size());
                                                               // Reject embedded NUL before passing through Win32 API.
-                                                              getRsp(8,80);getRsp(9,88);
-                                                              const auto scan=b.size();
-                                                              b.insert(b.end(),{0x4D,0x85,0xC9});auto scanned=emitLocalJcc(b,0x84);
-                                                              b.insert(b.end(),{0x41,0x80,0x38,0x00});auto noNul=emitLocalJcc(b,0x85);
-                                                              b.insert(b.end(),{0x0F,0x0B});patchLocal(b,noNul,b.size());
-                                                              b.insert(b.end(),{0x49,0xFF,0xC0,0x49,0xFF,0xC9});
-                                                              auto scanAgain=emitLocalJmp(b);patchLocal(b,scanAgain,scan);
-                                                              patchLocal(b,scanned,b.size());
+                                                              getRsp(8, 80); getRsp(9, 88);
+                                                              const auto scan = b.size();
+                                                              b.insert(b.end(), { 0x4D,0x85,0xC9 }); auto scanned = emitLocalJcc(b, 0x84);
+                                                              b.insert(b.end(), { 0x41,0x80,0x38,0x00 }); auto noNul = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, noNul, b.size());
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC0,0x49,0xFF,0xC9 });
+                                                              auto scanAgain = emitLocalJmp(b); patchLocal(b, scanAgain, scan);
+                                                              patchLocal(b, scanned, b.size());
                                                               // UTF-8 -> UTF-16, strict conversion. Convert to writable buffer.
-                                                              movImm(b,1,65001);movImm(b,2,8);getRsp(8,80);getRsp(9,88);
-                                                              movImm(b,0,0);storeRspRax(b,32);storeRspRax(b,40);
-                                                              emitImportedCall(b,"MultiByteToWideChar",imports);trapIfZero();storeRspRax(b,96);
-                                                              emitImportedCall(b,"GetProcessHeap",imports);trapIfZero();storeRspRax(b,104);
-                                                              movReg(b,1,0);movImm(b,2,8);getRsp(8,96);
-                                                              b.insert(b.end(),{0x49,0xFF,0xC0,0x49,0xD1,0xE0});
-                                                              emitImportedCall(b,"HeapAlloc",imports);trapIfZero();storeRspRax(b,112);
-                                                              movImm(b,1,65001);movImm(b,2,8);getRsp(8,80);getRsp(9,88);
-                                                              getRsp(0,112);storeRspRax(b,32);getRsp(0,96);storeRspRax(b,40);
-                                                              emitImportedCall(b,"MultiByteToWideChar",imports);trapIfZero();
-                                                              getRsp(10,112);getRsp(8,96);
-                                                              b.insert(b.end(),{0x49,0xD1,0xE0,0x4D,0x01,0xC2});
-                                                              movImm(b,0,0);storeMem(b,10,0,0,2);
+                                                              movImm(b, 1, 65001); movImm(b, 2, 8); getRsp(8, 80); getRsp(9, 88);
+                                                              movImm(b, 0, 0); storeRspRax(b, 32); storeRspRax(b, 40);
+                                                              emitImportedCall(b, "MultiByteToWideChar", imports); trapIfZero(); storeRspRax(b, 96);
+                                                              emitImportedCall(b, "GetProcessHeap", imports); trapIfZero(); storeRspRax(b, 104);
+                                                              movReg(b, 1, 0); movImm(b, 2, 8); getRsp(8, 96);
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC0,0x49,0xD1,0xE0 });
+                                                              emitImportedCall(b, "HeapAlloc", imports); trapIfZero(); storeRspRax(b, 112);
+                                                              movImm(b, 1, 65001); movImm(b, 2, 8); getRsp(8, 80); getRsp(9, 88);
+                                                              getRsp(0, 112); storeRspRax(b, 32); getRsp(0, 96); storeRspRax(b, 40);
+                                                              emitImportedCall(b, "MultiByteToWideChar", imports); trapIfZero();
+                                                              getRsp(10, 112); getRsp(8, 96);
+                                                              b.insert(b.end(), { 0x49,0xD1,0xE0,0x4D,0x01,0xC2 });
+                                                              movImm(b, 0, 0); storeMem(b, 10, 0, 0, 2);
                                                               // Zero and initialize STARTUPINFOW and PROCESS_INFORMATION.
-                                                              addressRsp(10,144);movImm(b,0,0);
-                                                              for(int off=0;off<104;off+=8)storeMem(b,10,off,0,8);
-                                                              movImm(b,0,104);storeMem(b,10,0,0,8);
-                                                              addressRsp(10,256);movImm(b,0,0);
-                                                              for(int off=0;off<24;off+=8)storeMem(b,10,off,0,8);
-                                                              movImm(b,0,~0ull);storeRspRax(b,128);
+                                                              addressRsp(10, 144); movImm(b, 0, 0);
+                                                              for (int off = 0; off < 104; off += 8)storeMem(b, 10, off, 0, 8);
+                                                              movImm(b, 0, 104); storeMem(b, 10, 0, 0, 8);
+                                                              addressRsp(10, 256); movImm(b, 0, 0);
+                                                              for (int off = 0; off < 24; off += 8)storeMem(b, 10, off, 0, 8);
+                                                              movImm(b, 0, ~0ull); storeRspRax(b, 128);
                                                               // CreateProcessW(NULL, writable_cmd, NULL, NULL, TRUE, 0,
                                                               //                NULL, NULL, &startup, &process).
-                                                              movImm(b,0,1);storeRspRax(b,32);
-                                                              movImm(b,0,0);storeRspRax(b,40);storeRspRax(b,48);storeRspRax(b,56);
-                                                              addressRsp(0,144);storeRspRax(b,64);
-                                                              addressRsp(0,256);storeRspRax(b,72);
-                                                              movImm(b,1,0);getRsp(2,112);movImm(b,8,0);movImm(b,9,0);
-                                                              emitImportedCall(b,"CreateProcessW",imports);
-                                                              b.insert(b.end(),{0x48,0x85,0xC0});auto noChild=emitLocalJcc(b,0x84);
-                                                              addressRsp(10,256);loadMem(b,1,10,0,8,false);
-                                                              movImm(b,2,0xFFFFFFFFu);
-                                                              emitImportedCall(b,"WaitForSingleObject",imports);
+                                                              movImm(b, 0, 1); storeRspRax(b, 32);
+                                                              movImm(b, 0, 0); storeRspRax(b, 40); storeRspRax(b, 48); storeRspRax(b, 56);
+                                                              addressRsp(0, 144); storeRspRax(b, 64);
+                                                              addressRsp(0, 256); storeRspRax(b, 72);
+                                                              movImm(b, 1, 0); getRsp(2, 112); movImm(b, 8, 0); movImm(b, 9, 0);
+                                                              emitImportedCall(b, "CreateProcessW", imports);
+                                                              b.insert(b.end(), { 0x48,0x85,0xC0 }); auto noChild = emitLocalJcc(b, 0x84);
+                                                              addressRsp(10, 256); loadMem(b, 1, 10, 0, 8, false);
+                                                              movImm(b, 2, 0xFFFFFFFFu);
+                                                              emitImportedCall(b, "WaitForSingleObject", imports);
                                                               // WAIT_FAILED = 0xFFFFFFFF, WAIT_OBJECT_0 = 0.
-                                                              b.insert(b.end(),{0x83,0xF8,0x00});auto badWait=emitLocalJcc(b,0x85);
-                                                              addressRsp(10,256);loadMem(b,1,10,0,8,false);
-                                                              addressRsp(2,120);movImm(b,0,0);storeRspRax(b,120);
-                                                              emitImportedCall(b,"GetExitCodeProcess",imports);
-                                                              b.insert(b.end(),{0x48,0x85,0xC0});auto badExit=emitLocalJcc(b,0x84);
-                                                              getRsp(0,120);storeRspRax(b,128);
-                                                              patchLocal(b,badWait,b.size());patchLocal(b,badExit,b.size());
-                                                              addressRsp(10,256);loadMem(b,1,10,8,8,false);
-                                                              emitImportedCall(b,"CloseHandle",imports);
-                                                              addressRsp(10,256);loadMem(b,1,10,0,8,false);
-                                                              emitImportedCall(b,"CloseHandle",imports);
-                                                              patchLocal(b,noChild,b.size());
+                                                              b.insert(b.end(), { 0x83,0xF8,0x00 }); auto badWait = emitLocalJcc(b, 0x85);
+                                                              addressRsp(10, 256); loadMem(b, 1, 10, 0, 8, false);
+                                                              addressRsp(2, 120); movImm(b, 0, 0); storeRspRax(b, 120);
+                                                              emitImportedCall(b, "GetExitCodeProcess", imports);
+                                                              b.insert(b.end(), { 0x48,0x85,0xC0 }); auto badExit = emitLocalJcc(b, 0x84);
+                                                              getRsp(0, 120); storeRspRax(b, 128);
+                                                              patchLocal(b, badWait, b.size()); patchLocal(b, badExit, b.size());
+                                                              addressRsp(10, 256); loadMem(b, 1, 10, 8, 8, false);
+                                                              emitImportedCall(b, "CloseHandle", imports);
+                                                              addressRsp(10, 256); loadMem(b, 1, 10, 0, 8, false);
+                                                              emitImportedCall(b, "CloseHandle", imports);
+                                                              patchLocal(b, noChild, b.size());
                                                               // Always release writable UTF-16 buffer; preserve result.
-                                                              getRsp(1,104);movImm(b,2,0);getRsp(8,112);
-                                                              emitImportedCall(b,"HeapFree",imports);
-                                                              getRsp(0,128);storeSlot(b,0,fn,i.destSlot);break;
+                                                              getRsp(1, 104); movImm(b, 2, 0); getRsp(8, 112);
+                                                              emitImportedCall(b, "HeapFree", imports);
+                                                              getRsp(0, 128); storeSlot(b, 0, fn, i.destSlot); break;
                                                           }
                                                           case PMIROpcode::FsWriteText: {
                                                               // write_text(path: text, bytes: text) -> bool.
                                                               // Strict UTF-8 path conversion, bounded 64MiB data,
                                                               // checked partial writes, deterministic handle cleanup.
-                                                              if (i.srcSlots.size()!=2 || i.valueType.kind!=IRValueKind::Bool || fn.outgoingArea<160)
+                                                              if (i.srcSlots.size() != 2 || i.valueType.kind != IRValueKind::Bool || fn.outgoingArea < 160)
                                                                   throw std::runtime_error("malformed native fs.write_text");
-                                                              const auto getRsp=[&](int reg,std::int32_t disp){
-                                                                  b.push_back(static_cast<std::uint8_t>(0x48|(reg>=8?4:0)));
-                                                                  b.insert(b.end(),{0x8B,static_cast<std::uint8_t>(0x84|((reg&7)<<3)),0x24});put32(b,disp);
-                                                              };
-                                                              const auto addressRsp=[&](int reg,std::int32_t disp){
-                                                                  b.push_back(static_cast<std::uint8_t>(0x48|(reg>=8?4:0)));
-                                                                  b.insert(b.end(),{0x8D,static_cast<std::uint8_t>(0x84|((reg&7)<<3)),0x24});put32(b,disp);
-                                                              };
-                                                              const auto trapIfZero=[&]{b.insert(b.end(),{0x48,0x85,0xC0});auto ok=emitLocalJcc(b,0x85);b.insert(b.end(),{0x0F,0x0B});patchLocal(b,ok,b.size());};
+                                                              const auto getRsp = [&](int reg, std::int32_t disp) {
+                                                                  b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 4 : 0)));
+                                                                  b.insert(b.end(), { 0x8B,static_cast<std::uint8_t>(0x84 | ((reg & 7) << 3)),0x24 }); put32(b, disp);
+                                                                  };
+                                                              const auto addressRsp = [&](int reg, std::int32_t disp) {
+                                                                  b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 4 : 0)));
+                                                                  b.insert(b.end(), { 0x8D,static_cast<std::uint8_t>(0x84 | ((reg & 7) << 3)),0x24 }); put32(b, disp);
+                                                                  };
+                                                              const auto trapIfZero = [&] {b.insert(b.end(), { 0x48,0x85,0xC0 }); auto ok = emitLocalJcc(b, 0x85); b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, ok, b.size()); };
                                                               // scratch rsp+64 path ptr, +72 path bytes, +80 wide len,
                                                               // +88 wide ptr, +96 contents ptr, +104 contents len,
                                                               // +112 DWORD written, +120 offset, +128 heap,
                                                               // +136 file handle, +144 success flag.
-                                                              loadSlot(b,10,fn,i.srcSlots[0]);
-                                                              loadMem(b,0,10,0,8,false);storeRspRax(b,64);
-                                                              loadMem(b,0,10,8,8,false);storeRspRax(b,72);
-                                                              loadSlot(b,10,fn,i.srcSlots[1]);
-                                                              loadMem(b,0,10,0,8,false);storeRspRax(b,96);
-                                                              loadMem(b,0,10,8,8,false);storeRspRax(b,104);
-                                                              getRsp(0,104);movImm(b,10,64ull*1024ull*1024ull);
-                                                              b.insert(b.end(),{0x4C,0x39,0xD0});auto dataOk=emitLocalJcc(b,0x86);
-                                                              b.insert(b.end(),{0x0F,0x0B});patchLocal(b,dataOk,b.size());
-                                                              getRsp(0,72);trapIfZero();movImm(b,10,0x7FFFFFFFull);
-                                                              b.insert(b.end(),{0x4C,0x39,0xD0});auto fit=emitLocalJcc(b,0x86);
-                                                              b.insert(b.end(),{0x0F,0x0B});patchLocal(b,fit,b.size());
-                                                              getRsp(8,64);getRsp(9,72);
-                                                              const auto scan=b.size();
-                                                              b.insert(b.end(),{0x4D,0x85,0xC9});auto scanned=emitLocalJcc(b,0x84);
-                                                              b.insert(b.end(),{0x41,0x80,0x38,0x00});auto notNul=emitLocalJcc(b,0x85);
-                                                              b.insert(b.end(),{0x0F,0x0B});patchLocal(b,notNul,b.size());
-                                                              b.insert(b.end(),{0x49,0xFF,0xC0,0x49,0xFF,0xC9});
-                                                              auto scanNext=emitLocalJmp(b);patchLocal(b,scanNext,scan);
-                                                              patchLocal(b,scanned,b.size());
-                                                              movImm(b,1,65001);movImm(b,2,8);getRsp(8,64);getRsp(9,72);
-                                                              movImm(b,0,0);storeRspRax(b,32);storeRspRax(b,40);
-                                                              emitImportedCall(b,"MultiByteToWideChar",imports);trapIfZero();storeRspRax(b,80);
-                                                              emitImportedCall(b,"GetProcessHeap",imports);trapIfZero();storeRspRax(b,128);
-                                                              movReg(b,1,0);movImm(b,2,8);getRsp(8,80);
-                                                              b.insert(b.end(),{0x49,0xFF,0xC0,0x49,0xD1,0xE0});
-                                                              emitImportedCall(b,"HeapAlloc",imports);trapIfZero();storeRspRax(b,88);
-                                                              movImm(b,1,65001);movImm(b,2,8);getRsp(8,64);getRsp(9,72);
-                                                              getRsp(0,88);storeRspRax(b,32);getRsp(0,80);storeRspRax(b,40);
-                                                              emitImportedCall(b,"MultiByteToWideChar",imports);trapIfZero();
-                                                              getRsp(1,88);movImm(b,2,0x40000000u);movImm(b,8,0);movImm(b,9,0);
-                                                              movImm(b,0,2);storeRspRax(b,32);movImm(b,0,0x80);storeRspRax(b,40);
-                                                              movImm(b,0,0);storeRspRax(b,48);
-                                                              emitImportedCall(b,"CreateFileW",imports);
-                                                              b.insert(b.end(),{0x48,0x83,0xF8,0xFF});auto openGood=emitLocalJcc(b,0x85);
-                                                              movImm(b,0,0);storeRspRax(b,144);
-                                                              auto skipWrite=emitLocalJmp(b);
-                                                              patchLocal(b,openGood,b.size());storeRspRax(b,136);
-                                                              movImm(b,0,1);storeRspRax(b,144);
-                                                              movImm(b,0,0);storeRspRax(b,120);
-                                                              const auto loop=b.size();
-                                                              getRsp(0,104);getRsp(10,120);
-                                                              b.insert(b.end(),{0x4C,0x39,0xD0});auto complete=emitLocalJcc(b,0x84);
-                                                              b.insert(b.end(),{0x4C,0x29,0xD0});movReg(b,8,0);
-                                                              movImm(b,10,65536);b.insert(b.end(),{0x4D,0x39,0xD0});
-                                                              auto smallChunkBranch=emitLocalJcc(b,0x86);movReg(b,8,10);patchLocal(b,smallChunkBranch,b.size());
-                                                              getRsp(1,136);getRsp(2,96);getRsp(0,120);
-                                                              b.insert(b.end(),{0x48,0x01,0xC2});
-                                                              addressRsp(9,112);movImm(b,0,0);storeRspRax(b,32);storeRspRax(b,112);
-                                                              emitImportedCall(b,"WriteFile",imports);
-                                                              b.insert(b.end(),{0x48,0x85,0xC0});auto writeFail=emitLocalJcc(b,0x84);
-                                                              getRsp(0,112);b.insert(b.end(),{0x48,0x85,0xC0});
-                                                              auto zeroBytes=emitLocalJcc(b,0x84);
-                                                              b.insert(b.end(),{0x48,0x01,0x84,0x24});put32(b,120);
-                                                              auto repeat=emitLocalJmp(b);patchLocal(b,repeat,loop);
-                                                              patchLocal(b,writeFail,b.size());patchLocal(b,zeroBytes,b.size());
-                                                              movImm(b,0,0);storeRspRax(b,144);
-                                                              patchLocal(b,complete,b.size());
-                                                              getRsp(1,136);emitImportedCall(b,"CloseHandle",imports);
-                                                              b.insert(b.end(),{0x48,0x85,0xC0});auto closeOk=emitLocalJcc(b,0x85);
-                                                              movImm(b,0,0);storeRspRax(b,144);
-                                                              patchLocal(b,closeOk,b.size());
-                                                              patchLocal(b,skipWrite,b.size());
-                                                              getRsp(1,128);movImm(b,2,0);getRsp(8,88);
-                                                              emitImportedCall(b,"HeapFree",imports);trapIfZero();
-                                                              getRsp(0,144);storeSlot(b,0,fn,i.destSlot);
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]);
+                                                              loadMem(b, 0, 10, 0, 8, false); storeRspRax(b, 64);
+                                                              loadMem(b, 0, 10, 8, 8, false); storeRspRax(b, 72);
+                                                              loadSlot(b, 10, fn, i.srcSlots[1]);
+                                                              loadMem(b, 0, 10, 0, 8, false); storeRspRax(b, 96);
+                                                              loadMem(b, 0, 10, 8, 8, false); storeRspRax(b, 104);
+                                                              getRsp(0, 104); movImm(b, 10, 64ull * 1024ull * 1024ull);
+                                                              b.insert(b.end(), { 0x4C,0x39,0xD0 }); auto dataOk = emitLocalJcc(b, 0x86);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, dataOk, b.size());
+                                                              getRsp(0, 72); trapIfZero(); movImm(b, 10, 0x7FFFFFFFull);
+                                                              b.insert(b.end(), { 0x4C,0x39,0xD0 }); auto fit = emitLocalJcc(b, 0x86);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, fit, b.size());
+                                                              getRsp(8, 64); getRsp(9, 72);
+                                                              const auto scan = b.size();
+                                                              b.insert(b.end(), { 0x4D,0x85,0xC9 }); auto scanned = emitLocalJcc(b, 0x84);
+                                                              b.insert(b.end(), { 0x41,0x80,0x38,0x00 }); auto notNul = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, notNul, b.size());
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC0,0x49,0xFF,0xC9 });
+                                                              auto scanNext = emitLocalJmp(b); patchLocal(b, scanNext, scan);
+                                                              patchLocal(b, scanned, b.size());
+                                                              movImm(b, 1, 65001); movImm(b, 2, 8); getRsp(8, 64); getRsp(9, 72);
+                                                              movImm(b, 0, 0); storeRspRax(b, 32); storeRspRax(b, 40);
+                                                              emitImportedCall(b, "MultiByteToWideChar", imports); trapIfZero(); storeRspRax(b, 80);
+                                                              emitImportedCall(b, "GetProcessHeap", imports); trapIfZero(); storeRspRax(b, 128);
+                                                              movReg(b, 1, 0); movImm(b, 2, 8); getRsp(8, 80);
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC0,0x49,0xD1,0xE0 });
+                                                              emitImportedCall(b, "HeapAlloc", imports); trapIfZero(); storeRspRax(b, 88);
+                                                              movImm(b, 1, 65001); movImm(b, 2, 8); getRsp(8, 64); getRsp(9, 72);
+                                                              getRsp(0, 88); storeRspRax(b, 32); getRsp(0, 80); storeRspRax(b, 40);
+                                                              emitImportedCall(b, "MultiByteToWideChar", imports); trapIfZero();
+                                                              getRsp(1, 88); movImm(b, 2, 0x40000000u); movImm(b, 8, 0); movImm(b, 9, 0);
+                                                              movImm(b, 0, 2); storeRspRax(b, 32); movImm(b, 0, 0x80); storeRspRax(b, 40);
+                                                              movImm(b, 0, 0); storeRspRax(b, 48);
+                                                              emitImportedCall(b, "CreateFileW", imports);
+                                                              b.insert(b.end(), { 0x48,0x83,0xF8,0xFF }); auto openGood = emitLocalJcc(b, 0x85);
+                                                              movImm(b, 0, 0); storeRspRax(b, 144);
+                                                              auto skipWrite = emitLocalJmp(b);
+                                                              patchLocal(b, openGood, b.size()); storeRspRax(b, 136);
+                                                              movImm(b, 0, 1); storeRspRax(b, 144);
+                                                              movImm(b, 0, 0); storeRspRax(b, 120);
+                                                              const auto loop = b.size();
+                                                              getRsp(0, 104); getRsp(10, 120);
+                                                              b.insert(b.end(), { 0x4C,0x39,0xD0 }); auto complete = emitLocalJcc(b, 0x84);
+                                                              b.insert(b.end(), { 0x4C,0x29,0xD0 }); movReg(b, 8, 0);
+                                                              movImm(b, 10, 65536); b.insert(b.end(), { 0x4D,0x39,0xD0 });
+                                                              auto smallChunkBranch = emitLocalJcc(b, 0x86); movReg(b, 8, 10); patchLocal(b, smallChunkBranch, b.size());
+                                                              getRsp(1, 136); getRsp(2, 96); getRsp(0, 120);
+                                                              b.insert(b.end(), { 0x48,0x01,0xC2 });
+                                                              addressRsp(9, 112); movImm(b, 0, 0); storeRspRax(b, 32); storeRspRax(b, 112);
+                                                              emitImportedCall(b, "WriteFile", imports);
+                                                              b.insert(b.end(), { 0x48,0x85,0xC0 }); auto writeFail = emitLocalJcc(b, 0x84);
+                                                              getRsp(0, 112); b.insert(b.end(), { 0x48,0x85,0xC0 });
+                                                              auto zeroBytes = emitLocalJcc(b, 0x84);
+                                                              b.insert(b.end(), { 0x48,0x01,0x84,0x24 }); put32(b, 120);
+                                                              auto repeat = emitLocalJmp(b); patchLocal(b, repeat, loop);
+                                                              patchLocal(b, writeFail, b.size()); patchLocal(b, zeroBytes, b.size());
+                                                              movImm(b, 0, 0); storeRspRax(b, 144);
+                                                              patchLocal(b, complete, b.size());
+                                                              getRsp(1, 136); emitImportedCall(b, "CloseHandle", imports);
+                                                              b.insert(b.end(), { 0x48,0x85,0xC0 }); auto closeOk = emitLocalJcc(b, 0x85);
+                                                              movImm(b, 0, 0); storeRspRax(b, 144);
+                                                              patchLocal(b, closeOk, b.size());
+                                                              patchLocal(b, skipWrite, b.size());
+                                                              getRsp(1, 128); movImm(b, 2, 0); getRsp(8, 88);
+                                                              emitImportedCall(b, "HeapFree", imports); trapIfZero();
+                                                              getRsp(0, 144); storeSlot(b, 0, fn, i.destSlot);
                                                               break;
                                                           }
                                                           case PMIROpcode::FsExists: {
                                                               // Return true if a UTF-8 path exists (including directories).
                                                               // Only invalid argument / encoding / allocation traps;
                                                               // a missing path gives false rather than a process trap.
-                                                              if (i.srcSlots.size()!=1 || i.valueType.kind!=IRValueKind::Bool)
+                                                              if (i.srcSlots.size() != 1 || i.valueType.kind != IRValueKind::Bool)
                                                                   throw std::runtime_error("fs.exists expects one path and yields bool");
                                                               if (fn.outgoingArea < 160)throw std::runtime_error("fs.exists needs Win64 call space");
-                                                              const auto getRsp=[&](int reg,std::int32_t disp){
-                                                                  b.push_back(static_cast<std::uint8_t>(0x48|(reg>=8?4:0)));
-                                                                  b.insert(b.end(),{0x8B,static_cast<std::uint8_t>(0x84|((reg&7)<<3)),0x24});put32(b,disp);
-                                                              };
-                                                              const auto trapIfZero=[&]{b.insert(b.end(),{0x48,0x85,0xC0});auto ok=emitLocalJcc(b,0x85);b.insert(b.end(),{0x0F,0x0B});patchLocal(b,ok,b.size());};
-                                                              loadSlot(b,10,fn,i.srcSlots[0]);
-                                                              loadMem(b,0,10,0,8,false);storeRspRax(b,64);
-                                                              loadMem(b,0,10,8,8,false);storeRspRax(b,72);
-                                                              getRsp(0,72);trapIfZero();movImm(b,10,0x7FFFFFFFull);
-                                                              b.insert(b.end(),{0x4C,0x39,0xD0});auto fits=emitLocalJcc(b,0x86);
-                                                              b.insert(b.end(),{0x0F,0x0B});patchLocal(b,fits,b.size());
+                                                              const auto getRsp = [&](int reg, std::int32_t disp) {
+                                                                  b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 4 : 0)));
+                                                                  b.insert(b.end(), { 0x8B,static_cast<std::uint8_t>(0x84 | ((reg & 7) << 3)),0x24 }); put32(b, disp);
+                                                                  };
+                                                              const auto trapIfZero = [&] {b.insert(b.end(), { 0x48,0x85,0xC0 }); auto ok = emitLocalJcc(b, 0x85); b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, ok, b.size()); };
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]);
+                                                              loadMem(b, 0, 10, 0, 8, false); storeRspRax(b, 64);
+                                                              loadMem(b, 0, 10, 8, 8, false); storeRspRax(b, 72);
+                                                              getRsp(0, 72); trapIfZero(); movImm(b, 10, 0x7FFFFFFFull);
+                                                              b.insert(b.end(), { 0x4C,0x39,0xD0 }); auto fits = emitLocalJcc(b, 0x86);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, fits, b.size());
                                                               // Reject embedded NUL bytes in a text path, rather than
                                                               // silently opening a truncated Win32 path.
-                                                              getRsp(8,64);getRsp(9,72);
-                                                              const auto pathScan=b.size();
-                                                              b.insert(b.end(),{0x4D,0x85,0xC9});auto scanDone=emitLocalJcc(b,0x84);
-                                                              b.insert(b.end(),{0x41,0x80,0x38,0x00});auto nonNull=emitLocalJcc(b,0x85);
-                                                              b.insert(b.end(),{0x0F,0x0B});patchLocal(b,nonNull,b.size());
-                                                              b.insert(b.end(),{0x49,0xFF,0xC0,0x49,0xFF,0xC9});
-                                                              const auto scanAgain=emitLocalJmp(b);patchLocal(b,scanAgain,pathScan);
-                                                              patchLocal(b,scanDone,b.size());
+                                                              getRsp(8, 64); getRsp(9, 72);
+                                                              const auto pathScan = b.size();
+                                                              b.insert(b.end(), { 0x4D,0x85,0xC9 }); auto scanDone = emitLocalJcc(b, 0x84);
+                                                              b.insert(b.end(), { 0x41,0x80,0x38,0x00 }); auto nonNull = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, nonNull, b.size());
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC0,0x49,0xFF,0xC9 });
+                                                              const auto scanAgain = emitLocalJmp(b); patchLocal(b, scanAgain, pathScan);
+                                                              patchLocal(b, scanDone, b.size());
                                                               // Determine wide length with strict UTF-8 conversion.
-                                                              movImm(b,1,65001);movImm(b,2,8);getRsp(8,64);getRsp(9,72);
-                                                              movImm(b,0,0);storeRspRax(b,32);storeRspRax(b,40);
-                                                              emitImportedCall(b,"MultiByteToWideChar",imports);trapIfZero();storeRspRax(b,80);
-                                                              emitImportedCall(b,"GetProcessHeap",imports);trapIfZero();storeRspRax(b,128);
-                                                              movReg(b,1,0);movImm(b,2,8);getRsp(8,80);
-                                                              b.insert(b.end(),{0x49,0xFF,0xC0,0x49,0xD1,0xE0});
-                                                              emitImportedCall(b,"HeapAlloc",imports);trapIfZero();storeRspRax(b,88);
-                                                              movImm(b,1,65001);movImm(b,2,8);getRsp(8,64);getRsp(9,72);
-                                                              getRsp(0,88);storeRspRax(b,32);getRsp(0,80);storeRspRax(b,40);
-                                                              emitImportedCall(b,"MultiByteToWideChar",imports);trapIfZero();
-                                                              getRsp(1,88);emitImportedCall(b,"GetFileAttributesW",imports);
+                                                              movImm(b, 1, 65001); movImm(b, 2, 8); getRsp(8, 64); getRsp(9, 72);
+                                                              movImm(b, 0, 0); storeRspRax(b, 32); storeRspRax(b, 40);
+                                                              emitImportedCall(b, "MultiByteToWideChar", imports); trapIfZero(); storeRspRax(b, 80);
+                                                              emitImportedCall(b, "GetProcessHeap", imports); trapIfZero(); storeRspRax(b, 128);
+                                                              movReg(b, 1, 0); movImm(b, 2, 8); getRsp(8, 80);
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC0,0x49,0xD1,0xE0 });
+                                                              emitImportedCall(b, "HeapAlloc", imports); trapIfZero(); storeRspRax(b, 88);
+                                                              movImm(b, 1, 65001); movImm(b, 2, 8); getRsp(8, 64); getRsp(9, 72);
+                                                              getRsp(0, 88); storeRspRax(b, 32); getRsp(0, 80); storeRspRax(b, 40);
+                                                              emitImportedCall(b, "MultiByteToWideChar", imports); trapIfZero();
+                                                              getRsp(1, 88); emitImportedCall(b, "GetFileAttributesW", imports);
                                                               // INVALID_FILE_ATTRIBUTES = 0xffffffff. For nonexistent
                                                               // path return false, otherwise true.
-                                                              b.insert(b.end(),{0x3D,0xFF,0xFF,0xFF,0xFF,0x0F,0x95,0xC0,0x0F,0xB6,0xC0});
-                                                              storeSlot(b,0,fn,i.destSlot);
-                                                              getRsp(1,128);movImm(b,2,0);getRsp(8,88);
-                                                              emitImportedCall(b,"HeapFree",imports);trapIfZero();
+                                                              b.insert(b.end(), { 0x3D,0xFF,0xFF,0xFF,0xFF,0x0F,0x95,0xC0,0x0F,0xB6,0xC0 });
+                                                              storeSlot(b, 0, fn, i.destSlot);
+                                                              getRsp(1, 128); movImm(b, 2, 0); getRsp(8, 88);
+                                                              emitImportedCall(b, "HeapFree", imports); trapIfZero();
                                                               break;
                                                           }
                                                           case PMIROpcode::FsReadText: {
                                                               // std.fs.read_text(path: text) -> owned string.
                                                               // Win32 wide-path, UTF-8 validation, exact read,
                                                               // 64 MiB resource limit; traps on all failures.
-                                                              if (i.srcSlots.size()!=1 || i.valueType.kind!=IRValueKind::String)
+                                                              if (i.srcSlots.size() != 1 || i.valueType.kind != IRValueKind::String)
                                                                   throw std::runtime_error("fs.read_text expects text and yields string");
                                                               if (fn.outgoingArea < 160)throw std::runtime_error("fs.read_text requires 160-byte outgoing area");
-                                                              const auto getRsp=[&](int reg,std::int32_t disp){
-                                                                  const int ids[6]={0,1,2,8,9,10};int idx=-1;
-                                                                  for(int j=0;j<6;++j)if(ids[j]==reg)idx=j;
-                                                                  if(idx<0)throw std::runtime_error("unsupported fs scratch register");
-                                                                  b.push_back(static_cast<std::uint8_t>(0x48|(reg>=8?4:0)));
-                                                                  b.insert(b.end(),{0x8B,static_cast<std::uint8_t>(0x84|((reg&7)<<3)),0x24});put32(b,disp);
-                                                              };
-                                                              const auto addressRsp=[&](int reg,std::int32_t disp){
-                                                                  b.push_back(static_cast<std::uint8_t>(0x48|(reg>=8?4:0)));
-                                                                  b.insert(b.end(),{0x8D,static_cast<std::uint8_t>(0x84|((reg&7)<<3)),0x24});put32(b,disp);
-                                                              };
-                                                              const auto trapIfZero=[&]{b.insert(b.end(),{0x48,0x85,0xC0});auto nonzero=emitLocalJcc(b,0x85);b.insert(b.end(),{0x0F,0x0B});patchLocal(b,nonzero,b.size());};
-                                                              const auto setStack=[&](int reg,int disp){movReg(b,0,reg);storeRspRax(b,disp);};
+                                                              const auto getRsp = [&](int reg, std::int32_t disp) {
+                                                                  const int ids[6] = { 0,1,2,8,9,10 }; int idx = -1;
+                                                                  for (int j = 0; j < 6; ++j)if (ids[j] == reg)idx = j;
+                                                                  if (idx < 0)throw std::runtime_error("unsupported fs scratch register");
+                                                                  b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 4 : 0)));
+                                                                  b.insert(b.end(), { 0x8B,static_cast<std::uint8_t>(0x84 | ((reg & 7) << 3)),0x24 }); put32(b, disp);
+                                                                  };
+                                                              const auto addressRsp = [&](int reg, std::int32_t disp) {
+                                                                  b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 4 : 0)));
+                                                                  b.insert(b.end(), { 0x8D,static_cast<std::uint8_t>(0x84 | ((reg & 7) << 3)),0x24 }); put32(b, disp);
+                                                                  };
+                                                              const auto trapIfZero = [&] {b.insert(b.end(), { 0x48,0x85,0xC0 }); auto nonzero = emitLocalJcc(b, 0x85); b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, nonzero, b.size()); };
+                                                              const auto setStack = [&](int reg, int disp) {movReg(b, 0, reg); storeRspRax(b, disp); };
                                                               // scratch: +64 utf8ptr, +72 bytes, +80 utf16 chars,
                                                               // +88 wideptr, +96 filesize, +104 data, +112 read DWORD,
                                                               // +120 offset, +128 heap, +136 handle.
@@ -11049,77 +11213,77 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                                               // before the first Windows API call. Otherwise the
                                                               // final store dereferences an uninitialized slot pointer.
                                                               initRichDest(b, fn, i.destSlot);
-                                                              loadSlot(b,10,fn,i.srcSlots[0]);
-                                                              loadMem(b,0,10,0,8,false);storeRspRax(b,64);
-                                                              loadMem(b,0,10,8,8,false);storeRspRax(b,72);
+                                                              loadSlot(b, 10, fn, i.srcSlots[0]);
+                                                              loadMem(b, 0, 10, 0, 8, false); storeRspRax(b, 64);
+                                                              loadMem(b, 0, 10, 8, 8, false); storeRspRax(b, 72);
                                                               // reject empty path and lengths beyond Win32 int
-                                                              getRsp(0,72);trapIfZero();movImm(b,10,0x7FFFFFFFull);
-                                                              b.insert(b.end(),{0x4C,0x39,0xD0});auto fits=emitLocalJcc(b,0x86);
-                                                              b.insert(b.end(),{0x0F,0x0B});patchLocal(b,fits,b.size());
+                                                              getRsp(0, 72); trapIfZero(); movImm(b, 10, 0x7FFFFFFFull);
+                                                              b.insert(b.end(), { 0x4C,0x39,0xD0 }); auto fits = emitLocalJcc(b, 0x86);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, fits, b.size());
                                                               // Reject embedded NUL bytes in a text path, rather than
                                                               // silently opening a truncated Win32 path.
-                                                              getRsp(8,64);getRsp(9,72);
-                                                              const auto pathScan=b.size();
-                                                              b.insert(b.end(),{0x4D,0x85,0xC9});auto scanDone=emitLocalJcc(b,0x84);
-                                                              b.insert(b.end(),{0x41,0x80,0x38,0x00});auto nonNull=emitLocalJcc(b,0x85);
-                                                              b.insert(b.end(),{0x0F,0x0B});patchLocal(b,nonNull,b.size());
-                                                              b.insert(b.end(),{0x49,0xFF,0xC0,0x49,0xFF,0xC9});
-                                                              const auto scanAgain=emitLocalJmp(b);patchLocal(b,scanAgain,pathScan);
-                                                              patchLocal(b,scanDone,b.size());
+                                                              getRsp(8, 64); getRsp(9, 72);
+                                                              const auto pathScan = b.size();
+                                                              b.insert(b.end(), { 0x4D,0x85,0xC9 }); auto scanDone = emitLocalJcc(b, 0x84);
+                                                              b.insert(b.end(), { 0x41,0x80,0x38,0x00 }); auto nonNull = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, nonNull, b.size());
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC0,0x49,0xFF,0xC9 });
+                                                              const auto scanAgain = emitLocalJmp(b); patchLocal(b, scanAgain, pathScan);
+                                                              patchLocal(b, scanDone, b.size());
                                                               // MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,ptr,length,0,0)
-                                                              movImm(b,1,65001);movImm(b,2,8);getRsp(8,64);getRsp(9,72);
-                                                              movImm(b,0,0);storeRspRax(b,32);storeRspRax(b,40);
-                                                              emitImportedCall(b,"MultiByteToWideChar",imports);
-                                                              trapIfZero();storeRspRax(b,80);
-                                                              emitImportedCall(b,"GetProcessHeap",imports);trapIfZero();storeRspRax(b,128);
-                                                              movReg(b,1,0);movImm(b,2,8);getRsp(8,80);
-                                                              b.insert(b.end(),{0x49,0xFF,0xC0,0x49,0xD1,0xE0}); // (chars+1)*2
-                                                              emitImportedCall(b,"HeapAlloc",imports);trapIfZero();storeRspRax(b,88);
-                                                              movImm(b,1,65001);movImm(b,2,8);getRsp(8,64);getRsp(9,72);
-                                                              getRsp(0,88);storeRspRax(b,32);getRsp(0,80);storeRspRax(b,40);
-                                                              emitImportedCall(b,"MultiByteToWideChar",imports);trapIfZero();
+                                                              movImm(b, 1, 65001); movImm(b, 2, 8); getRsp(8, 64); getRsp(9, 72);
+                                                              movImm(b, 0, 0); storeRspRax(b, 32); storeRspRax(b, 40);
+                                                              emitImportedCall(b, "MultiByteToWideChar", imports);
+                                                              trapIfZero(); storeRspRax(b, 80);
+                                                              emitImportedCall(b, "GetProcessHeap", imports); trapIfZero(); storeRspRax(b, 128);
+                                                              movReg(b, 1, 0); movImm(b, 2, 8); getRsp(8, 80);
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC0,0x49,0xD1,0xE0 }); // (chars+1)*2
+                                                              emitImportedCall(b, "HeapAlloc", imports); trapIfZero(); storeRspRax(b, 88);
+                                                              movImm(b, 1, 65001); movImm(b, 2, 8); getRsp(8, 64); getRsp(9, 72);
+                                                              getRsp(0, 88); storeRspRax(b, 32); getRsp(0, 80); storeRspRax(b, 40);
+                                                              emitImportedCall(b, "MultiByteToWideChar", imports); trapIfZero();
                                                               // File path WCHAR buffer was zero-initialized, so it is terminated.
-                                                              getRsp(1,88);movImm(b,2,0x80000000u);movImm(b,8,7);movImm(b,9,0);
-                                                              movImm(b,0,3);storeRspRax(b,32);movImm(b,0,0x08000000);storeRspRax(b,40);
-                                                              movImm(b,0,0);storeRspRax(b,48);
-                                                              emitImportedCall(b,"CreateFileW",imports);
-                                                              b.insert(b.end(),{0x48,0x83,0xF8,0xFF});auto opened=emitLocalJcc(b,0x85);
-                                                              b.insert(b.end(),{0x0F,0x0B});patchLocal(b,opened,b.size());storeRspRax(b,136);
-                                                              getRsp(1,136);addressRsp(2,96);emitImportedCall(b,"GetFileSizeEx",imports);trapIfZero();
-                                                              getRsp(0,96);movImm(b,10,64ull*1024ull*1024ull);
-                                                              b.insert(b.end(),{0x4C,0x39,0xD0});auto inLimit=emitLocalJcc(b,0x86);
-                                                              b.insert(b.end(),{0x0F,0x0B});patchLocal(b,inLimit,b.size());
-                                                              getRsp(1,128);movImm(b,2,8);getRsp(8,96);
-                                                              b.insert(b.end(),{0x49,0xFF,0xC0}); // length+1 for NUL
-                                                              emitImportedCall(b,"HeapAlloc",imports);trapIfZero();storeRspRax(b,104);
-                                                              movImm(b,0,0);storeRspRax(b,120);
-                                                              const auto loop=b.size();
-                                                              getRsp(0,96);getRsp(10,120);
-                                                              b.insert(b.end(),{0x4C,0x39,0xD0});auto finished=emitLocalJcc(b,0x84);
-                                                              b.insert(b.end(),{0x4C,0x29,0xD0}); // rax=length-offset
-                                                              movReg(b,8,0);movImm(b,10,65536);
-                                                              b.insert(b.end(),{0x4D,0x39,0xD0});auto smallChunkBranch=emitLocalJcc(b,0x86);
-                                                              movReg(b,8,10);patchLocal(b,smallChunkBranch,b.size());
-                                                              getRsp(1,136);getRsp(2,104);getRsp(0,120);
-                                                              b.insert(b.end(),{0x48,0x01,0xC2}); // buffer+offset
-                                                              addressRsp(9,112);movImm(b,0,0);storeRspRax(b,32);storeRspRax(b,112);
-                                                              emitImportedCall(b,"ReadFile",imports);trapIfZero();
-                                                              getRsp(0,112);trapIfZero();
-                                                              b.insert(b.end(),{0x48,0x01,0x84,0x24});put32(b,120);
-                                                              auto again=emitLocalJmp(b);patchLocal(b,again,loop);
-                                                              patchLocal(b,finished,b.size());
+                                                              getRsp(1, 88); movImm(b, 2, 0x80000000u); movImm(b, 8, 7); movImm(b, 9, 0);
+                                                              movImm(b, 0, 3); storeRspRax(b, 32); movImm(b, 0, 0x08000000); storeRspRax(b, 40);
+                                                              movImm(b, 0, 0); storeRspRax(b, 48);
+                                                              emitImportedCall(b, "CreateFileW", imports);
+                                                              b.insert(b.end(), { 0x48,0x83,0xF8,0xFF }); auto opened = emitLocalJcc(b, 0x85);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, opened, b.size()); storeRspRax(b, 136);
+                                                              getRsp(1, 136); addressRsp(2, 96); emitImportedCall(b, "GetFileSizeEx", imports); trapIfZero();
+                                                              getRsp(0, 96); movImm(b, 10, 64ull * 1024ull * 1024ull);
+                                                              b.insert(b.end(), { 0x4C,0x39,0xD0 }); auto inLimit = emitLocalJcc(b, 0x86);
+                                                              b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, inLimit, b.size());
+                                                              getRsp(1, 128); movImm(b, 2, 8); getRsp(8, 96);
+                                                              b.insert(b.end(), { 0x49,0xFF,0xC0 }); // length+1 for NUL
+                                                              emitImportedCall(b, "HeapAlloc", imports); trapIfZero(); storeRspRax(b, 104);
+                                                              movImm(b, 0, 0); storeRspRax(b, 120);
+                                                              const auto loop = b.size();
+                                                              getRsp(0, 96); getRsp(10, 120);
+                                                              b.insert(b.end(), { 0x4C,0x39,0xD0 }); auto finished = emitLocalJcc(b, 0x84);
+                                                              b.insert(b.end(), { 0x4C,0x29,0xD0 }); // rax=length-offset
+                                                              movReg(b, 8, 0); movImm(b, 10, 65536);
+                                                              b.insert(b.end(), { 0x4D,0x39,0xD0 }); auto smallChunkBranch = emitLocalJcc(b, 0x86);
+                                                              movReg(b, 8, 10); patchLocal(b, smallChunkBranch, b.size());
+                                                              getRsp(1, 136); getRsp(2, 104); getRsp(0, 120);
+                                                              b.insert(b.end(), { 0x48,0x01,0xC2 }); // buffer+offset
+                                                              addressRsp(9, 112); movImm(b, 0, 0); storeRspRax(b, 32); storeRspRax(b, 112);
+                                                              emitImportedCall(b, "ReadFile", imports); trapIfZero();
+                                                              getRsp(0, 112); trapIfZero();
+                                                              b.insert(b.end(), { 0x48,0x01,0x84,0x24 }); put32(b, 120);
+                                                              auto again = emitLocalJmp(b); patchLocal(b, again, loop);
+                                                              patchLocal(b, finished, b.size());
                                                               // Read text is validated UTF-8 (including no malformed byte sequences).
-                                                              getRsp(0,96);b.insert(b.end(),{0x48,0x85,0xC0});auto empty=emitLocalJcc(b,0x84);
-                                                              movImm(b,1,65001);movImm(b,2,8);getRsp(8,104);getRsp(9,96);
-                                                              movImm(b,0,0);storeRspRax(b,32);storeRspRax(b,40);
-                                                              emitImportedCall(b,"MultiByteToWideChar",imports);trapIfZero();
-                                                              patchLocal(b,empty,b.size());
-                                                              getRsp(1,136);emitImportedCall(b,"CloseHandle",imports);trapIfZero();
-                                                              getRsp(1,128);movImm(b,2,0);getRsp(8,88);
-                                                              emitImportedCall(b,"HeapFree",imports);trapIfZero();
-                                                              loadSlot(b,11,fn,i.destSlot);
-                                                              getRsp(0,104);storeMem(b,11,0,0,8);
-                                                              getRsp(0,96);storeMem(b,11,8,0,8);storeMem(b,11,16,0,8);
+                                                              getRsp(0, 96); b.insert(b.end(), { 0x48,0x85,0xC0 }); auto empty = emitLocalJcc(b, 0x84);
+                                                              movImm(b, 1, 65001); movImm(b, 2, 8); getRsp(8, 104); getRsp(9, 96);
+                                                              movImm(b, 0, 0); storeRspRax(b, 32); storeRspRax(b, 40);
+                                                              emitImportedCall(b, "MultiByteToWideChar", imports); trapIfZero();
+                                                              patchLocal(b, empty, b.size());
+                                                              getRsp(1, 136); emitImportedCall(b, "CloseHandle", imports); trapIfZero();
+                                                              getRsp(1, 128); movImm(b, 2, 0); getRsp(8, 88);
+                                                              emitImportedCall(b, "HeapFree", imports); trapIfZero();
+                                                              loadSlot(b, 11, fn, i.destSlot);
+                                                              getRsp(0, 104); storeMem(b, 11, 0, 0, 8);
+                                                              getRsp(0, 96); storeMem(b, 11, 8, 0, 8); storeMem(b, 11, 16, 0, 8);
                                                               break;
                                                           }
                                                           case PMIROpcode::TextStreamRead: {
@@ -11719,7 +11883,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                                               if (i.srcSlots.size() != 2)throw std::runtime_error("PMIR array index requires array and index");
                                                               std::string elem; std::size_t count = 0;
                                                               const bool isView = i.typeName.starts_with("view<") && i.typeName.ends_with(">");
-                                                              if (isView) elem = i.typeName.substr(5,i.typeName.size()-6);
+                                                              if (isView) elem = i.typeName.substr(5, i.typeName.size() - 6);
                                                               else if (!typeIsArray(i.typeName, &elem, &count))throw std::runtime_error("PMIR malformed array/view type");
                                                               const auto layout = abi.layout(elem);
                                                               if (layout.size == 0 || layout.size > std::numeric_limits<std::int32_t>::max())throw std::runtime_error("PMIR unsupported array element stride");
@@ -11727,7 +11891,8 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                                               if (isView) {
                                                                   loadSlot(b, 10, fn, i.srcSlots[0]);
                                                                   loadMem(b, 8, 10, 8, 8, false); // r8 = live view length
-                                                              } else movImm(b, 8, static_cast<std::uint64_t>(count));
+                                                              }
+                                                              else movImm(b, 8, static_cast<std::uint64_t>(count));
                                                               b.insert(b.end(), { 0x4D,0x39,0xC1 }); // cmp r9,r8 (unsigned)
                                                               auto valid = emitLocalJcc(b, 0x82); // JB: index < bound
                                                               b.insert(b.end(), { 0x0F,0x0B }); // UD2 on out-of-bounds
@@ -11786,111 +11951,112 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   // Accept the canonical `main(args: view<text>) gives int`.
                                   // The argument view excludes argv[0], the executable path.
                                   void emitArgumentEntry(MachineProgram& out, const std::string& target)const {
-                                      constexpr std::uint32_t frame=256;
-                                      while(out.text.size()%16)out.text.push_back(0x90);
-                                      const auto base=out.text.size();
-                                      auto& b=out.text;
-                                      out.functionOffsets["__pcn_entry_args"]=static_cast<std::uint32_t>(base);
-                                      b.insert(b.end(),{0x55,0x48,0x89,0xE5,0x48,0x81,0xEC});put32(b,frame);
+                                      constexpr std::uint32_t frame = 256;
+                                      while (out.text.size() % 16)out.text.push_back(0x90);
+                                      const auto base = out.text.size();
+                                      auto& b = out.text;
+                                      out.functionOffsets["__pcn_entry_args"] = static_cast<std::uint32_t>(base);
+                                      b.insert(b.end(), { 0x55,0x48,0x89,0xE5,0x48,0x81,0xEC }); put32(b, frame);
                                       std::vector<EncodedFunction::Import> imps;
-                                      auto importCall=[&](const std::string& symbol){emitImportedCall(b,symbol,imps);};
-                                      auto getRsp=[&](int reg,std::int32_t d){
-                                          b.push_back(static_cast<std::uint8_t>(0x48|(reg>=8?4:0)));
-                                          b.insert(b.end(),{0x8B,static_cast<std::uint8_t>(0x84|((reg&7)<<3)),0x24});put32(b,d);
-                                      };
-                                      auto leaRsp=[&](int reg,std::int32_t d){
-                                          b.push_back(static_cast<std::uint8_t>(0x48|(reg>=8?4:0)));
-                                          b.insert(b.end(),{0x8D,static_cast<std::uint8_t>(0x84|((reg&7)<<3)),0x24});put32(b,d);
-                                      };
-                                      auto trapUnlessNonzero=[&]{b.insert(b.end(),{0x48,0x85,0xC0});auto yes=emitLocalJcc(b,0x85);b.insert(b.end(),{0x0F,0x0B});patchLocal(b,yes,b.size());};
-                                      auto store=[&](int src,int disp){movReg(b,0,src);storeRspRax(b,disp);};
+                                      auto importCall = [&](const std::string& symbol) {emitImportedCall(b, symbol, imps); };
+                                      auto getRsp = [&](int reg, std::int32_t d) {
+                                          b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 4 : 0)));
+                                          b.insert(b.end(), { 0x8B,static_cast<std::uint8_t>(0x84 | ((reg & 7) << 3)),0x24 }); put32(b, d);
+                                          };
+                                      auto leaRsp = [&](int reg, std::int32_t d) {
+                                          b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 4 : 0)));
+                                          b.insert(b.end(), { 0x8D,static_cast<std::uint8_t>(0x84 | ((reg & 7) << 3)),0x24 }); put32(b, d);
+                                          };
+                                      auto trapUnlessNonzero = [&] {b.insert(b.end(), { 0x48,0x85,0xC0 }); auto yes = emitLocalJcc(b, 0x85); b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, yes, b.size()); };
+                                      auto store = [&](int src, int disp) {movReg(b, 0, src); storeRspRax(b, disp); };
                                       // Win32 CommandLineToArgvW may write only a 32-bit argc.
-                                      movImm(b,0,0);storeRspRax(b,88);
-                                      importCall("GetCommandLineW");trapUnlessNonzero();movReg(b,1,0);
-                                      leaRsp(2,88);importCall("CommandLineToArgvW");trapUnlessNonzero();storeRspRax(b,80);
-                                      getRsp(0,88);trapUnlessNonzero();movImm(b,10,4096);
-                                      b.insert(b.end(),{0x4C,0x39,0xD0});auto reasonable=emitLocalJcc(b,0x86);
-                                      b.insert(b.end(),{0x0F,0x0B});patchLocal(b,reasonable,b.size());
-                                      importCall("GetProcessHeap");trapUnlessNonzero();storeRspRax(b,128);
-                                      movReg(b,1,0);movImm(b,2,8);getRsp(8,88);
-                                      b.insert(b.end(),{0x49,0xC1,0xE0,0x04}); // argc*16
-                                      importCall("HeapAlloc");trapUnlessNonzero();storeRspRax(b,96);
-                                      movImm(b,0,0);storeRspRax(b,104);
-                                      const auto loop=b.size();
-                                      getRsp(0,104);getRsp(10,88);
-                                      b.insert(b.end(),{0x4C,0x39,0xD0});auto done=emitLocalJcc(b,0x83); // >= argc
+                                      movImm(b, 0, 0); storeRspRax(b, 88);
+                                      importCall("GetCommandLineW"); trapUnlessNonzero(); movReg(b, 1, 0);
+                                      leaRsp(2, 88); importCall("CommandLineToArgvW"); trapUnlessNonzero(); storeRspRax(b, 80);
+                                      getRsp(0, 88); trapUnlessNonzero(); movImm(b, 10, 4096);
+                                      b.insert(b.end(), { 0x4C,0x39,0xD0 }); auto reasonable = emitLocalJcc(b, 0x86);
+                                      b.insert(b.end(), { 0x0F,0x0B }); patchLocal(b, reasonable, b.size());
+                                      importCall("GetProcessHeap"); trapUnlessNonzero(); storeRspRax(b, 128);
+                                      movReg(b, 1, 0); movImm(b, 2, 8); getRsp(8, 88);
+                                      b.insert(b.end(), { 0x49,0xC1,0xE0,0x04 }); // argc*16
+                                      importCall("HeapAlloc"); trapUnlessNonzero(); storeRspRax(b, 96);
+                                      movImm(b, 0, 0); storeRspRax(b, 104);
+                                      const auto loop = b.size();
+                                      getRsp(0, 104); getRsp(10, 88);
+                                      b.insert(b.end(), { 0x4C,0x39,0xD0 }); auto done = emitLocalJcc(b, 0x83); // >= argc
                                       // R10=argv[index] address
-                                      getRsp(10,80);getRsp(9,104);
-                                      b.insert(b.end(),{0x4F,0x8D,0x14,0xCA});
-                                      loadMem(b,8,10,0,8,false);store(8,112);
-                                      movImm(b,1,65001);movImm(b,2,0x80);getRsp(8,112);movImm(b,9,static_cast<std::uint64_t>(-1));
-                                      movImm(b,0,0);storeRspRax(b,32);storeRspRax(b,40);
-                                      storeRspRax(b,48);storeRspRax(b,56);
-                                      importCall("WideCharToMultiByte");trapUnlessNonzero();storeRspRax(b,120);
-                                      getRsp(1,128);movImm(b,2,8);getRsp(8,120);
-                                      importCall("HeapAlloc");trapUnlessNonzero();storeRspRax(b,136);
-                                      movImm(b,1,65001);movImm(b,2,0x80);getRsp(8,112);movImm(b,9,static_cast<std::uint64_t>(-1));
-                                      getRsp(0,136);storeRspRax(b,32);getRsp(0,120);storeRspRax(b,40);
-                                      movImm(b,0,0);storeRspRax(b,48);storeRspRax(b,56);
-                                      importCall("WideCharToMultiByte");trapUnlessNonzero();
-                                      getRsp(11,96);getRsp(10,104);
-                                      b.insert(b.end(),{0x4D,0x6B,0xD2,0x10,0x4D,0x01,0xD3}); // dest+=index*16
-                                      getRsp(0,136);storeMem(b,11,0,0,8);
-                                      getRsp(0,120);b.insert(b.end(),{0x48,0xFF,0xC8}); // terminator excluded
-                                      storeMem(b,11,8,0,8);
-                                      b.insert(b.end(),{0x48,0xFF,0x84,0x24});put32(b,104); // index++
-                                      auto back=emitLocalJmp(b);patchLocal(b,back,loop);
-                                      patchLocal(b,done,b.size());
-                                      getRsp(1,80);importCall("LocalFree");
+                                      getRsp(10, 80); getRsp(9, 104);
+                                      b.insert(b.end(), { 0x4F,0x8D,0x14,0xCA });
+                                      loadMem(b, 8, 10, 0, 8, false); store(8, 112);
+                                      movImm(b, 1, 65001); movImm(b, 2, 0x80); getRsp(8, 112); movImm(b, 9, static_cast<std::uint64_t>(-1));
+                                      movImm(b, 0, 0); storeRspRax(b, 32); storeRspRax(b, 40);
+                                      storeRspRax(b, 48); storeRspRax(b, 56);
+                                      importCall("WideCharToMultiByte"); trapUnlessNonzero(); storeRspRax(b, 120);
+                                      getRsp(1, 128); movImm(b, 2, 8); getRsp(8, 120);
+                                      importCall("HeapAlloc"); trapUnlessNonzero(); storeRspRax(b, 136);
+                                      movImm(b, 1, 65001); movImm(b, 2, 0x80); getRsp(8, 112); movImm(b, 9, static_cast<std::uint64_t>(-1));
+                                      getRsp(0, 136); storeRspRax(b, 32); getRsp(0, 120); storeRspRax(b, 40);
+                                      movImm(b, 0, 0); storeRspRax(b, 48); storeRspRax(b, 56);
+                                      importCall("WideCharToMultiByte"); trapUnlessNonzero();
+                                      getRsp(11, 96); getRsp(10, 104);
+                                      b.insert(b.end(), { 0x4D,0x6B,0xD2,0x10,0x4D,0x01,0xD3 }); // dest+=index*16
+                                      getRsp(0, 136); storeMem(b, 11, 0, 0, 8);
+                                      getRsp(0, 120); b.insert(b.end(), { 0x48,0xFF,0xC8 }); // terminator excluded
+                                      storeMem(b, 11, 8, 0, 8);
+                                      b.insert(b.end(), { 0x48,0xFF,0x84,0x24 }); put32(b, 104); // index++
+                                      auto back = emitLocalJmp(b); patchLocal(b, back, loop);
+                                      patchLocal(b, done, b.size());
+                                      getRsp(1, 80); importCall("LocalFree");
                                       // main receives view of user arguments, no executable path.
-                                      getRsp(0,96);b.insert(b.end(),{0x48,0x83,0xC0,0x10});storeRspRax(b,144);
-                                      getRsp(0,88);b.insert(b.end(),{0x48,0xFF,0xC8});storeRspRax(b,152);
-                                      leaRsp(1,144);b.push_back(0xE8);const auto disp=b.size();put32(b,0);
-                                      const auto found=out.functionOffsets.find(target);
-                                      if(found==out.functionOffsets.end())throw std::runtime_error("argument entry missing main routine");
-                                      const auto rel=static_cast<std::int64_t>(found->second)-static_cast<std::int64_t>(disp+4);
-                                      if(rel<std::numeric_limits<std::int32_t>::min() || rel>std::numeric_limits<std::int32_t>::max())
+                                      getRsp(0, 96); b.insert(b.end(), { 0x48,0x83,0xC0,0x10 }); storeRspRax(b, 144);
+                                      getRsp(0, 88); b.insert(b.end(), { 0x48,0xFF,0xC8 }); storeRspRax(b, 152);
+                                      leaRsp(1, 144); b.push_back(0xE8); const auto disp = b.size(); put32(b, 0);
+                                      const auto found = out.functionOffsets.find(target);
+                                      if (found == out.functionOffsets.end())throw std::runtime_error("argument entry missing main routine");
+                                      const auto rel = static_cast<std::int64_t>(found->second) - static_cast<std::int64_t>(disp + 4);
+                                      if (rel<std::numeric_limits<std::int32_t>::min() || rel>std::numeric_limits<std::int32_t>::max())
                                           throw std::runtime_error("argument entry call displacement overflow");
-                                      patch32(b,disp,static_cast<std::int32_t>(rel));
+                                      patch32(b, disp, static_cast<std::int32_t>(rel));
                                       // Borrowed argv text remains alive throughout main, then freed.
-                                      storeRspRax(b,160);movImm(b,0,0);storeRspRax(b,104);
-                                      const auto freeLoop=b.size();
-                                      getRsp(0,104);getRsp(10,88);
-                                      b.insert(b.end(),{0x4C,0x39,0xD0});auto freed=emitLocalJcc(b,0x83);
-                                      getRsp(11,96);getRsp(10,104);
-                                      b.insert(b.end(),{0x4D,0x6B,0xD2,0x10,0x4D,0x01,0xD3});
-                                      loadMem(b,8,11,0,8,false);getRsp(1,128);movImm(b,2,0);
-                                      importCall("HeapFree");trapUnlessNonzero();
-                                      b.insert(b.end(),{0x48,0xFF,0x84,0x24});put32(b,104);
-                                      auto backward=emitLocalJmp(b);patchLocal(b,backward,freeLoop);
-                                      patchLocal(b,freed,b.size());
-                                      getRsp(1,128);movImm(b,2,0);getRsp(8,96);
-                                      importCall("HeapFree");trapUnlessNonzero();
-                                      getRsp(0,160);epilogue(b);
-                                      for(const auto& imp:imps)out.imports.push_back({imp.dispPos,imp.symbol});
-                                      out.functionSizes["__pcn_entry_args"]=static_cast<std::uint32_t>(b.size()-base);
+                                      storeRspRax(b, 160); movImm(b, 0, 0); storeRspRax(b, 104);
+                                      const auto freeLoop = b.size();
+                                      getRsp(0, 104); getRsp(10, 88);
+                                      b.insert(b.end(), { 0x4C,0x39,0xD0 }); auto freed = emitLocalJcc(b, 0x83);
+                                      getRsp(11, 96); getRsp(10, 104);
+                                      b.insert(b.end(), { 0x4D,0x6B,0xD2,0x10,0x4D,0x01,0xD3 });
+                                      loadMem(b, 8, 11, 0, 8, false); getRsp(1, 128); movImm(b, 2, 0);
+                                      importCall("HeapFree"); trapUnlessNonzero();
+                                      b.insert(b.end(), { 0x48,0xFF,0x84,0x24 }); put32(b, 104);
+                                      auto backward = emitLocalJmp(b); patchLocal(b, backward, freeLoop);
+                                      patchLocal(b, freed, b.size());
+                                      getRsp(1, 128); movImm(b, 2, 0); getRsp(8, 96);
+                                      importCall("HeapFree"); trapUnlessNonzero();
+                                      getRsp(0, 160); epilogue(b);
+                                      for (const auto& imp : imps)out.imports.push_back({ imp.dispPos,imp.symbol });
+                                      out.functionSizes["__pcn_entry_args"] = static_cast<std::uint32_t>(b.size() - base);
                                   }
                                   void selectEntry(const PMIRProgram& program, const std::string& requested, MachineProgram& out)const {
-                                      auto isArgsMain=[](const PMIRFunction& f){
-                                          return f.name=="main" && f.parameterTypes.size()==1 && f.parameterTypes[0]=="view<text>" && !f.richReturn
-                                              && f.returnValueType.kind==IRValueKind::Int64;
-                                      };
-                                      const PMIRFunction* fn=nullptr;
-                                      for(const auto& f:program.functions)if(f.name=="main" && f.parameterSlots.empty() && !f.richReturn) {fn=&f;break;}
-                                      if(!fn)for(const auto& f:program.functions)if(isArgsMain(f)){fn=&f;break;}
-                                      if(!fn && !requested.empty())for(const auto& f:program.functions)
-                                          if(f.name==requested && !f.richReturn && (f.parameterSlots.empty()||isArgsMain(f))){fn=&f;break;}
-                                      if(!fn && requested.empty())for(const auto& f:program.functions)if(f.parameterSlots.empty()&&!f.richReturn){fn=&f;break;}
-                                      if(!fn)throw std::runtime_error("native linker: no supported entry routine (main() or main(args: view<text>))");
-                                      if (fn->returnValueType.kind==IRValueKind::Float32 || fn->returnValueType.kind==IRValueKind::Float64)
+                                      auto isArgsMain = [](const PMIRFunction& f) {
+                                          return f.name == "main" && f.parameterTypes.size() == 1 && f.parameterTypes[0] == "view<text>" && !f.richReturn
+                                              && f.returnValueType.kind == IRValueKind::Int64;
+                                          };
+                                      const PMIRFunction* fn = nullptr;
+                                      for (const auto& f : program.functions)if (f.name == "main" && f.parameterSlots.empty() && !f.richReturn) { fn = &f; break; }
+                                      if (!fn)for (const auto& f : program.functions)if (isArgsMain(f)) { fn = &f; break; }
+                                      if (!fn && !requested.empty())for (const auto& f : program.functions)
+                                          if (f.name == requested && !f.richReturn && (f.parameterSlots.empty() || isArgsMain(f))) { fn = &f; break; }
+                                      if (!fn && requested.empty())for (const auto& f : program.functions)if (f.parameterSlots.empty() && !f.richReturn) { fn = &f; break; }
+                                      if (!fn)throw std::runtime_error("native linker: no supported entry routine (main() or main(args: view<text>))");
+                                      if (fn->returnValueType.kind == IRValueKind::Float32 || fn->returnValueType.kind == IRValueKind::Float64)
                                           throw std::runtime_error("native executable entry must return an integer status");
-                                      if(isArgsMain(*fn)){
-                                          emitArgumentEntry(out,fn->name);
-                                          out.entryName="__pcn_entry_args";
-                                          out.entryOffset=out.functionOffsets.at(out.entryName);
-                                      }else{
-                                          out.entryName=fn->name;
-                                          out.entryOffset=out.functionOffsets.at(fn->name);
+                                      if (isArgsMain(*fn)) {
+                                          emitArgumentEntry(out, fn->name);
+                                          out.entryName = "__pcn_entry_args";
+                                          out.entryOffset = out.functionOffsets.at(out.entryName);
+                                      }
+                                      else {
+                                          out.entryName = fn->name;
+                                          out.entryOffset = out.functionOffsets.at(fn->name);
                                       }
                                   }
                               };
@@ -12246,78 +12412,78 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       struct Library {
                                           std::string dll;
                                           std::vector<std::string> names;
-                                          std::uint32_t ilt=0, iat=0, dllOffset=0;
+                                          std::uint32_t ilt = 0, iat = 0, dllOffset = 0;
                                       };
                                       std::vector<Library> libraries;
-                                      std::map<std::string,std::uint32_t> symbolIat;
-                                      std::map<std::string,std::uint32_t> hintNames;
-                                      std::uint32_t iat=0, iatSize=0, total=0, descriptorSize=0;
+                                      std::map<std::string, std::uint32_t> symbolIat;
+                                      std::map<std::string, std::uint32_t> hintNames;
+                                      std::uint32_t iat = 0, iatSize = 0, total = 0, descriptorSize = 0;
                                   };
                                   static ImportLayout describeImports(const std::vector<MachineProgram::ImportCall>& calls) {
-                                      static const std::vector<std::pair<std::string,std::string>> known={
-                                          {"GetProcessHeap","KERNEL32.dll"},{"HeapAlloc","KERNEL32.dll"},{"HeapFree","KERNEL32.dll"},
-                                          {"GetStdHandle","KERNEL32.dll"},{"WriteFile","KERNEL32.dll"},{"ReadFile","KERNEL32.dll"},
-                                          {"CloseHandle","KERNEL32.dll"},{"GetLastError","KERNEL32.dll"},{"ExitProcess","KERNEL32.dll"},
-                                          {"CreateFileW","KERNEL32.dll"},{"GetFileSizeEx","KERNEL32.dll"},{"GetFileAttributesW","KERNEL32.dll"},
-                                          {"MultiByteToWideChar","KERNEL32.dll"},{"WideCharToMultiByte","KERNEL32.dll"},
-                                          {"GetCommandLineW","KERNEL32.dll"},{"LocalFree","KERNEL32.dll"},
-                                          {"CreateProcessW","KERNEL32.dll"},{"WaitForSingleObject","KERNEL32.dll"},
-                                          {"GetExitCodeProcess","KERNEL32.dll"},
-                                          {"CommandLineToArgvW","SHELL32.dll"}
+                                      static const std::vector<std::pair<std::string, std::string>> known = {
+                                          { "GetProcessHeap","KERNEL32.dll" },{ "HeapAlloc","KERNEL32.dll" },{ "HeapFree","KERNEL32.dll" },
+                                          { "GetStdHandle","KERNEL32.dll" },{ "WriteFile","KERNEL32.dll" },{ "ReadFile","KERNEL32.dll" },
+                                          { "CloseHandle","KERNEL32.dll" },{ "GetLastError","KERNEL32.dll" },{ "ExitProcess","KERNEL32.dll" },
+                                          { "CreateFileW","KERNEL32.dll" },{ "GetFileSizeEx","KERNEL32.dll" },{ "GetFileAttributesW","KERNEL32.dll" },
+                                          { "MultiByteToWideChar","KERNEL32.dll" },{ "WideCharToMultiByte","KERNEL32.dll" },
+                                          { "GetCommandLineW","KERNEL32.dll" },{ "LocalFree","KERNEL32.dll" },
+                                          { "CreateProcessW","KERNEL32.dll" },{ "WaitForSingleObject","KERNEL32.dll" },
+                                          { "GetExitCodeProcess","KERNEL32.dll" },
+                                          { "CommandLineToArgvW","SHELL32.dll" }
                                       };
                                       std::set<std::string> used;
-                                      for(const auto& call:calls){
-                                          if(std::find_if(known.begin(),known.end(),[&](const auto& x){return x.first==call.symbol;})==known.end())
-                                              throw std::runtime_error("unsupported Win32 import: "+call.symbol);
+                                      for (const auto& call : calls) {
+                                          if (std::find_if(known.begin(), known.end(), [&](const auto& x) {return x.first == call.symbol; }) == known.end())
+                                              throw std::runtime_error("unsupported Win32 import: " + call.symbol);
                                           used.insert(call.symbol);
                                       }
                                       ImportLayout layout;
-                                      for(const auto& lib:{std::string("KERNEL32.dll"),std::string("SHELL32.dll")}) {
-                                          ImportLayout::Library l;l.dll=lib;
-                                          for(const auto& [name,dll]:known)if(dll==lib && used.contains(name))l.names.push_back(name);
-                                          if(!l.names.empty())layout.libraries.push_back(std::move(l));
+                                      for (const auto& lib : { std::string("KERNEL32.dll"),std::string("SHELL32.dll") }) {
+                                          ImportLayout::Library l; l.dll = lib;
+                                          for (const auto& [name, dll] : known)if (dll == lib && used.contains(name))l.names.push_back(name);
+                                          if (!l.names.empty())layout.libraries.push_back(std::move(l));
                                       }
-                                      if(layout.libraries.empty())return layout;
-                                      layout.descriptorSize=static_cast<std::uint32_t>((layout.libraries.size()+1)*20u);
-                                      std::uint32_t offset=layout.descriptorSize;
-                                      for(auto& lib:layout.libraries){lib.ilt=offset;offset+=static_cast<std::uint32_t>((lib.names.size()+1)*8u);}
-                                      layout.iat=offset;
-                                      for(auto& lib:layout.libraries){
-                                          lib.iat=offset;
-                                          for(std::size_t i=0;i<lib.names.size();++i)layout.symbolIat[lib.names[i]]=offset+static_cast<std::uint32_t>(i*8);
-                                          offset+=static_cast<std::uint32_t>((lib.names.size()+1)*8u);
+                                      if (layout.libraries.empty())return layout;
+                                      layout.descriptorSize = static_cast<std::uint32_t>((layout.libraries.size() + 1) * 20u);
+                                      std::uint32_t offset = layout.descriptorSize;
+                                      for (auto& lib : layout.libraries) { lib.ilt = offset; offset += static_cast<std::uint32_t>((lib.names.size() + 1) * 8u); }
+                                      layout.iat = offset;
+                                      for (auto& lib : layout.libraries) {
+                                          lib.iat = offset;
+                                          for (std::size_t i = 0; i < lib.names.size(); ++i)layout.symbolIat[lib.names[i]] = offset + static_cast<std::uint32_t>(i * 8);
+                                          offset += static_cast<std::uint32_t>((lib.names.size() + 1) * 8u);
                                       }
-                                      layout.iatSize=offset-layout.iat;
-                                      for(const auto& lib:layout.libraries)for(const auto& n:lib.names){
-                                          if(offset&1)++offset;
-                                          layout.hintNames[n]=offset;
-                                          offset+=static_cast<std::uint32_t>(n.size()+3);
+                                      layout.iatSize = offset - layout.iat;
+                                      for (const auto& lib : layout.libraries)for (const auto& n : lib.names) {
+                                          if (offset & 1)++offset;
+                                          layout.hintNames[n] = offset;
+                                          offset += static_cast<std::uint32_t>(n.size() + 3);
                                       }
-                                      for(auto& lib:layout.libraries){lib.dllOffset=offset;offset+=static_cast<std::uint32_t>(lib.dll.size()+1);}
-                                      layout.total=offset;return layout;
+                                      for (auto& lib : layout.libraries) { lib.dllOffset = offset; offset += static_cast<std::uint32_t>(lib.dll.size() + 1); }
+                                      layout.total = offset; return layout;
                                   }
-                                  static std::vector<std::uint8_t> importSection(const ImportLayout& imp,std::uint32_t baseRva) {
-                                      ByteBuffer out;if(imp.libraries.empty())return {};
-                                      for(const auto& lib:imp.libraries){
-                                          out.writeU32(baseRva+lib.ilt);out.writeU32(0);out.writeU32(0);
-                                          out.writeU32(baseRva+lib.dllOffset);out.writeU32(baseRva+lib.iat);
+                                  static std::vector<std::uint8_t> importSection(const ImportLayout& imp, std::uint32_t baseRva) {
+                                      ByteBuffer out; if (imp.libraries.empty())return {};
+                                      for (const auto& lib : imp.libraries) {
+                                          out.writeU32(baseRva + lib.ilt); out.writeU32(0); out.writeU32(0);
+                                          out.writeU32(baseRva + lib.dllOffset); out.writeU32(baseRva + lib.iat);
                                       }
-                                      for(std::size_t i=0;i<20;++i)out.writeU8(0);
-                                      for(const auto& lib:imp.libraries){
-                                          for(const auto& name:lib.names)out.writeU64(baseRva+imp.hintNames.at(name));out.writeU64(0);
+                                      for (std::size_t i = 0; i < 20; ++i)out.writeU8(0);
+                                      for (const auto& lib : imp.libraries) {
+                                          for (const auto& name : lib.names)out.writeU64(baseRva + imp.hintNames.at(name)); out.writeU64(0);
                                       }
-                                      for(const auto& lib:imp.libraries){
-                                          for(const auto& name:lib.names)out.writeU64(baseRva+imp.hintNames.at(name));out.writeU64(0);
+                                      for (const auto& lib : imp.libraries) {
+                                          for (const auto& name : lib.names)out.writeU64(baseRva + imp.hintNames.at(name)); out.writeU64(0);
                                       }
-                                      for(const auto& lib:imp.libraries)for(const auto& name:lib.names){
-                                          out.align(2);if(out.size()!=imp.hintNames.at(name))throw std::runtime_error("import hint offset mismatch");
-                                          out.writeU16(0);out.writeStringZ(name);
+                                      for (const auto& lib : imp.libraries)for (const auto& name : lib.names) {
+                                          out.align(2); if (out.size() != imp.hintNames.at(name))throw std::runtime_error("import hint offset mismatch");
+                                          out.writeU16(0); out.writeStringZ(name);
                                       }
-                                      for(const auto& lib:imp.libraries){
-                                          if(out.size()!=lib.dllOffset)throw std::runtime_error("import dll offset mismatch");
+                                      for (const auto& lib : imp.libraries) {
+                                          if (out.size() != lib.dllOffset)throw std::runtime_error("import dll offset mismatch");
                                           out.writeStringZ(lib.dll);
                                       }
-                                      if(out.size()!=imp.total)throw std::runtime_error("import section size mismatch");
+                                      if (out.size() != imp.total)throw std::runtime_error("import section size mismatch");
                                       return out.release();
                                   }
                               public:
@@ -12752,9 +12918,9 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           if (sec.name == ".pdata") { exceptionRva = sec.virtualAddress; exceptionSize = sec.virtualSize; }
                                           if (sec.name == ".idata") {
                                               importRva = sec.virtualAddress;
-                                              const auto imp=describeImports(image.importCalls);
-                                              importSize=imp.descriptorSize;
-                                              iatRva=sec.virtualAddress+imp.iat; iatSize=imp.iatSize;
+                                              const auto imp = describeImports(image.importCalls);
+                                              importSize = imp.descriptorSize;
+                                              iatRva = sec.virtualAddress + imp.iat; iatSize = imp.iatSize;
                                           }
                                       }
                                       for (int i = 0; i < 16; ++i) {
@@ -13872,11 +14038,11 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   const int fd = static_cast<int>(reinterpret_cast<std::uintptr_t>(handle));
                                   if (!data && amount)return 0;
                                   if (fd != 1 && fd != 2) {
-                                      auto* file=static_cast<std::FILE*>(handle);
+                                      auto* file = static_cast<std::FILE*>(handle);
                                       if (!file)return 0;
-                                      const std::size_t count=std::fwrite(data,1,amount,file);
-                                      if (written)*written=static_cast<std::uint32_t>(count);
-                                      return std::ferror(file)?0:1;
+                                      const std::size_t count = std::fwrite(data, 1, amount, file);
+                                      if (written)*written = static_cast<std::uint32_t>(count);
+                                      return std::ferror(file) ? 0 : 1;
                                   }
                                   const ssize_t count = ::write(fd, data, amount);
                                   if (count < 0)return 0;
@@ -13888,11 +14054,11 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   if (readCount)*readCount = 0;
                                   if (!data && amount)return 0;
                                   if (reinterpret_cast<std::uintptr_t>(handle) != 3u) {
-                                      auto* f=static_cast<std::FILE*>(handle);
-                                      if(!f)return 0;
-                                      const auto n=std::fread(data,1,amount,f);
-                                      if(readCount)*readCount=static_cast<std::uint32_t>(n);
-                                      return std::ferror(f)?0:1;
+                                      auto* f = static_cast<std::FILE*>(handle);
+                                      if (!f)return 0;
+                                      const auto n = std::fread(data, 1, amount, f);
+                                      if (readCount)*readCount = static_cast<std::uint32_t>(n);
+                                      return std::ferror(f) ? 0 : 1;
                                   }
                                   const ssize_t n = ::read(0, data, amount);
                                   if (n < 0)return 0;
@@ -13901,152 +14067,156 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                               }
                               // Host-only Win64 ABI shims for deterministic native differential
                               // tests. Production PE files import the real Windows functions.
-                              static std::string pcn_test_u16_to_utf8(const char16_t* src,std::size_t n){
+                              static std::string pcn_test_u16_to_utf8(const char16_t* src, std::size_t n) {
                                   std::string result;
-                                  for(std::size_t i=0;i<n;++i){
-                                      std::uint32_t cp=src[i];
-                                      if(cp>=0xD800 && cp<=0xDBFF){
-                                          if(i+1>=n || src[i+1]<0xDC00 || src[i+1]>0xDFFF)return {};
-                                          cp=0x10000+((cp-0xD800)<<10)+(src[++i]-0xDC00);
-                                      }else if(cp>=0xDC00 && cp<=0xDFFF)return {};
-                                      if(cp<0x80)result.push_back(static_cast<char>(cp));
-                                      else if(cp<0x800){result.push_back(static_cast<char>(0xC0|(cp>>6)));result.push_back(static_cast<char>(0x80|(cp&63)));}
-                                      else if(cp<0x10000){result.push_back(static_cast<char>(0xE0|(cp>>12)));result.push_back(static_cast<char>(0x80|((cp>>6)&63)));result.push_back(static_cast<char>(0x80|(cp&63)));}
-                                      else {result.push_back(static_cast<char>(0xF0|(cp>>18)));result.push_back(static_cast<char>(0x80|((cp>>12)&63)));result.push_back(static_cast<char>(0x80|((cp>>6)&63)));result.push_back(static_cast<char>(0x80|(cp&63)));}
+                                  for (std::size_t i = 0; i < n; ++i) {
+                                      std::uint32_t cp = src[i];
+                                      if (cp >= 0xD800 && cp <= 0xDBFF) {
+                                          if (i + 1 >= n || src[i + 1] < 0xDC00 || src[i + 1]>0xDFFF)return {};
+                                          cp = 0x10000 + ((cp - 0xD800) << 10) + (src[++i] - 0xDC00);
+                                      }
+                                      else if (cp >= 0xDC00 && cp <= 0xDFFF)return {};
+                                      if (cp < 0x80)result.push_back(static_cast<char>(cp));
+                                      else if (cp < 0x800) { result.push_back(static_cast<char>(0xC0 | (cp >> 6))); result.push_back(static_cast<char>(0x80 | (cp & 63))); }
+                                      else if (cp < 0x10000) { result.push_back(static_cast<char>(0xE0 | (cp >> 12))); result.push_back(static_cast<char>(0x80 | ((cp >> 6) & 63))); result.push_back(static_cast<char>(0x80 | (cp & 63))); }
+                                      else { result.push_back(static_cast<char>(0xF0 | (cp >> 18))); result.push_back(static_cast<char>(0x80 | ((cp >> 12) & 63))); result.push_back(static_cast<char>(0x80 | ((cp >> 6) & 63))); result.push_back(static_cast<char>(0x80 | (cp & 63))); }
                                   }return result;
                               }
-                              static std::u16string pcn_test_utf8_to_u16(const char* src,std::size_t n){
+                              static std::u16string pcn_test_utf8_to_u16(const char* src, std::size_t n) {
                                   std::u16string out;
-                                  for(std::size_t i=0;i<n;){
-                                      unsigned char lead=static_cast<unsigned char>(src[i++]);std::uint32_t cp=lead;unsigned extra=0;
-                                      if(lead>=0xC2 && lead<=0xDF){cp=lead&31;extra=1;}
-                                      else if(lead>=0xE0 && lead<=0xEF){cp=lead&15;extra=2;}
-                                      else if(lead>=0xF0 && lead<=0xF4){cp=lead&7;extra=3;}
-                                      else if(lead>=0x80)throw std::runtime_error("invalid UTF8");
-                                      if(extra>n-i)throw std::runtime_error("truncated UTF8");
-                                      for(unsigned k=0;k<extra;++k){auto c=static_cast<unsigned char>(src[i++]);if((c&0xC0)!=0x80)throw std::runtime_error("invalid UTF8 continuation");cp=(cp<<6)|(c&63);}
-                                      if((extra==1 && cp<0x80)||(extra==2 && cp<0x800)||(extra==3 && cp<0x10000)||cp>0x10FFFF||(cp>=0xD800&&cp<=0xDFFF))throw std::runtime_error("invalid UTF8 scalar");
-                                      if(cp<0x10000)out.push_back(static_cast<char16_t>(cp));
-                                      else {cp-=0x10000;out.push_back(static_cast<char16_t>(0xD800+(cp>>10)));out.push_back(static_cast<char16_t>(0xDC00+(cp&1023)));}
+                                  for (std::size_t i = 0; i < n;) {
+                                      unsigned char lead = static_cast<unsigned char>(src[i++]); std::uint32_t cp = lead; unsigned extra = 0;
+                                      if (lead >= 0xC2 && lead <= 0xDF) { cp = lead & 31; extra = 1; }
+                                      else if (lead >= 0xE0 && lead <= 0xEF) { cp = lead & 15; extra = 2; }
+                                      else if (lead >= 0xF0 && lead <= 0xF4) { cp = lead & 7; extra = 3; }
+                                      else if (lead >= 0x80)throw std::runtime_error("invalid UTF8");
+                                      if (extra > n - i)throw std::runtime_error("truncated UTF8");
+                                      for (unsigned k = 0; k < extra; ++k) { auto c = static_cast<unsigned char>(src[i++]); if ((c & 0xC0) != 0x80)throw std::runtime_error("invalid UTF8 continuation"); cp = (cp << 6) | (c & 63); }
+                                      if ((extra == 1 && cp < 0x80) || (extra == 2 && cp < 0x800) || (extra == 3 && cp < 0x10000) || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))throw std::runtime_error("invalid UTF8 scalar");
+                                      if (cp < 0x10000)out.push_back(static_cast<char16_t>(cp));
+                                      else { cp -= 0x10000; out.push_back(static_cast<char16_t>(0xD800 + (cp >> 10))); out.push_back(static_cast<char16_t>(0xDC00 + (cp & 1023))); }
                                   }return out;
                               }
-                              extern "C" __attribute__((ms_abi)) int pcn_test_MultiByteToWideChar(std::uint32_t,std::uint32_t,const char* src,int count,char16_t* dest,int cap){
-                                  if(!src || count==0)return 0;
-                                  try{
-                                      std::size_t n=count<0?std::strlen(src):static_cast<std::size_t>(count);
-                                      auto wide=pcn_test_utf8_to_u16(src,n);
-                                      const bool nul=count<0;
-                                      if(wide.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()-1))return 0;
-                                      int required=static_cast<int>(wide.size())+(nul?1:0);
-                                      if(!dest)return required;
-                                      if(cap<required)return 0;
-                                      std::memcpy(dest,wide.data(),wide.size()*2);
-                                      if(nul)dest[wide.size()]=0;
+                              extern "C" __attribute__((ms_abi)) int pcn_test_MultiByteToWideChar(std::uint32_t, std::uint32_t, const char* src, int count, char16_t* dest, int cap) {
+                                  if (!src || count == 0)return 0;
+                                  try {
+                                      std::size_t n = count < 0 ? std::strlen(src) : static_cast<std::size_t>(count);
+                                      auto wide = pcn_test_utf8_to_u16(src, n);
+                                      const bool nul = count < 0;
+                                      if (wide.size() > static_cast<std::size_t>(std::numeric_limits<int>::max() - 1))return 0;
+                                      int required = static_cast<int>(wide.size()) + (nul ? 1 : 0);
+                                      if (!dest)return required;
+                                      if (cap < required)return 0;
+                                      std::memcpy(dest, wide.data(), wide.size() * 2);
+                                      if (nul)dest[wide.size()] = 0;
                                       return required;
-                                  }catch(...){return 0;}
+                                  }
+                                  catch (...) { return 0; }
                               }
-                              extern "C" __attribute__((ms_abi)) int pcn_test_WideCharToMultiByte(std::uint32_t,std::uint32_t,const char16_t* src,int count,char* dest,int cap,const void*,void*){
-                                  if(!src || count==0)return 0;
-                                  std::size_t n=0;
-                                  if(count<0){while(src[n])++n;}else n=static_cast<std::size_t>(count);
-                                  auto utf8=pcn_test_u16_to_utf8(src,n);const bool nul=count<0;
-                                  int required=static_cast<int>(utf8.size())+(nul?1:0);
-                                  if(!dest)return required;
-                                  if(cap<required)return 0;
-                                  std::memcpy(dest,utf8.data(),utf8.size());if(nul)dest[utf8.size()]=0;
+                              extern "C" __attribute__((ms_abi)) int pcn_test_WideCharToMultiByte(std::uint32_t, std::uint32_t, const char16_t* src, int count, char* dest, int cap, const void*, void*) {
+                                  if (!src || count == 0)return 0;
+                                  std::size_t n = 0;
+                                  if (count < 0) { while (src[n])++n; }
+                                  else n = static_cast<std::size_t>(count);
+                                  auto utf8 = pcn_test_u16_to_utf8(src, n); const bool nul = count < 0;
+                                  int required = static_cast<int>(utf8.size()) + (nul ? 1 : 0);
+                                  if (!dest)return required;
+                                  if (cap < required)return 0;
+                                  std::memcpy(dest, utf8.data(), utf8.size()); if (nul)dest[utf8.size()] = 0;
                                   return required;
                               }
-                              extern "C" __attribute__((ms_abi)) const char16_t* pcn_test_GetCommandLineW(){
+                              extern "C" __attribute__((ms_abi)) const char16_t* pcn_test_GetCommandLineW() {
                                   // Linux-only deterministic test override. No runtime platform
                                   // change: production Windows binaries import GetCommandLineW.
-                                  if (const char* custom=std::getenv("PARACINE_TEST_COMMANDLINE")) {
+                                  if (const char* custom = std::getenv("PARACINE_TEST_COMMANDLINE")) {
                                       static std::u16string command;
-                                      command=pcn_test_utf8_to_u16(custom,std::strlen(custom));
+                                      command = pcn_test_utf8_to_u16(custom, std::strlen(custom));
                                       return command.c_str();
                                   }
-                                  static const char16_t command[]=u"stage0_test.exe alpha \"two words\" \U0001F680";
+                                  static const char16_t command[] = u"stage0_test.exe alpha \"two words\" \U0001F680";
                                   return command;
                               }
-                              extern "C" __attribute__((ms_abi)) char16_t** pcn_test_CommandLineToArgvW(const char16_t* raw,int* argc){
-                                  if(!raw || !argc)return nullptr;
-                                  std::vector<std::u16string> args;std::u16string cur;bool inside=false;
-                                  for(std::size_t i=0;;++i){const char16_t c=raw[i];
-                                      if(c==u'"'){inside=!inside;continue;}
-                                      if(!c || ((!inside)&&(c==u' ' || c==u'\t'))){if(!cur.empty()){args.push_back(cur);cur.clear();}if(!c)break;}
+                              extern "C" __attribute__((ms_abi)) char16_t** pcn_test_CommandLineToArgvW(const char16_t* raw, int* argc) {
+                                  if (!raw || !argc)return nullptr;
+                                  std::vector<std::u16string> args; std::u16string cur; bool inside = false;
+                                  for (std::size_t i = 0;; ++i) {
+                                      const char16_t c = raw[i];
+                                      if (c == u'"') { inside = !inside; continue; }
+                                      if (!c || ((!inside) && (c == u' ' || c == u'\t'))) { if (!cur.empty()) { args.push_back(cur); cur.clear(); }if (!c)break; }
                                       else cur.push_back(c);
                                   }
-                                  std::size_t bytes=(args.size()+1)*sizeof(char16_t*);for(const auto& a:args)bytes+=(a.size()+1)*2;
-                                  void* mem=std::malloc(bytes);if(!mem)return nullptr;
-                                  auto ptrs=static_cast<char16_t**>(mem);auto cursor=reinterpret_cast<char16_t*>(ptrs+args.size()+1);
-                                  for(std::size_t i=0;i<args.size();++i){ptrs[i]=cursor;std::memcpy(cursor,args[i].c_str(),(args[i].size()+1)*2);cursor+=args[i].size()+1;}
-                                  ptrs[args.size()]=nullptr;*argc=static_cast<int>(args.size());return ptrs;
+                                  std::size_t bytes = (args.size() + 1) * sizeof(char16_t*); for (const auto& a : args)bytes += (a.size() + 1) * 2;
+                                  void* mem = std::malloc(bytes); if (!mem)return nullptr;
+                                  auto ptrs = static_cast<char16_t**>(mem); auto cursor = reinterpret_cast<char16_t*>(ptrs + args.size() + 1);
+                                  for (std::size_t i = 0; i < args.size(); ++i) { ptrs[i] = cursor; std::memcpy(cursor, args[i].c_str(), (args[i].size() + 1) * 2); cursor += args[i].size() + 1; }
+                                  ptrs[args.size()] = nullptr; *argc = static_cast<int>(args.size()); return ptrs;
                               }
-                              extern "C" __attribute__((ms_abi)) void* pcn_test_LocalFree(void* p){std::free(p);return nullptr;}
-                              extern "C" __attribute__((ms_abi)) void* pcn_test_CreateFileW(const char16_t* name,std::uint32_t access,std::uint32_t,void*,std::uint32_t disposition,std::uint32_t,void*){
-                                  if(!name)return reinterpret_cast<void*>(~std::uintptr_t{0});
-                                  std::size_t n=0;while(name[n])++n;
-                                  const auto path=pcn_test_u16_to_utf8(name,n);
-                                  if(path.empty())return reinterpret_cast<void*>(~std::uintptr_t{0});
-                                  auto* f=std::fopen(path.c_str(),(access & 0x40000000u) && disposition == 2 ? "wb" : "rb");return f?static_cast<void*>(f):reinterpret_cast<void*>(~std::uintptr_t{0});
+                              extern "C" __attribute__((ms_abi)) void* pcn_test_LocalFree(void* p) { std::free(p); return nullptr; }
+                              extern "C" __attribute__((ms_abi)) void* pcn_test_CreateFileW(const char16_t* name, std::uint32_t access, std::uint32_t, void*, std::uint32_t disposition, std::uint32_t, void*) {
+                                  if (!name)return reinterpret_cast<void*>(~std::uintptr_t{ 0 });
+                                  std::size_t n = 0; while (name[n])++n;
+                                  const auto path = pcn_test_u16_to_utf8(name, n);
+                                  if (path.empty())return reinterpret_cast<void*>(~std::uintptr_t{ 0 });
+                                  auto* f = std::fopen(path.c_str(), (access & 0x40000000u) && disposition == 2 ? "wb" : "rb"); return f ? static_cast<void*>(f) : reinterpret_cast<void*>(~std::uintptr_t{ 0 });
                               }
-                              extern "C" __attribute__((ms_abi)) std::uint32_t pcn_test_GetFileAttributesW(const char16_t* name){
-                                  if(!name)return 0xffffffffu;
-                                  std::size_t n=0;while(name[n])++n;
-                                  const auto path=pcn_test_u16_to_utf8(name,n);
-                                  if(path.empty())return 0xffffffffu;
+                              extern "C" __attribute__((ms_abi)) std::uint32_t pcn_test_GetFileAttributesW(const char16_t* name) {
+                                  if (!name)return 0xffffffffu;
+                                  std::size_t n = 0; while (name[n])++n;
+                                  const auto path = pcn_test_u16_to_utf8(name, n);
+                                  if (path.empty())return 0xffffffffu;
                                   std::error_code ec;
-                                  const auto status=std::filesystem::status(filesystemPathFromUtf8(path),ec);
-                                  if(ec || !std::filesystem::exists(status))return 0xffffffffu;
+                                  const auto status = std::filesystem::status(filesystemPathFromUtf8(path), ec);
+                                  if (ec || !std::filesystem::exists(status))return 0xffffffffu;
                                   return std::filesystem::is_directory(status) ? 0x10u : 0x80u;
                               }
-                              extern "C" __attribute__((ms_abi)) int pcn_test_GetFileSizeEx(void* h,std::int64_t* size){
-                                  auto* f=static_cast<std::FILE*>(h);if(!f||!size)return 0;
-                                  long at=std::ftell(f);if(at<0 || std::fseek(f,0,SEEK_END)!=0)return 0;
-                                  long end=std::ftell(f);if(end<0)return 0;
-                                  if(std::fseek(f,at,SEEK_SET)!=0)return 0;*size=end;return 1;
+                              extern "C" __attribute__((ms_abi)) int pcn_test_GetFileSizeEx(void* h, std::int64_t* size) {
+                                  auto* f = static_cast<std::FILE*>(h); if (!f || !size)return 0;
+                                  long at = std::ftell(f); if (at < 0 || std::fseek(f, 0, SEEK_END) != 0)return 0;
+                                  long end = std::ftell(f); if (end < 0)return 0;
+                                  if (std::fseek(f, at, SEEK_SET) != 0)return 0; *size = end; return 1;
                               }
                               // Win64 ABI process shims exercise actual generated machine code on
                               // Linux. Production PE32+ binaries import the real Win32 APIs.
-                              struct PcnTestChild { pid_t pid=-1; int exitCode=-1; bool waited=false; };
+                              struct PcnTestChild { pid_t pid = -1; int exitCode = -1; bool waited = false; };
                               static std::unordered_set<PcnTestChild*> pcn_test_children;
-                              static constexpr std::uintptr_t pcn_test_thread_sentinel=0x127;
+                              static constexpr std::uintptr_t pcn_test_thread_sentinel = 0x127;
                               struct PcnTestProcessInfo { void* process; void* thread; std::uint32_t processId; std::uint32_t threadId; };
-                              extern "C" __attribute__((ms_abi)) int pcn_test_CreateProcessW(const char16_t*,char16_t* cmd,
-                                  void*,void*,int,std::uint32_t,void*,const char16_t*,void*,PcnTestProcessInfo* result){
-                                  if(!cmd || !result)return 0;
-                                  std::size_t n=0;while(cmd[n])++n;
-                                  const std::string command=pcn_test_u16_to_utf8(cmd,n);
-                                  if(command.empty())return 0;
-                                  const auto pid=fork();
-                                  if(pid<0)return 0;
-                                  if(pid==0){
-                                      execl("/bin/sh","sh","-c",command.c_str(),static_cast<char*>(nullptr));
+                              extern "C" __attribute__((ms_abi)) int pcn_test_CreateProcessW(const char16_t*, char16_t* cmd,
+                                  void*, void*, int, std::uint32_t, void*, const char16_t*, void*, PcnTestProcessInfo* result) {
+                                  if (!cmd || !result)return 0;
+                                  std::size_t n = 0; while (cmd[n])++n;
+                                  const std::string command = pcn_test_u16_to_utf8(cmd, n);
+                                  if (command.empty())return 0;
+                                  const auto pid = fork();
+                                  if (pid < 0)return 0;
+                                  if (pid == 0) {
+                                      execl("/bin/sh", "sh", "-c", command.c_str(), static_cast<char*>(nullptr));
                                       _exit(127);
                                   }
-                                  auto* p=new PcnTestChild{pid,-1,false};pcn_test_children.insert(p);
-                                  result->process=p;result->thread=reinterpret_cast<void*>(pcn_test_thread_sentinel);
-                                  result->processId=static_cast<std::uint32_t>(pid);result->threadId=0;
+                                  auto* p = new PcnTestChild{ pid,-1,false }; pcn_test_children.insert(p);
+                                  result->process = p; result->thread = reinterpret_cast<void*>(pcn_test_thread_sentinel);
+                                  result->processId = static_cast<std::uint32_t>(pid); result->threadId = 0;
                                   return 1;
                               }
-                              extern "C" __attribute__((ms_abi)) std::uint32_t pcn_test_WaitForSingleObject(void* handle,std::uint32_t){
-                                  auto* p=static_cast<PcnTestChild*>(handle);
-                                  if(!pcn_test_children.contains(p))return 0xffffffffu;
-                                  if(!p->waited){
-                                      int status=0;if(waitpid(p->pid,&status,0)<0)return 0xffffffffu;
-                                      p->exitCode=WIFEXITED(status)?WEXITSTATUS(status):-1;p->waited=true;
+                              extern "C" __attribute__((ms_abi)) std::uint32_t pcn_test_WaitForSingleObject(void* handle, std::uint32_t) {
+                                  auto* p = static_cast<PcnTestChild*>(handle);
+                                  if (!pcn_test_children.contains(p))return 0xffffffffu;
+                                  if (!p->waited) {
+                                      int status = 0; if (waitpid(p->pid, &status, 0) < 0)return 0xffffffffu;
+                                      p->exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1; p->waited = true;
                                   }
                                   return 0;
                               }
-                              extern "C" __attribute__((ms_abi)) int pcn_test_GetExitCodeProcess(void* handle,std::uint32_t* exitCode){
-                                  auto* p=static_cast<PcnTestChild*>(handle);
-                                  if(!pcn_test_children.contains(p) || !p->waited || !exitCode)return 0;
-                                  *exitCode=static_cast<std::uint32_t>(p->exitCode);return 1;
+                              extern "C" __attribute__((ms_abi)) int pcn_test_GetExitCodeProcess(void* handle, std::uint32_t* exitCode) {
+                                  auto* p = static_cast<PcnTestChild*>(handle);
+                                  if (!pcn_test_children.contains(p) || !p->waited || !exitCode)return 0;
+                                  *exitCode = static_cast<std::uint32_t>(p->exitCode); return 1;
                               }
-                              extern "C" __attribute__((ms_abi)) int pcn_test_CloseHandle(void* h){
-                                  if(reinterpret_cast<std::uintptr_t>(h)==pcn_test_thread_sentinel)return 1;
-                                  auto* child=static_cast<PcnTestChild*>(h);
-                                  if(pcn_test_children.erase(child)){delete child;return 1;}
-                                  return h && std::fclose(static_cast<std::FILE*>(h))==0;
+                              extern "C" __attribute__((ms_abi)) int pcn_test_CloseHandle(void* h) {
+                                  if (reinterpret_cast<std::uintptr_t>(h) == pcn_test_thread_sentinel)return 1;
+                                  auto* child = static_cast<PcnTestChild*>(h);
+                                  if (pcn_test_children.erase(child)) { delete child; return 1; }
+                                  return h && std::fclose(static_cast<std::FILE*>(h)) == 0;
                               }
                               static void* hostImport(const std::string& name) {
                                   if (name == "GetProcessHeap")return reinterpret_cast<void*>(&pcn_test_GetProcessHeap);
@@ -14132,7 +14302,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           }
                                           _exit(0);
                                       }
-                                      catch (const std::exception& ex) { std::fprintf(stderr,"native-test exception: %s\n",ex.what());_exit(124); }
+                                      catch (const std::exception& ex) { std::fprintf(stderr, "native-test exception: %s\n", ex.what()); _exit(124); }
                                       catch (...) { _exit(125); }
                                   }
                                   close(channel[1]);
@@ -15206,7 +15376,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       if (!artifacts.analysis.succeeded()) throw std::runtime_error("labeled continue rejected by semantic analysis");
                                       if (PCIRInterpreter(artifacts.pcir).run("") != 3)
                                           throw std::runtime_error("labeled continue PCIR result differs from expected 3");
-                                  });
+                                      });
                                   test("labeled nested break exits selected loop", [&] {
                                       const auto artifacts = compileAll(
                                           "routine main() gives int\n"
@@ -15220,24 +15390,24 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       if (!artifacts.analysis.succeeded()) throw std::runtime_error("labeled break rejected by semantic analysis");
                                       if (PCIRInterpreter(artifacts.pcir).run("") != 1)
                                           throw std::runtime_error("labeled break PCIR result differs from expected 1");
-                                  });
+                                      });
                                   test("invalid labels rejected with semantic diagnostics", [&] {
                                       expectSemanticDiagnostic("routine main() gives int\n    from i = 1 to 2\n        break @missing\n    give 0\n", "unknown enclosing loop", "invalid labeled break");
                                       expectSemanticDiagnostic("routine main() gives int\n    @same: from i = 1 to 2\n        @same: from j = 1 to 3\n            break\n    give 0\n", "duplicate active loop label", "duplicate active label");
-                                  });
+                                      });
                                   test("non-loop labels rejected by parser", [&] {
                                       bool rejected = false;
                                       try { (void)Parser(Lexer("routine main() gives int\n    @bad: if true\n        give 1\n    give 0\n").tokenize()).parse(); }
                                       catch (const std::exception& ex) { rejected = std::string(ex.what()).find("E0240") != std::string::npos; }
                                       if (!rejected) throw std::runtime_error("expected E0240 for non-loop label");
-                                  });
+                                      });
                                   test("guarded for survives closure discovery and textual output", [&] {
                                       const std::string src = "routine main() gives int\n    var sum: int = 0\n    @scan: for n in 0..=5 while n < 3\n        sum += n\n    give sum\n";
                                       const auto artifacts = compileAll(src, CompilerOptions{});
                                       if (!artifacts.analysis.succeeded()) throw std::runtime_error("guarded for semantic rejection");
                                       if (PCIRInterpreter(artifacts.pcir).run("") != 3)
                                           throw std::runtime_error("guarded for PCIR wrong value");
-                                  });
+                                      });
                                   test("fixed-array iteration and stopping guard", [&] {
                                       for (int opt : {0, 3}) {
                                           CompilerOptions options; options.optimizationLevel = opt;
@@ -15252,13 +15422,13 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           if (PCIRInterpreter(artifacts.pcir).run("") != 6)
                                               throw std::runtime_error("array guard PCIR execution mismatch");
                                       }
-                                  });
+                                      });
                                   test("fixed-array iteration over literal", [&] {
                                       auto artifacts = compileAll("routine main() gives int\n    var total: int = 0\n    for n in [3, 4, 5]\n        total += n\n    give total\n", CompilerOptions{});
                                       if (!artifacts.analysis.succeeded())throw std::runtime_error("array literal semantic failure");
                                       if (PCIRInterpreter(artifacts.pcir).run("") != 12)
                                           throw std::runtime_error("array literal iteration mismatch");
-                                  });
+                                      });
                                   test("for inclusive maximum endpoint does not advance past end", [&] {
                                       auto artifacts = compileAll(
                                           "routine main() gives int\n"
@@ -15269,30 +15439,30 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       if (!artifacts.analysis.succeeded())throw std::runtime_error("inclusive maximum rejected");
                                       if (PCIRInterpreter(artifacts.pcir).run("") != 2)
                                           throw std::runtime_error("inclusive numeric range wrapped at MAX");
-                                  });
+                                      });
                                   test("array loop variable cannot escape lexical scope", [&] {
                                       expectSemanticDiagnostic("routine main() gives int\n    for n in [1, 2]\n        println(n)\n    give n\n", "unknown name: n", "loop binding out of scope");
-                                  });
+                                      });
                                   test("array iteration lowered to executing x64 machine code", [&] {
                                       auto a = compileAll("routine main() gives int\n    let x: array<int,4> = [2, 4, 9, 1]\n    var sum: int = 0\n    for n in x while n < 8\n        sum += n\n    give sum\n", CompilerOptions{});
                                       if (!a.analysis.succeeded())throw std::runtime_error("array native semantic rejection");
 #if defined(__linux__) && defined(__x86_64__)
                                       if (executeEmittedMachineTextIsolated(a.machine) != 6)throw std::runtime_error("array native machine mismatch");
 #endif
-                                  });
+                                      });
                                   test("labeled continue lowered to executing x64 machine code", [&] {
                                       auto a = compileAll("routine main() gives int\n    var n: int = 0\n    @outer: from i: int = 1 to 3\n        @inner: from j: int = 1 to 2\n            n += 1\n            if j == 1\n                continue @outer\n    give n\n", CompilerOptions{});
                                       if (!a.analysis.succeeded())throw std::runtime_error("labeled native semantic rejection");
 #if defined(__linux__) && defined(__x86_64__)
                                       if (executeEmittedMachineTextIsolated(a.machine) != 3)throw std::runtime_error("labeled native machine mismatch");
 #endif
-                                  });
+                                      });
                                   test("unsupported view iterator diagnosed in semantic phase", [&] {
                                       expectSemanticSuccess("routine accumulate(items: view<int>) gives int with trap\n    var sum: int = 0\n    for n in items\n        sum += n\n    give sum\n", "view iterator semantic support");
-                                  });
+                                      });
                                   test("mutable for-array iteration fails closed", [&] {
                                       expectSemanticDiagnostic("routine main() gives int\n    var nums: array<int,2> = [1, 2]\n    for var n in nums\n        n += 1\n    give 0\n", "E0612 for var", "array mutable element borrowing");
-                                  });
+                                      });
                                   test("labeled continue-until jump always visits post-test", [&] {
                                       auto artifacts = compileAll(
                                           "routine main() gives int\n"
@@ -15307,7 +15477,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 #if defined(__linux__) && defined(__x86_64__)
                                       if (executeEmittedMachineTextIsolated(artifacts.machine) != 3) throw std::runtime_error("labeled post-test native mismatch");
 #endif
-                                  });
+                                      });
                                   test("labeled while break exits target loop", [&] {
                                       auto artifacts = compileAll(
                                           "routine main() gives int\n"
@@ -15323,7 +15493,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 #if defined(__linux__) && defined(__x86_64__)
                                       if (executeEmittedMachineTextIsolated(artifacts.machine) != 4) throw std::runtime_error("labeled while native mismatch");
 #endif
-                                  });
+                                      });
                                   test("optimizer converges with copy propagation and branch folding", [&] {
                                       auto artifacts = compileAll(
                                           "routine main() gives int\n"
@@ -15358,14 +15528,14 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                               for (const auto& b : f.blocks) for (const auto& i : b.instructions)
                                                   if (i.op == IROpcode::Call) ++count;
                                           return count;
-                                      };
+                                          };
                                       if (calls(baseline.pcir, "main") != 1 || calls(optimized.pcir, "main") != 0)
                                           throw std::runtime_error("small pure leaf call was not eliminated");
 #if defined(__linux__) && defined(__x86_64__)
                                       if (executeEmittedMachineTextIsolated(optimized.machine) != 72)
                                           throw std::runtime_error("inlined native x64 differs from PCIR");
 #endif
-                                  });
+                                      });
                                   test("premium optimizer: local common-subexpression reuse", [&] {
                                       const std::string src =
                                           "routine twice(x: int) gives int\n"
@@ -15380,13 +15550,13 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                               for (const auto& b : f.blocks) for (const auto& i : b.instructions)
                                                   if (i.op == IROpcode::Mul) ++n;
                                           return n;
-                                      };
+                                          };
                                       CompilerOptions o0; o0.optimizationLevel = 0;
                                       CompilerOptions o3; o3.optimizationLevel = 3;
                                       const auto a = compileAll(src, o0), b = compileAll(src, o3);
                                       if (multiplicationCount(a.pcir) != 2 || multiplicationCount(b.pcir) != 1)
                                           throw std::runtime_error("integer value numbering did not remove duplicate multiplication");
-                                  });
+                                      });
                                   test("premium optimizer: cross-block propagation and dead CFG", [&] {
                                       const std::string src =
                                           "routine main() gives int\n"
@@ -15402,7 +15572,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           throw std::runtime_error("constant CFG edges were not pruned");
                                       if (PCIRInterpreter(opt.pcir).run("") != 42)
                                           throw std::runtime_error("cross-block constant propagation changed result");
-                                  });
+                                      });
                                   test("premium optimizer: mutable snapshots retain old values", [&] {
                                       const std::string src =
                                           "routine main() gives int\n"
@@ -15411,7 +15581,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           "    n = 7\n"
                                           "    let after: int = n\n"
                                           "    give before * 10 + after\n";
-                                      for (int level : {0,3}) {
+                                      for (int level : {0, 3}) {
                                           CompilerOptions o; o.optimizationLevel = level;
                                           auto a = compileAll(src, o);
                                           if (PCIRInterpreter(a.pcir).run("") != 47)
@@ -15421,7 +15591,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                               throw std::runtime_error("native mutable snapshot diverged");
 #endif
                                       }
-                                  });
+                                      });
                                   test("premium optimizer: loop-carried dataflow is conservative", [&] {
                                       const std::string src =
                                           "routine main() gives int\n"
@@ -15432,7 +15602,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           "        count += 1\n"
                                           "        total += snapshot\n"
                                           "    give total\n";
-                                      for (int level : {0,3}) {
+                                      for (int level : {0, 3}) {
                                           CompilerOptions o; o.optimizationLevel = level;
                                           auto a = compileAll(src, o);
                                           if (PCIRInterpreter(a.pcir).run("") != 21)
@@ -15442,7 +15612,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                               throw std::runtime_error("loop native execution changed by optimizer");
 #endif
                                       }
-                                  });
+                                      });
                                   test("premium optimizer: division-by-zero trap is retained even if unused", [&] {
                                       CompilerOptions o; o.optimizationLevel = 3;
                                       auto a = compileAll(
@@ -15456,7 +15626,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           for (const auto& i : b.instructions)
                                               if (i.op == IROpcode::Div) hasDivision = true;
                                       if (!hasDivision) throw std::runtime_error("unsafe DCE removed observable divide trap");
-                                  });
+                                      });
                                   test("premium optimizer: immutable UTF-8 literal predicates across blocks", [&] {
                                       const std::string src =
                                           "routine main() gives int\n"
@@ -15476,7 +15646,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           for (const auto& f : program.functions) for (const auto& block : f.blocks)
                                               for (const auto& i : block.instructions) ++count;
                                           return count;
-                                      };
+                                          };
                                       if (n(b.pcir) >= n(a.pcir))
                                           throw std::runtime_error("constant text code produced no IR reduction");
                                       if (PCIRInterpreter(b.pcir).run("") != 73)
@@ -15485,7 +15655,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       if (executeEmittedMachineTextIsolated(b.machine) != 73)
                                           throw std::runtime_error("UTF-8 literal native result differs from PCIR");
 #endif
-                                  });
+                                      });
                                   test("premium optimizer: observable stdout operations remain ordered", [&] {
                                       const std::string src =
                                           "module hello\n"
@@ -15503,97 +15673,98 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                               for (const auto& i : block.instructions)
                                                   if (i.op == IROpcode::TextStreamWrite) ++n;
                                           return n;
-                                      };
+                                          };
                                       if (writes(a.pcir) != 4 || writes(b.pcir) != 4)
                                           throw std::runtime_error("optimizer discarded or reordered observable print operations");
-                                  });
+                                      });
                                   // Stage-0 semantic hardening and Stage-1 bootstrap readiness.
                                   test("type-check: unknown parameter type", [&] {
                                       expectSemanticDiagnostic("routine main(x: Imaginary) gives int\n    give 0\n", "E0321 unknown type", "unknown param type");
-                                  });
+                                      });
                                   test("type-check: unknown return type", [&] {
                                       expectSemanticDiagnostic("routine main() gives Missing\n    give 0\n", "E0321 unknown type", "unknown return type");
-                                  });
+                                      });
                                   test("type-check: forward record declarations", [&] {
                                       expectSemanticSuccess("record First\n    second: Second\nrecord Second\n    value: int\nroutine main() gives int\n    give 0\n", "forward nominal type");
-                                  });
+                                      });
                                   test("type-check: infinitely recursive structures rejected", [&] {
                                       expectSemanticDiagnostic("record Node\n    next: Node\nroutine main() gives int\n    give 0\n", "E0329 infinitely recursive", "recursive inline record");
-                                  });
+                                      });
                                   test("type-check: mutual recursion through inline fields rejected", [&] {
                                       expectSemanticDiagnostic("record A\n    next: B\nrecord B\n    back: A\nroutine main() gives int\n    give 0\n", "E0329 infinitely recursive", "mutual inline record recursion");
-                                  });
+                                      });
                                   test("type-check: duplicate record field", [&] {
                                       expectSemanticDiagnostic("record Pair\n    x: int\n    x: double\nroutine main() gives int\n    give 0\n", "E0325 duplicate field", "duplicate record member");
-                                  });
+                                      });
                                   test("type-check: void cannot be a stored field", [&] {
                                       expectSemanticDiagnostic("record Wrong\n    payload: void\nroutine main() gives int\n    give 0\n", "E0324 stored field", "void record field");
-                                  });
+                                      });
                                   test("type-check: malformed generic arity", [&] {
                                       expectSemanticDiagnostic("routine main() gives int\n    let v: option<int,int> = nothing\n    give 0\n", "E0322 type 'option'", "generic arity");
-                                  });
+                                      });
                                   test("type-check: invalid array length parameter", [&] {
                                       expectSemanticDiagnostic("routine main(items: array<int,bool>) gives int\n    give 0\n", "E0323 fixed-array", "array length is not an integer");
-                                  });
+                                      });
                                   test("type-check: missing non-void return path", [&] {
                                       expectSemanticDiagnostic("routine main(x: bool) gives int\n    if x\n        give 42\n", "E0326 routine", "missing return path");
-                                  });
+                                      });
                                   test("type-check: declared constant type", [&] {
                                       // Constant expressions receive an even earlier lexical/const-evaluation check.
                                       try {
-                                          auto result=compileAll("const WRONG: int = true\nroutine main() gives int\n    give 0\n", CompilerOptions{},false);
-                                          if (!hasDiagnostic(result.analysis,"E0327 constant")) throw std::runtime_error("invalid constant accepted");
-                                      } catch (const std::exception& ex) {
+                                          auto result = compileAll("const WRONG: int = true\nroutine main() gives int\n    give 0\n", CompilerOptions{}, false);
+                                          if (!hasDiagnostic(result.analysis, "E0327 constant")) throw std::runtime_error("invalid constant accepted");
+                                      }
+                                      catch (const std::exception& ex) {
                                           if (std::string(ex.what()).find("E0234") == std::string::npos) throw;
                                       }
-                                  });
+                                      });
                                   test("type-check: mixed logical operand", [&] {
                                       expectSemanticDiagnostic("routine main() gives int\n    if true and 1\n        give 1\n    give 0\n", "E0328 logical operator", "bool and numeric");
-                                  });
+                                      });
                                   test("type-check: unknown local annotation", [&] {
                                       expectSemanticDiagnostic("routine main() gives int\n    let sample: Unseen = 3\n    give 0\n", "E0321 unknown type", "unknown let annotation");
-                                  });
+                                      });
                                   test("type-check: float array index", [&] {
                                       expectSemanticDiagnostic("routine main() gives int\n    let a: array<int,2> = [1,2]\n    give a[1.0]\n", "E0310 array index", "floating array index");
-                                  });
+                                      });
                                   test("diagnostics: machine-readable code and help", [&] {
-                                      const auto a=compileAll("routine main() gives int\n    let t: Ghost = 0\n    give 0\n",CompilerOptions{},false);
+                                      const auto a = compileAll("routine main() gives int\n    let t: Ghost = 0\n    give 0\n", CompilerOptions{}, false);
                                       if (a.analysis.diagnostics.empty())throw std::runtime_error("missing failure");
-                                      const auto& d=a.analysis.diagnostics.front();
-                                      if (semanticDiagnosticCode(d)!="E0321" || semanticDiagnosticHint(d).empty())
+                                      const auto& d = a.analysis.diagnostics.front();
+                                      if (semanticDiagnosticCode(d) != "E0321" || semanticDiagnosticHint(d).empty())
                                           throw std::runtime_error("diagnostic not structured");
-                                  });
+                                      });
                                   test("optimizer: fold valid UTF-8 literal slice only", [&] {
-                                      const std::string src="routine main() gives int\n    let piece: text = \"alpha.beta\".slice(0,5)\n    if piece.compare(\"alpha\") == 0\n        give 42\n    give 0\n";
-                                      CompilerOptions o0; o0.optimizationLevel=0;
-                                      CompilerOptions o3; o3.optimizationLevel=3;
-                                      const auto a=compileAll(src,o0), b=compileAll(src,o3);
-                                      auto countSlice=[](const IRProgram& ir) {
-                                          std::size_t n=0;
-                                          for (const auto& f:ir.functions)for (const auto& block:f.blocks)
-                                              for (const auto& inst:block.instructions)
-                                                  if (inst.op==IROpcode::TextSlice)++n;
+                                      const std::string src = "routine main() gives int\n    let piece: text = \"alpha.beta\".slice(0,5)\n    if piece.compare(\"alpha\") == 0\n        give 42\n    give 0\n";
+                                      CompilerOptions o0; o0.optimizationLevel = 0;
+                                      CompilerOptions o3; o3.optimizationLevel = 3;
+                                      const auto a = compileAll(src, o0), b = compileAll(src, o3);
+                                      auto countSlice = [](const IRProgram& ir) {
+                                          std::size_t n = 0;
+                                          for (const auto& f : ir.functions)for (const auto& block : f.blocks)
+                                              for (const auto& inst : block.instructions)
+                                                  if (inst.op == IROpcode::TextSlice)++n;
                                           return n;
-                                      };
-                                      if (countSlice(a.pcir)==0 || countSlice(b.pcir)!=0)
+                                          };
+                                      if (countSlice(a.pcir) == 0 || countSlice(b.pcir) != 0)
                                           throw std::runtime_error("proven constant UTF-8 slice not specialized");
-                                      if (PCIRInterpreter(a.pcir).run("")!=42 || PCIRInterpreter(b.pcir).run("")!=42)
+                                      if (PCIRInterpreter(a.pcir).run("") != 42 || PCIRInterpreter(b.pcir).run("") != 42)
                                           throw std::runtime_error("slice optimizer changed meaning");
 #if defined(__linux__) && defined(__x86_64__)
-                                      if (executeEmittedMachineTextIsolated(b.machine)!=42)
+                                      if (executeEmittedMachineTextIsolated(b.machine) != 42)
                                           throw std::runtime_error("native text slice mismatch");
 #endif
-                                  });
+                                      });
                                   test("optimizer: preserve invalid UTF-8 split trap", [&] {
-                                      const std::string src="routine main() gives int with trap\n    let s: text = \"é\"\n    let piece: text = s.slice(1,1)\n    give piece.count().to_int()\n";
-                                      CompilerOptions o3; o3.optimizationLevel=3;
-                                      const auto a=compileAll(src,o3);
+                                      const std::string src = "routine main() gives int with trap\n    let s: text = \"é\"\n    let piece: text = s.slice(1,1)\n    give piece.count().to_int()\n";
+                                      CompilerOptions o3; o3.optimizationLevel = 3;
+                                      const auto a = compileAll(src, o3);
                                       if (!a.analysis.succeeded())throw std::runtime_error("invalid slice must compile to checked runtime operation");
-                                      bool sliced=false;
-                                      for (const auto& f:a.pcir.functions)for (const auto& b:f.blocks)
-                                          for (const auto& i:b.instructions)if (i.op==IROpcode::TextSlice)sliced=true;
+                                      bool sliced = false;
+                                      for (const auto& f : a.pcir.functions)for (const auto& b : f.blocks)
+                                          for (const auto& i : b.instructions)if (i.op == IROpcode::TextSlice)sliced = true;
                                       if (!sliced)throw std::runtime_error("optimizer discarded trap for split UTF-8 scalar");
-                                  });
+                                      });
                                   test("package manager manifest and lock workflow", [&] {
                                       namespace fs = std::filesystem;
                                       const auto root = fs::temp_directory_path() /
@@ -15623,7 +15794,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       fs::remove_all(root, ec);
                                       });
                                   test("stage0 args: UTF-8 quoted argv view and checked indexing", [&] {
-                                      const std::string code=
+                                      const std::string code =
                                           "module argvprobe\nimport std.io\n"
                                           "routine main(args: view<text>) gives int with trap\n"
                                           "    if args.count != 3\n        give 1\n"
@@ -15631,174 +15802,176 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           "    if not args[1].equals(\"two words\")\n        give 3\n"
                                           "    if not args[2].equals(\"🚀\")\n        give 4\n"
                                           "    give 0\n";
-                                      for(int opt:{0,3}){
-                                          CompilerOptions options;options.optimizationLevel=opt;
-                                          auto a=compileAll(code,options);
-                                          if(!a.analysis.succeeded())throw std::runtime_error("argv semantic analysis failed");
-                                          if(a.machine.entryName!="__pcn_entry_args")throw std::runtime_error("entry did not select UTF-8 args thunk");
-                                          if(a.machine.imports.empty())throw std::runtime_error("argv startup missing imports");
+                                      for (int opt : {0, 3}) {
+                                          CompilerOptions options; options.optimizationLevel = opt;
+                                          auto a = compileAll(code, options);
+                                          if (!a.analysis.succeeded())throw std::runtime_error("argv semantic analysis failed");
+                                          if (a.machine.entryName != "__pcn_entry_args")throw std::runtime_error("entry did not select UTF-8 args thunk");
+                                          if (a.machine.imports.empty())throw std::runtime_error("argv startup missing imports");
 #if defined(__linux__) && defined(__x86_64__)
-                                          if(executeEmittedMachineTextIsolated(a.machine)!=0)throw std::runtime_error("argv UTF-8/quoted native execution mismatch");
+                                          if (executeEmittedMachineTextIsolated(a.machine) != 0)throw std::runtime_error("argv UTF-8/quoted native execution mismatch");
 #endif
-                                          auto pe=PECOFFGenerator{}.emitExecutable(a.pcir,a.pmir,a.machine);
-                                          if(verifyNativeArtifact(pe).format!="PE32+ executable")throw std::runtime_error("argv PE verification failed");
+                                          auto pe = PECOFFGenerator{}.emitExecutable(a.pcir, a.pmir, a.machine);
+                                          if (verifyNativeArtifact(pe).format != "PE32+ executable")throw std::runtime_error("argv PE verification failed");
                                       }
-                                  });
+                                      });
                                   test("stage0 args: for-loop over view<text>", [&] {
-                                      const std::string code=
+                                      const std::string code =
                                           "routine main(args: view<text>) gives int with trap\n"
                                           "    var count: int = 0\n"
                                           "    for argument in args\n"
                                           "        if argument.count() == 0\n            give 8\n"
                                           "        count += 1\n"
                                           "    give count\n";
-                                      for(int opt:{0,3}){
-                                          CompilerOptions options;options.optimizationLevel=opt;
-                                          auto a=compileAll(code,options);
-                                          if(!a.analysis.succeeded())throw std::runtime_error("view iteration semantics failed");
+                                      for (int opt : {0, 3}) {
+                                          CompilerOptions options; options.optimizationLevel = opt;
+                                          auto a = compileAll(code, options);
+                                          if (!a.analysis.succeeded())throw std::runtime_error("view iteration semantics failed");
 #if defined(__linux__) && defined(__x86_64__)
-                                          if(executeEmittedMachineTextIsolated(a.machine)!=3)throw std::runtime_error("view iteration returned incorrect count");
+                                          if (executeEmittedMachineTextIsolated(a.machine) != 3)throw std::runtime_error("view iteration returned incorrect count");
 #endif
                                       }
-                                  });
+                                      });
                                   test("stage0 fs: Unicode path, owned UTF-8 read and cleanup", [&] {
-                                      const auto path=std::filesystem::temp_directory_path()/"paracine-stage0-fs-test-𐐷.txt";
-                                      struct Cleanup {std::filesystem::path path;~Cleanup(){std::error_code ec;std::filesystem::remove(path,ec);}}cleanup{path};
-                                      {std::ofstream out(path,std::ios::binary);if(!out)throw std::runtime_error("test file creation failed");
-                                          for(int i=0;i<13000;++i)out.put('a');out<<"🚀";}
-                                      const auto pathUtf8=path.u8string();
-                                      const std::string filename(pathUtf8.begin(),pathUtf8.end());
+                                      const auto path = std::filesystem::temp_directory_path() / "paracine-stage0-fs-test-𐐷.txt";
+                                      struct Cleanup { std::filesystem::path path; ~Cleanup() { std::error_code ec; std::filesystem::remove(path, ec); } }cleanup{ path };
+                                      {
+                                          std::ofstream out(path, std::ios::binary); if (!out)throw std::runtime_error("test file creation failed");
+                                          for (int i = 0; i < 13000; ++i)out.put('a'); out << "🚀";
+                                      }
+                                      const auto pathUtf8 = path.u8string();
+                                      const std::string filename(pathUtf8.begin(), pathUtf8.end());
                                       std::string quoted;
-                                      for(auto ch:filename){if(ch=='\\'||ch=='\"')quoted.push_back('\\');quoted.push_back(ch);}
-                                      const std::string code=
+                                      for (auto ch : filename) { if (ch == '\\' || ch == '\"')quoted.push_back('\\'); quoted.push_back(ch); }
+                                      const std::string code =
                                           "module fileprobe\nimport std.fs\n"
                                           "routine main() gives int with io,alloc,trap\n"
-                                          "    let body: string = std.fs.read_text(\""+quoted+"\")\n"
+                                          "    let body: string = std.fs.read_text(\"" + quoted + "\")\n"
                                           "    if body.to_text().count() != 13004\n        give 3\n"
                                           "    give 0\n";
-                                      for(int opt:{0,3}){
-                                          CompilerOptions options;options.optimizationLevel=opt;
-                                          auto a=compileAll(code,options);
-                                          if(!a.analysis.succeeded())throw std::runtime_error("file read semantic failure");
-                                          if(PCIRInterpreter(a.pcir).run("")!=0)throw std::runtime_error("file read interpreter failure");
+                                      for (int opt : {0, 3}) {
+                                          CompilerOptions options; options.optimizationLevel = opt;
+                                          auto a = compileAll(code, options);
+                                          if (!a.analysis.succeeded())throw std::runtime_error("file read semantic failure");
+                                          if (PCIRInterpreter(a.pcir).run("") != 0)throw std::runtime_error("file read interpreter failure");
 #if defined(__linux__) && defined(__x86_64__)
-                                          if(executeEmittedMachineTextIsolated(a.machine)!=0)throw std::runtime_error("file read native failure");
+                                          if (executeEmittedMachineTextIsolated(a.machine) != 0)throw std::runtime_error("file read native failure");
 #endif
-                                          auto bytes=PECOFFGenerator{}.emitExecutable(a.pcir,a.pmir,a.machine);
-                                          if(verifyNativeArtifact(bytes).format!="PE32+ executable")throw std::runtime_error("file PE verification failed");
+                                          auto bytes = PECOFFGenerator{}.emitExecutable(a.pcir, a.pmir, a.machine);
+                                          if (verifyNativeArtifact(bytes).format != "PE32+ executable")throw std::runtime_error("file PE verification failed");
                                       }
-                                  });
+                                      });
                                   test("stage0 fs: exists detects UTF-8 paths and missing files", [&] {
-                                      const auto path=std::filesystem::temp_directory_path()/"paracine-stage0-exists-𐐷.txt";
-                                      struct Cleanup {std::filesystem::path p;~Cleanup(){std::error_code ec;std::filesystem::remove(p,ec);}}cleanup{path};
-                                      {std::ofstream f(path,std::ios::binary); f << "hello";}
-                                      const auto u8=path.u8string();const std::string filename(u8.begin(),u8.end());
+                                      const auto path = std::filesystem::temp_directory_path() / "paracine-stage0-exists-𐐷.txt";
+                                      struct Cleanup { std::filesystem::path p; ~Cleanup() { std::error_code ec; std::filesystem::remove(p, ec); } }cleanup{ path };
+                                      { std::ofstream f(path, std::ios::binary); f << "hello"; }
+                                      const auto u8 = path.u8string(); const std::string filename(u8.begin(), u8.end());
                                       std::string escaped;
-                                      for(char c:filename){if(c=='\\'||c=='"')escaped.push_back('\\');escaped.push_back(c);}
-                                      const std::string code=
+                                      for (char c : filename) { if (c == '\\' || c == '"')escaped.push_back('\\'); escaped.push_back(c); }
+                                      const std::string code =
                                           "module existsprobe\nimport std.fs\n"
                                           "routine main() gives int with alloc,io,trap\n"
-                                          "    if not std.fs.exists(\""+escaped+"\")\n        give 5\n"
-                                          "    if std.fs.exists(\""+escaped+".does-not-exist\")\n        give 6\n"
+                                          "    if not std.fs.exists(\"" + escaped + "\")\n        give 5\n"
+                                          "    if std.fs.exists(\"" + escaped + ".does-not-exist\")\n        give 6\n"
                                           "    give 0\n";
-                                      for(int opt:{0,3}){
-                                          CompilerOptions options;options.optimizationLevel=opt;
-                                          auto a=compileAll(code,options);
-                                          if(!a.analysis.succeeded())throw std::runtime_error("fs exists semantic failure");
-                                          if(PCIRInterpreter(a.pcir).run("")!=0)throw std::runtime_error("fs exists oracle failure");
+                                      for (int opt : {0, 3}) {
+                                          CompilerOptions options; options.optimizationLevel = opt;
+                                          auto a = compileAll(code, options);
+                                          if (!a.analysis.succeeded())throw std::runtime_error("fs exists semantic failure");
+                                          if (PCIRInterpreter(a.pcir).run("") != 0)throw std::runtime_error("fs exists oracle failure");
 #if defined(__linux__) && defined(__x86_64__)
-                                          if(executeEmittedMachineTextIsolated(a.machine)!=0)throw std::runtime_error("fs exists native failure");
+                                          if (executeEmittedMachineTextIsolated(a.machine) != 0)throw std::runtime_error("fs exists native failure");
 #endif
-                                          auto bytes=PECOFFGenerator{}.emitExecutable(a.pcir,a.pmir,a.machine);
-                                          if(verifyNativeArtifact(bytes).format!="PE32+ executable")throw std::runtime_error("fs exists PE verification failed");
+                                          auto bytes = PECOFFGenerator{}.emitExecutable(a.pcir, a.pmir, a.machine);
+                                          if (verifyNativeArtifact(bytes).format != "PE32+ executable")throw std::runtime_error("fs exists PE verification failed");
                                       }
-                                  });
+                                      });
                                   test("stage0 fs: write_text Unicode path and full-file roundtrip O0/O3", [&] {
-                                      const auto path=std::filesystem::temp_directory_path()/"paracine-stage0-write-🚀.txt";
-                                      struct Cleanup{std::filesystem::path p;~Cleanup(){std::error_code ec;std::filesystem::remove(p,ec);}} cleanup{path};
-                                      const auto u8=path.u8string();const std::string filename(u8.begin(),u8.end());
+                                      const auto path = std::filesystem::temp_directory_path() / "paracine-stage0-write-🚀.txt";
+                                      struct Cleanup { std::filesystem::path p; ~Cleanup() { std::error_code ec; std::filesystem::remove(p, ec); } } cleanup{ path };
+                                      const auto u8 = path.u8string(); const std::string filename(u8.begin(), u8.end());
                                       std::string escaped;
-                                      for(char c:filename){if(c=='\\'||c=='"')escaped.push_back('\\');escaped.push_back(c);}
-                                      const std::string code=
+                                      for (char c : filename) { if (c == '\\' || c == '"')escaped.push_back('\\'); escaped.push_back(c); }
+                                      const std::string code =
                                           "module writeprobe\nimport std.fs\n"
                                           "routine main() gives int with io,alloc,trap\n"
-                                          "    if not std.fs.write_text(\""+escaped+"\", \"original\")\n        give 2\n"
-                                          "    if not std.fs.write_text(\""+escaped+"\", \"updated λ 🚀\")\n        give 3\n"
-                                          "    let body: string = std.fs.read_text(\""+escaped+"\")\n"
+                                          "    if not std.fs.write_text(\"" + escaped + "\", \"original\")\n        give 2\n"
+                                          "    if not std.fs.write_text(\"" + escaped + "\", \"updated λ 🚀\")\n        give 3\n"
+                                          "    let body: string = std.fs.read_text(\"" + escaped + "\")\n"
                                           "    if not body.to_text().equals(\"updated λ 🚀\")\n        give 4\n"
                                           "    give 0\n";
-                                      for (int opt: {0,3}) {
-                                          CompilerOptions options;options.optimizationLevel=opt;
-                                          auto a=compileAll(code,options);
-                                          if(!a.analysis.succeeded())throw std::runtime_error("write_text semantic failure");
-                                          if(PCIRInterpreter(a.pcir).run("")!=0)throw std::runtime_error("write_text interpreter failure");
+                                      for (int opt : {0, 3}) {
+                                          CompilerOptions options; options.optimizationLevel = opt;
+                                          auto a = compileAll(code, options);
+                                          if (!a.analysis.succeeded())throw std::runtime_error("write_text semantic failure");
+                                          if (PCIRInterpreter(a.pcir).run("") != 0)throw std::runtime_error("write_text interpreter failure");
 #if defined(__linux__) && defined(__x86_64__)
-                                          if(executeEmittedMachineTextIsolated(a.machine)!=0)throw std::runtime_error("write_text emitted x64 failure");
+                                          if (executeEmittedMachineTextIsolated(a.machine) != 0)throw std::runtime_error("write_text emitted x64 failure");
 #endif
-                                          const auto image=PECOFFGenerator{}.emitExecutable(a.pcir,a.pmir,a.machine);
-                                          if(verifyNativeArtifact(image).format!="PE32+ executable")throw std::runtime_error("write_text PE check failure");
+                                          const auto image = PECOFFGenerator{}.emitExecutable(a.pcir, a.pmir, a.machine);
+                                          if (verifyNativeArtifact(image).format != "PE32+ executable")throw std::runtime_error("write_text PE check failure");
                                       }
-                                  });
+                                      });
                                   test("stage0 fs: write_text reports missing parent and supports empty content", [&] {
-                                      const auto dir=std::filesystem::temp_directory_path()/"paracine-stage0-write-no-parent";
-                                      std::error_code ec;std::filesystem::remove_all(dir,ec);
-                                      const auto failFile=(dir/"missing.txt").u8string();
-                                      const std::string missing(failFile.begin(),failFile.end());
-                                      const auto emptyFile=std::filesystem::temp_directory_path()/"paracine-write-empty-test.txt";
-                                      struct Cleanup{std::filesystem::path p;~Cleanup(){std::error_code ec;std::filesystem::remove(p,ec);}} cleanup{emptyFile};
-                                      const auto u8=emptyFile.u8string();const std::string empty(u8.begin(),u8.end());
-                                      std::string code="module writesafe\nimport std.fs\nroutine main() gives int with io,alloc,trap\n"
-                                          "    if std.fs.write_text(\""+missing+"\", \"x\")\n        give 2\n"
-                                          "    if not std.fs.write_text(\""+empty+"\", \"\")\n        give 3\n"
-                                          "    let body: string = std.fs.read_text(\""+empty+"\")\n"
+                                      const auto dir = std::filesystem::temp_directory_path() / "paracine-stage0-write-no-parent";
+                                      std::error_code ec; std::filesystem::remove_all(dir, ec);
+                                      const auto failFile = (dir / "missing.txt").u8string();
+                                      const std::string missing(failFile.begin(), failFile.end());
+                                      const auto emptyFile = std::filesystem::temp_directory_path() / "paracine-write-empty-test.txt";
+                                      struct Cleanup { std::filesystem::path p; ~Cleanup() { std::error_code ec; std::filesystem::remove(p, ec); } } cleanup{ emptyFile };
+                                      const auto u8 = emptyFile.u8string(); const std::string empty(u8.begin(), u8.end());
+                                      std::string code = "module writesafe\nimport std.fs\nroutine main() gives int with io,alloc,trap\n"
+                                          "    if std.fs.write_text(\"" + missing + "\", \"x\")\n        give 2\n"
+                                          "    if not std.fs.write_text(\"" + empty + "\", \"\")\n        give 3\n"
+                                          "    let body: string = std.fs.read_text(\"" + empty + "\")\n"
                                           "    if body.to_text().count() != 0\n        give 4\n"
                                           "    give 0\n";
-                                      auto a=compileAll(code,CompilerOptions{});
-                                      if(PCIRInterpreter(a.pcir).run("")!=0)throw std::runtime_error("write_text missing-parent interpreter failure");
+                                      auto a = compileAll(code, CompilerOptions{});
+                                      if (PCIRInterpreter(a.pcir).run("") != 0)throw std::runtime_error("write_text missing-parent interpreter failure");
 #if defined(__linux__) && defined(__x86_64__)
-                                      if(executeEmittedMachineTextIsolated(a.machine)!=0)throw std::runtime_error("write_text missing-parent native failure");
+                                      if (executeEmittedMachineTextIsolated(a.machine) != 0)throw std::runtime_error("write_text missing-parent native failure");
 #endif
-                                  });
+                                      });
                                   test("stage0 fs: write_text rejects non-text arguments", [&] {
-                                      const std::string code="module rejected\nimport std.fs\nroutine main() gives int with io,alloc,trap\n    if std.fs.write_text(7, \"a\")\n        give 1\n    give 0\n";
-                                      auto a=compileAll(code,CompilerOptions{});
-                                      if(a.analysis.succeeded())throw std::runtime_error("write_text accepted integer path");
-                                  });
+                                      const std::string code = "module rejected\nimport std.fs\nroutine main() gives int with io,alloc,trap\n    if std.fs.write_text(7, \"a\")\n        give 1\n    give 0\n";
+                                      auto a = compileAll(code, CompilerOptions{});
+                                      if (a.analysis.succeeded())throw std::runtime_error("write_text accepted integer path");
+                                      });
                                   test("stage0 fs: read_text initializes owned result after branch chains", [&] {
-                                      const auto path=std::filesystem::temp_directory_path()/"paracine-read-after-branch.txt";
-                                      struct Cleanup{std::filesystem::path p;~Cleanup(){std::error_code ec;std::filesystem::remove(p,ec);}}cleanup{path};
-                                      {std::ofstream f(path,std::ios::binary);f<<"chain";}
-                                      const auto u=path.u8string();const std::string filename(u.begin(),u.end());
-                                      const std::string code="module chain\nimport std.fs\nroutine main() gives int with io,alloc,trap\n"
-                                          "    if not std.fs.exists(\""+filename+"\")\n        give 2\n"
-                                          "    if not std.fs.exists(\""+filename+"\")\n        give 3\n"
-                                          "    let body: string = std.fs.read_text(\""+filename+"\")\n"
+                                      const auto path = std::filesystem::temp_directory_path() / "paracine-read-after-branch.txt";
+                                      struct Cleanup { std::filesystem::path p; ~Cleanup() { std::error_code ec; std::filesystem::remove(p, ec); } }cleanup{ path };
+                                      { std::ofstream f(path, std::ios::binary); f << "chain"; }
+                                      const auto u = path.u8string(); const std::string filename(u.begin(), u.end());
+                                      const std::string code = "module chain\nimport std.fs\nroutine main() gives int with io,alloc,trap\n"
+                                          "    if not std.fs.exists(\"" + filename + "\")\n        give 2\n"
+                                          "    if not std.fs.exists(\"" + filename + "\")\n        give 3\n"
+                                          "    let body: string = std.fs.read_text(\"" + filename + "\")\n"
                                           "    if not body.to_text().equals(\"chain\")\n        give 4\n    give 0\n";
-                                      for(int opt: {0,3}){
-                                          CompilerOptions o;o.optimizationLevel=opt;
-                                          auto a=compileAll(code,o);
-                                          if(PCIRInterpreter(a.pcir).run("")!=0)throw std::runtime_error("branch-owned read interpreter mismatch");
+                                      for (int opt : {0, 3}) {
+                                          CompilerOptions o; o.optimizationLevel = opt;
+                                          auto a = compileAll(code, o);
+                                          if (PCIRInterpreter(a.pcir).run("") != 0)throw std::runtime_error("branch-owned read interpreter mismatch");
 #if defined(__linux__) && defined(__x86_64__)
-                                          if(executeEmittedMachineTextIsolated(a.machine)!=0)throw std::runtime_error("branch-owned read native mismatch");
+                                          if (executeEmittedMachineTextIsolated(a.machine) != 0)throw std::runtime_error("branch-owned read native mismatch");
 #endif
                                       }
-                                  });
+                                      });
                                   test("stage0 fs: write_text completes multiple 64KiB chunks", [&] {
-                                      const auto path=std::filesystem::temp_directory_path()/"paracine-write-chunk.txt";
-                                      struct Cleanup{std::filesystem::path p;~Cleanup(){std::error_code ec;std::filesystem::remove(p,ec);}}cleanup{path};
-                                      const auto u=path.u8string();const std::string filename(u.begin(),u.end());
-                                      const std::string contents(80000,'Q');
-                                      const std::string code="module chunk\nimport std.fs\nroutine main() gives int with io,alloc,trap\n"
-                                          "    if not std.fs.write_text(\""+filename+"\", \""+contents+"\")\n        give 2\n"
-                                          "    let content: string = std.fs.read_text(\""+filename+"\")\n"
+                                      const auto path = std::filesystem::temp_directory_path() / "paracine-write-chunk.txt";
+                                      struct Cleanup { std::filesystem::path p; ~Cleanup() { std::error_code ec; std::filesystem::remove(p, ec); } }cleanup{ path };
+                                      const auto u = path.u8string(); const std::string filename(u.begin(), u.end());
+                                      const std::string contents(80000, 'Q');
+                                      const std::string code = "module chunk\nimport std.fs\nroutine main() gives int with io,alloc,trap\n"
+                                          "    if not std.fs.write_text(\"" + filename + "\", \"" + contents + "\")\n        give 2\n"
+                                          "    let content: string = std.fs.read_text(\"" + filename + "\")\n"
                                           "    if content.to_text().count() != 80000\n        give 3\n    give 0\n";
-                                      auto a=compileAll(code,CompilerOptions{});
-                                      if(PCIRInterpreter(a.pcir).run("")!=0)throw std::runtime_error("chunk write oracle mismatch");
+                                      auto a = compileAll(code, CompilerOptions{});
+                                      if (PCIRInterpreter(a.pcir).run("") != 0)throw std::runtime_error("chunk write oracle mismatch");
 #if defined(__linux__) && defined(__x86_64__)
-                                      if(executeEmittedMachineTextIsolated(a.machine)!=0)throw std::runtime_error("chunk write native mismatch");
+                                      if (executeEmittedMachineTextIsolated(a.machine) != 0)throw std::runtime_error("chunk write native mismatch");
 #endif
-                                      if(std::filesystem::file_size(path)!=80000u)throw std::runtime_error("write file size mismatch");
-                                  });
+                                      if (std::filesystem::file_size(path) != 80000u)throw std::runtime_error("write file size mismatch");
+                                      });
                                   test("stage0 process: UTF-8 command line native call and exit status", [&] {
 #ifdef _WIN32
                                       const std::string command = "cmd.exe /d /c exit /b 37";
@@ -15811,31 +15984,82 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           "    let code: int = std.process.run(\"" + command + "\")\n"
                                           "    if code == 37\n        give 0\n"
                                           "    give 1\n";
-                                      for (int opt : {0,3}) {
-                                          CompilerOptions options; options.optimizationLevel=opt;
-                                          auto compiled=compileAll(source,options);
-                                          if(!compiled.analysis.succeeded())throw std::runtime_error("process.run semantic analysis rejected valid call");
-                                          bool hasRun=false;
-                                          for(const auto& fn:compiled.pcir.functions)for(const auto& block:fn.blocks)
-                                              for(const auto& i:block.instructions)if(i.op==IROpcode::ProcessRun)hasRun=true;
-                                          if(!hasRun)throw std::runtime_error("process.run incorrectly removed as dead or pure operation");
+                                      for (int opt : {0, 3}) {
+                                          CompilerOptions options; options.optimizationLevel = opt;
+                                          auto compiled = compileAll(source, options);
+                                          if (!compiled.analysis.succeeded())throw std::runtime_error("process.run semantic analysis rejected valid call");
+                                          bool hasRun = false;
+                                          for (const auto& fn : compiled.pcir.functions)for (const auto& block : fn.blocks)
+                                              for (const auto& i : block.instructions)if (i.op == IROpcode::ProcessRun)hasRun = true;
+                                          if (!hasRun)throw std::runtime_error("process.run incorrectly removed as dead or pure operation");
 #if defined(__linux__) && defined(__x86_64__)
-                                          if(executeEmittedMachineTextIsolated(compiled.machine)!=0)
+                                          if (executeEmittedMachineTextIsolated(compiled.machine) != 0)
                                               throw std::runtime_error("native process.run did not propagate child exit status");
 #endif
-                                          auto image=PECOFFGenerator{}.emitExecutable(compiled.pcir,compiled.pmir,compiled.machine);
-                                          if(verifyNativeArtifact(image).format!="PE32+ executable")
+                                          auto image = PECOFFGenerator{}.emitExecutable(compiled.pcir, compiled.pmir, compiled.machine);
+                                          if (verifyNativeArtifact(image).format != "PE32+ executable")
                                               throw std::runtime_error("invalid native PE import for process.run");
                                       }
-                                  });
+                                      });
                                   test("stage0 process: reject non-text process command", [&] {
-                                      const std::string source=
+                                      const std::string source =
                                           "module bad_process\nimport std.process\n"
                                           "routine main() gives int with io, alloc, trap\n"
                                           "    let code: int = std.process.run(42)\n    give code\n";
-                                      auto analyzed=compileAll(source,CompilerOptions{});
-                                      if(analyzed.analysis.succeeded())throw std::runtime_error("process.run accepted integer command");
-                                  });
+                                      auto analyzed = compileAll(source, CompilerOptions{});
+                                      if (analyzed.analysis.succeeded())throw std::runtime_error("process.run accepted integer command");
+                                      });
+                                  test("frontend: transparent type aliases survive native lowering", [&] {
+                                      const auto source = "module aliases\nalias Count = int\nalias Slots = array<Count,3>\n"
+                                          "routine increment(n: Count) gives Count\n    give n + 1\n"
+                                          "routine main() gives int\n    let values: Slots = [1,2,3]\n"
+                                          "    give increment(values[0])\n";
+                                      auto a = compileAll(source, CompilerOptions{});
+                                      if (!a.analysis.succeeded())throw std::runtime_error("alias semantic analysis failed");
+                                      if (PCIRInterpreter(a.pcir).run("") != 2)throw std::runtime_error("alias produced wrong oracle value");
+#if defined(__linux__) && defined(__x86_64__)
+                                      if (executeEmittedMachineTextIsolated(a.machine) != 2)
+                                          throw std::runtime_error("alias produced wrong x64 value");
+#endif
+                                      });
+                                  test("frontend: comparison RHS shift precedence", [&] {
+                                      const std::string source = "module shift\nroutine main() gives int\n"
+                                          "    if 2 < 1 << 2\n        give 7\n    give 9\n";
+                                      auto a = compileAll(source, CompilerOptions{});
+                                      if (!a.analysis.succeeded() || PCIRInterpreter(a.pcir).run("") != 7)
+                                          throw std::runtime_error("comparison did not bind shift on RHS");
+#if defined(__linux__) && defined(__x86_64__)
+                                      if (executeEmittedMachineTextIsolated(a.machine) != 7)
+                                          throw std::runtime_error("shift precedence changed native result");
+#endif
+                                      });
+                                  test("frontend: unicode escapes and trailing parameter commas", [&] {
+                                      const std::string source = "module escapes\n"
+                                          "routine f(a: char,) gives int\n    if a == '\\u{1F642}'\n        give 42\n    give 0\n"
+                                          "routine main() gives int\n    let sample: text = \"happy \\u{1F642}\"\n"
+                                          "    give f('\\u{1F642}')\n";
+                                      auto a = compileAll(source, CompilerOptions{});
+                                      if (!a.analysis.succeeded() || PCIRInterpreter(a.pcir).run("") != 42)
+                                          throw std::runtime_error("Unicode literals or trailing commas failed");
+                                      });
+                                  test("frontend: invalid string escape rejected in lexer", [&] {
+                                      try { (void)Lexer("routine main() gives int\n    let s = \"bad \\z\"\n").tokenize(); }
+                                      catch (const std::runtime_error& e) {
+                                          if (std::string(e.what()).find("E0116") != std::string::npos)return;
+                                          throw;
+                                      }
+                                      throw std::runtime_error("invalid string escape accepted");
+                                      });
+                                  test("frontend: recursion and grouping limits", [&] {
+                                      std::string deep = "routine main() gives int\n    give ";
+                                      deep += std::string(257, '(') + "1" + std::string(257, ')') + "\n";
+                                      try { (void)Lexer(deep).tokenize(); }
+                                      catch (const std::runtime_error& e) {
+                                          if (std::string(e.what()).find("E0118") != std::string::npos)return;
+                                          throw;
+                                      }
+                                      throw std::runtime_error("excessive grouping depth accepted");
+                                      });
                                   out << "Selftests: " << passed << " passed, " << failed << " failed\n";
                                   return failed ? 2 : 0;
                               }
@@ -15845,6 +16069,8 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
 int main(int argc, char** argv) {
     if (argc < 2) { pcn::printHelp(std::cout); return 0; }
     bool diagnosticJSON = false;
+    std::string diagnosticSource;
+    std::string diagnosticPath;
     try {
         std::vector<std::string> args; for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
         if (args[0] == "selftest") {
@@ -15852,7 +16078,7 @@ int main(int argc, char** argv) {
             return pcn::runCompilerSelfTests(std::cout);
         }
         if (args[0] == "bootstrap-status") {
-            if (args.size()!=1) throw std::runtime_error("bootstrap-status takes no arguments");
+            if (args.size() != 1) throw std::runtime_error("bootstrap-status takes no arguments");
             std::cout << pcn::kCompilerBuild << "\n"
                 << "Stage 0: C++23 bootstrap compiler = available\n"
                 << "Stage 1: Paracine-written scanner and typed IR seeds = compiled and regression-tested\n"
@@ -16016,6 +16242,8 @@ int main(int argc, char** argv) {
         if (sourceArg.empty()) throw std::runtime_error("command requires a .pcn source file");
         std::filesystem::path sourcePath = sourceArg;
         std::string source = pcn::readSourceFile(sourcePath);
+        diagnosticSource = source;
+        diagnosticPath = sourcePath.string();
         if (command == "tokens") {
             const auto stream = pcn::Lexer(source).tokenize();
             for (const auto& tok : stream) {
@@ -16183,7 +16411,7 @@ int main(int argc, char** argv) {
                 }
                 std::cout << "]}\n";
             }
-            else pcn::printSemanticDiagnostics(artifacts.analysis,sourcePath.string(),source);
+            else pcn::printSemanticDiagnostics(artifacts.analysis, sourcePath.string(), source);
             return 1;
         }
 
@@ -16323,10 +16551,82 @@ int main(int argc, char** argv) {
         throw std::runtime_error("unknown command: " + command);
     }
     catch (const std::exception& ex) {
-        if (diagnosticJSON)
-            std::cout << "{\"ok\":false,\"phase\":\"compiler\",\"error\":\""
-            << pcn::jsonEscape(ex.what()) << "\"}\n";
-        else std::cerr << "error: " << ex.what() << "\n";
+        const std::string detail = ex.what();
+        std::string code = "E0000", message = detail, phase = "compiler", hint;
+        std::size_t line = 0, column = 0;
+        if (detail.size() >= 5 && detail[0] == 'E' &&
+            std::all_of(detail.begin() + 1, detail.begin() + 5,
+                [](unsigned char c) { return std::isdigit(c) != 0; })) {
+            code = detail.substr(0, 5);
+            phase = code.substr(0, 3) == "E01" ? "lexer" :
+                code.substr(0, 3) == "E02" ? "parser" : "compiler";
+            std::size_t at = 5;
+            if (detail.compare(at, 4, " at ") == 0) {
+                at += 4;
+                auto digits = [&](std::size_t& output) {
+                    if (at == detail.size() || !std::isdigit(static_cast<unsigned char>(detail[at]))) return false;
+                    while (at < detail.size() && std::isdigit(static_cast<unsigned char>(detail[at]))) {
+                        const auto digit = static_cast<std::size_t>(detail[at++] - '0');
+                        if (output > 100000000) return false;
+                        output = output * 10 + digit;
+                    }
+                    return true;
+                    };
+                if (digits(line) && at < detail.size() && detail[at++] == ':' &&
+                    digits(column) && at < detail.size() && detail[at] == ':') ++at;
+                else { line = 0; column = 0; at = 5; }
+            }
+            message = detail.substr(at);
+            const auto first = message.find_first_not_of(' ');
+            if (first != std::string::npos) message.erase(0, first);
+        }
+        if (code == "E0100" || code == "E0101" || code == "E0102")
+            hint = "Indent blocks using exactly four ASCII spaces per level; tabs are forbidden.";
+        else if (code == "E0116")
+            hint = "Use valid string/character escapes, including Unicode \\u{HEX}.";
+        else if (code == "E0201")
+            hint = "A block body must begin on the next significant line, indented four spaces.";
+        else if (code == "E0234")
+            hint = "Aliases are transparent types; put any required generic parameters in the alias target.";
+        const std::string sourceLine = [&]() -> std::string {
+            if (!line || diagnosticSource.empty()) return {};
+            std::size_t at = 0, current = 1;
+            while (current < line && at < diagnosticSource.size()) {
+                const auto end = diagnosticSource.find('\n', at);
+                if (end == std::string::npos) return {};
+                at = end + 1;
+                ++current;
+            }
+            if (current != line || at >= diagnosticSource.size()) return {};
+            const auto end = diagnosticSource.find('\n', at);
+            std::string result = diagnosticSource.substr(at, end == std::string::npos ?
+                std::string::npos : end - at);
+            if (!result.empty() && result.back() == '\r') result.pop_back();
+            return result;
+            }();
+        if (diagnosticJSON) {
+            std::cout << "{\"ok\":false,\"phase\":\"" << phase
+                << "\",\"error\":\"" << pcn::jsonEscape(detail)
+                << "\",\"diagnostics\":[{\"severity\":\"error\",\"code\":\""
+                << code << "\",\"line\":" << line << ",\"column\":" << column
+                << ",\"message\":\"" << pcn::jsonEscape(message)
+                << "\",\"hint\":\"" << pcn::jsonEscape(hint)
+                << "\",\"source\":\"" << pcn::jsonEscape(sourceLine) << "\"}]}\n";
+        }
+        else {
+            std::cerr << "error[" << code << "]";
+            if (!diagnosticPath.empty()) std::cerr << " " << diagnosticPath;
+            if (line) std::cerr << ":" << line << ":" << column;
+            std::cerr << ": " << message << "\n";
+            if (!sourceLine.empty()) {
+                const auto gutter = std::to_string(line).size();
+                std::cerr << std::string(gutter + 1, ' ') << "|\n" << line << " | " << sourceLine
+                    << "\n" << std::string(gutter + 1, ' ') << "| "
+                    << std::string(column ? std::min<std::size_t>(column - 1, sourceLine.size()) : 0, ' ')
+                    << "^\n";
+            }
+            if (!hint.empty()) std::cerr << "  help: " << hint << "\n";
+        }
         return 1;
     }
 }
