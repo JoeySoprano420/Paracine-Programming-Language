@@ -10539,7 +10539,11 @@ namespace pcn {
     enum class PMIROpcode {
         ConstInt, ConstFloat, ConstBool, ConstNull, ConstText, Copy, Add, Sub, Mul, Div, Mod, BitAnd, BitOr, BitXor,
         Shl, Shr, Neg, BitNot, Not, Eq, Ne, Lt, Le, Gt, Ge, And, Or, Branch, BranchIf, Call, CallClosure,
-        TextToString, StringToText, StringClear, StringDispose, StringMove, StringAppend, ByteCount, TextEquals, TextByteAt, TextFindByte, TextStartsWith, TextEndsWith, TextSlice, TextHash64, TextCodepointAt, TextCodepointCount, TextIsAscii, TextFindText, TextCompare, TextRFindText, TextStreamWrite, TextStreamRead, FsReadText, FsExists, FsWriteText, ProcessRun, NumericCheckedCast, MakeAggregate, ExtractField, StoreField, ArrayIndex, ArrayStore, ResultOk, ResultErr, ResultIsErr, ResultTry, OptionSome, OptionNone, MakeClosure, Return, Nop
+        TextToString, StringToText, StringClear, StringDispose, StringMove, StringAppend, ByteCount, TextEquals, TextByteAt, TextFindByte, TextStartsWith, TextEndsWith, TextSlice, TextHash64, TextCodepointAt, TextCodepointCount, TextIsAscii, TextFindText, TextCompare, TextRFindText, TextStreamWrite, TextStreamRead, FsReadText, FsExists, FsWriteText, ProcessRun, NumericCheckedCast, MakeAggregate, ExtractField, StoreField, ArrayIndex, ArrayStore, ResultOk, ResultErr, ResultIsErr, ResultTry, OptionSome, OptionNone, MakeClosure, Return, Nop,
+        // Target-specific 64-bit immediate operations. These are introduced
+        // after semantic verification, never in source PCIR.
+        AddImm, SubImm, MulImm, BitAndImm, BitOrImm, BitXorImm,
+        ShlImm, ShrImm, EqImm, NeImm, LtImm, LeImm, GtImm, GeImm
     };
 
     struct PMIRInstruction {
@@ -10729,9 +10733,43 @@ namespace pcn {
                 else if (i.op == IROpcode::FsReadText || i.op == IROpcode::FsExists || i.op == IROpcode::FsWriteText)out.outgoingArea = std::max(out.outgoingArea, 160u);
                 else if (i.op == IROpcode::ProcessRun)out.outgoingArea = std::max(out.outgoingArea, 320u);
                 else if (i.op == IROpcode::StringAppend)out.outgoingArea = std::max(out.outgoingArea, 80u);
-            std::uint32_t cursor = out.totalSlots * 8u;
+            // Dense but non-reusing allocation: preserve every referenced VReg's stable
+            // identity, while avoiding frame cells for dead/removed optimizer temporaries.
+            // Because no two referenced VRegs share storage, pointers, mutable updates,
+            // rich aggregates, and phi-edge assignments retain their original semantics.
+            std::set<std::uint32_t> referencedSlots;
+            for (auto v : fn.parameterVregs) referencedSlots.insert(static_cast<std::uint32_t>(v));
+            for (const auto& block : fn.blocks) for (const auto& inst : block.instructions) {
+                if (inst.dest != VReg::None) referencedSlots.insert(static_cast<std::uint32_t>(inst.dest));
+                for (auto v : inst.args) referencedSlots.insert(static_cast<std::uint32_t>(v));
+            }
+            if (referencedSlots.contains(0) ||
+                referencedSlots.size() > std::numeric_limits<std::uint32_t>::max() / 8u)
+                throw std::runtime_error("PMIR invalid or excessive virtual frame cells");
+            std::uint32_t cursor = static_cast<std::uint32_t>(referencedSlots.size()) * 8u;
             if (out.richReturn) { out.sretCellOffset = cursor + 8u; cursor = out.sretCellOffset; }
-            for (std::uint32_t slot = 1; slot <= out.totalSlots; ++slot) { PMIRSlotInfo info; info.type = vregTypes[slot]; info.cellOffset = slot * 8u; auto lay = abi.layout(info.type); info.rich = lay.rich; info.objectSize = static_cast<std::uint32_t>(lay.size); info.objectAlignment = static_cast<std::uint32_t>(std::max<std::size_t>(lay.alignment, 1)); if (info.rich) { cursor = alignUp32(cursor + std::max<std::uint32_t>(info.objectSize, 1), info.objectAlignment); info.objectOffset = cursor; }out.slots[slot] = info; }
+            std::uint32_t cell = 0;
+            for (std::uint32_t slot : referencedSlots) {
+                if (slot > fn.totalVregs) throw std::runtime_error("PMIR virtual slot outside function register range");
+                PMIRSlotInfo info; info.type = vregTypes[slot]; info.cellOffset = ++cell * 8u;
+                auto lay = abi.layout(info.type); info.rich = lay.rich;
+                if (lay.size > std::numeric_limits<std::uint32_t>::max() ||
+                    lay.alignment > std::numeric_limits<std::uint32_t>::max())
+                    throw std::runtime_error("PMIR unsupported aggregate layout size");
+                info.objectSize = static_cast<std::uint32_t>(lay.size);
+                info.objectAlignment = static_cast<std::uint32_t>(std::max<std::size_t>(lay.alignment, 1));
+                if (info.rich) {
+                    const std::uint64_t end = static_cast<std::uint64_t>(cursor) + std::max(info.objectSize, 1u);
+                    if (end > std::numeric_limits<std::uint32_t>::max() - info.objectAlignment)
+                        throw std::runtime_error("PMIR rich frame allocation overflow");
+                    cursor = alignUp32(static_cast<std::uint32_t>(end), info.objectAlignment);
+                    info.objectOffset = cursor;
+                }
+                out.slots.emplace(slot, info);
+            }
+            if (static_cast<std::uint64_t>(cursor) + out.outgoingArea + 15u >
+                static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()))
+                throw std::runtime_error("PMIR stack frame exceeds x64 signed displacement range");
             out.frameSize = align16(cursor + out.outgoingArea);
             for (const auto& b : fn.blocks) {
                 PMIRBlock pb; pb.id = static_cast<std::uint32_t>(b.id); pb.label = b.labelName;
@@ -10755,15 +10793,104 @@ namespace pcn {
         }
     };
 
+    // Target-aware, semantics-preserving immediate instruction selection.
+    // Track constants inside a basic block only. A mutable VReg can be written
+    // repeatedly, so the map is killed on writes and never crosses a CFG edge.
+    // Calls and ownership operations may indirectly mutate state: fail closed.
+    class PMIRImmediateSelector {
+    public:
+        void optimize(PMIRProgram& program) const {
+            for (auto& fn : program.functions) for (auto& block : fn.blocks) {
+                std::unordered_map<std::uint32_t, std::int64_t> known;
+                for (auto& inst : block.instructions) {
+                    std::optional<std::int64_t> propagated;
+                    if (inst.op == PMIROpcode::ConstInt && inst.destSlot)
+                        propagated = inst.immediate;
+                    else if (inst.op == PMIROpcode::Copy && inst.destSlot && inst.srcSlots.size() == 1) {
+                        const auto it = known.find(inst.srcSlots[0]);
+                        if (it != known.end()) propagated = it->second;
+                    }
+                    auto select = [&](PMIROpcode replacement, bool allowLargeShift = false) {
+                        if (inst.srcSlots.size() != 2) return false;
+                        if (!fn.slots.contains(inst.srcSlots[0]) || !fn.slots.contains(inst.srcSlots[1])) return false;
+                        if (fn.slots.at(inst.srcSlots[0]).type.kind != IRValueKind::Int64 ||
+                            fn.slots.at(inst.srcSlots[1]).type.kind != IRValueKind::Int64) return false;
+                        auto it = known.find(inst.srcSlots[1]);
+                        if (it == known.end()) return false;
+                        const auto value = it->second;
+                        if (!allowLargeShift && (value < std::numeric_limits<std::int32_t>::min() ||
+                            value > std::numeric_limits<std::int32_t>::max())) return false;
+                        inst.op = replacement;
+                        inst.immediate = value;
+                        inst.hasImmediate = true;
+                        inst.srcSlots.resize(1);
+                        return true;
+                        };
+                    // Commutative operations may accept a constant in either lane.
+                    if (inst.srcSlots.size() == 2 && (inst.op == PMIROpcode::Add || inst.op == PMIROpcode::Mul ||
+                        inst.op == PMIROpcode::BitAnd || inst.op == PMIROpcode::BitOr ||
+                        inst.op == PMIROpcode::BitXor || inst.op == PMIROpcode::Eq || inst.op == PMIROpcode::Ne)) {
+                        const bool left = known.contains(inst.srcSlots[0]);
+                        const bool right = known.contains(inst.srcSlots[1]);
+                        if (left && !right) std::swap(inst.srcSlots[0], inst.srcSlots[1]);
+                    }
+                    switch (inst.op) {
+                    case PMIROpcode::Add: select(PMIROpcode::AddImm); break;
+                    case PMIROpcode::Sub: select(PMIROpcode::SubImm); break;
+                    case PMIROpcode::Mul: select(PMIROpcode::MulImm); break;
+                    case PMIROpcode::BitAnd: select(PMIROpcode::BitAndImm); break;
+                    case PMIROpcode::BitOr: select(PMIROpcode::BitOrImm); break;
+                    case PMIROpcode::BitXor: select(PMIROpcode::BitXorImm); break;
+                    case PMIROpcode::Shl: select(PMIROpcode::ShlImm, true); break;
+                    case PMIROpcode::Shr: select(PMIROpcode::ShrImm, true); break;
+                    case PMIROpcode::Eq: select(PMIROpcode::EqImm); break;
+                    case PMIROpcode::Ne: select(PMIROpcode::NeImm); break;
+                    case PMIROpcode::Lt: select(PMIROpcode::LtImm); break;
+                    case PMIROpcode::Le: select(PMIROpcode::LeImm); break;
+                    case PMIROpcode::Gt: select(PMIROpcode::GtImm); break;
+                    case PMIROpcode::Ge: select(PMIROpcode::GeImm); break;
+                    default: break;
+                    }
+                    if (inst.destSlot) {
+                        known.erase(inst.destSlot);
+                        if (propagated) known.emplace(inst.destSlot, *propagated);
+                    }
+                    // Conservative barrier: future additions that can modify
+                    // caller-owned cells cannot inherit stale constant facts.
+                    switch (inst.op) {
+                    case PMIROpcode::Call: case PMIROpcode::CallClosure:
+                    case PMIROpcode::ArrayStore: case PMIROpcode::StoreField:
+                    case PMIROpcode::StringAppend: case PMIROpcode::StringClear:
+                    case PMIROpcode::StringDispose: case PMIROpcode::StringMove:
+                    case PMIROpcode::TextStreamWrite: case PMIROpcode::TextStreamRead:
+                    case PMIROpcode::FsReadText: case PMIROpcode::FsWriteText:
+                    case PMIROpcode::ProcessRun:
+                        known.clear(); break;
+                    default: break;
+                    }
+                }
+            }
+        }
+    };
+
     class PMIRVerifier {
     public:
         std::vector<std::string> verify(const PMIRProgram& program) const {
             std::vector<std::string> errors; std::unordered_set<std::string> names; RichABIResolver abi(program.skm, program.nominalTypes);
             for (const auto& fn : program.functions) {
                 if (!names.insert(fn.name).second)errors.push_back("duplicate PMIR function: " + fn.name); if ((fn.frameSize & 15u) != 0)errors.push_back(fn.name + ": frame is not 16-byte aligned"); if (fn.outgoingArea < 32)errors.push_back(fn.name + ": Microsoft x64 shadow space is missing"); if (fn.richReturn && !fn.sretCellOffset)errors.push_back(fn.name + ": rich return missing hidden sret cell");
-                std::unordered_set<std::uint32_t>blocks; for (const auto& b : fn.blocks)blocks.insert(b.id); auto slotOK = [&](std::uint32_t s) {return s == 0 || s <= fn.totalSlots; }; for (auto p : fn.parameterSlots)if (!slotOK(p) || p == 0)errors.push_back(fn.name + ": invalid parameter stack slot");
+                std::unordered_set<std::uint32_t>blocks; for (const auto& b : fn.blocks)blocks.insert(b.id); auto slotOK = [&](std::uint32_t s) {return s == 0 || (s <= fn.totalSlots && fn.slots.contains(s)); }; for (auto p : fn.parameterSlots)if (!slotOK(p) || p == 0)errors.push_back(fn.name + ": invalid parameter stack slot");
                 const auto usable = fn.frameSize - fn.outgoingArea; for (const auto& [slot, si] : fn.slots) { if (si.cellOffset > usable)errors.push_back(fn.name + ": slot cell overlaps outgoing call area"); if (si.rich && (si.objectOffset > usable || si.objectOffset < si.objectSize))errors.push_back(fn.name + ": rich object storage outside local frame"); (void)slot; }
-                for (const auto& b : fn.blocks)for (const auto& i : b.instructions) { if (!slotOK(i.destSlot))errors.push_back(fn.name + ": invalid PMIR destination slot"); for (auto x : i.srcSlots)if (!slotOK(x) || x == 0)errors.push_back(fn.name + ": invalid PMIR source slot"); for (auto t : i.targets)if (!blocks.contains(t))errors.push_back(fn.name + ": invalid PMIR branch target"); if (i.op == PMIROpcode::Branch && i.targets.size() != 1)errors.push_back(fn.name + ": PMIR branch requires one target"); if (i.op == PMIROpcode::BranchIf && (i.targets.size() != 2 || i.srcSlots.size() != 1))errors.push_back(fn.name + ": PMIR conditional branch shape invalid"); }
+                for (const auto& b : fn.blocks)for (const auto& i : b.instructions) {
+                    if (!slotOK(i.destSlot))errors.push_back(fn.name + ": invalid PMIR destination slot"); for (auto x : i.srcSlots)if (!slotOK(x) || x == 0)errors.push_back(fn.name + ": invalid PMIR source slot"); for (auto t : i.targets)if (!blocks.contains(t))errors.push_back(fn.name + ": invalid PMIR branch target"); if (i.op == PMIROpcode::Branch && i.targets.size() != 1)errors.push_back(fn.name + ": PMIR branch requires one target"); if (i.op == PMIROpcode::BranchIf && (i.targets.size() != 2 || i.srcSlots.size() != 1))errors.push_back(fn.name + ": PMIR conditional branch shape invalid");
+                    if (i.op >= PMIROpcode::AddImm && i.op <= PMIROpcode::GeImm) {
+                        if (i.destSlot == 0 || i.srcSlots.size() != 1 || !i.hasImmediate)
+                            errors.push_back(fn.name + ": malformed target immediate instruction");
+                        if (i.op != PMIROpcode::ShlImm && i.op != PMIROpcode::ShrImm &&
+                            (i.immediate < std::numeric_limits<std::int32_t>::min() || i.immediate > std::numeric_limits<std::int32_t>::max()))
+                            errors.push_back(fn.name + ": immediate cannot fit a sign-extended imm32");
+                    }
+                }
             }return errors;
         }
     };
@@ -10772,6 +10899,13 @@ namespace pcn {
         switch (op) {
         case PMIROpcode::ConstInt:return"mov.imm"; case PMIROpcode::ConstFloat:return"mov.fp.bits"; case PMIROpcode::ConstBool:return"mov.bool"; case PMIROpcode::ConstNull:return"mov.null"; case PMIROpcode::ConstText:return"text.literal"; case PMIROpcode::Copy:return"copy";
         case PMIROpcode::Add:return"add"; case PMIROpcode::Sub:return"sub"; case PMIROpcode::Mul:return"imul"; case PMIROpcode::Div:return"idiv.defined"; case PMIROpcode::Mod:return"imod.defined"; case PMIROpcode::BitAnd:return"and"; case PMIROpcode::BitOr:return"or"; case PMIROpcode::BitXor:return"xor"; case PMIROpcode::Shl:return"shl"; case PMIROpcode::Shr:return"sar"; case PMIROpcode::Neg:return"neg"; case PMIROpcode::BitNot:return"not"; case PMIROpcode::Not:return"logical.not"; case PMIROpcode::Eq:return"cmp.eq"; case PMIROpcode::Ne:return"cmp.ne"; case PMIROpcode::Lt:return"cmp.lt"; case PMIROpcode::Le:return"cmp.le"; case PMIROpcode::Gt:return"cmp.gt"; case PMIROpcode::Ge:return"cmp.ge"; case PMIROpcode::And:return"logical.and"; case PMIROpcode::Or:return"logical.or"; case PMIROpcode::Branch:return"jmp"; case PMIROpcode::BranchIf:return"br.if"; case PMIROpcode::Call:return"call"; case PMIROpcode::CallClosure:return"call.closure"; case PMIROpcode::TextToString:return"text.to_string"; case PMIROpcode::StringToText:return"string.to_text"; case PMIROpcode::StringClear:return"string.clear"; case PMIROpcode::StringDispose:return"string.dispose"; case PMIROpcode::StringMove:return"string.move"; case PMIROpcode::StringAppend:return"string.append"; case PMIROpcode::ByteCount:return"text.count"; case PMIROpcode::TextEquals:return"text.equals"; case PMIROpcode::TextByteAt:return"text.byte_at.checked"; case PMIROpcode::TextFindByte:return"text.find_byte"; case PMIROpcode::TextStartsWith:return"text.starts_with"; case PMIROpcode::TextEndsWith:return"text.ends_with"; case PMIROpcode::TextSlice:return"text.slice.utf8_checked"; case PMIROpcode::TextHash64:return"text.hash64.fnv1a"; case PMIROpcode::TextCodepointAt:return"text.codepoint_at.utf8_checked"; case PMIROpcode::TextCodepointCount:return"text.codepoint_count"; case PMIROpcode::TextIsAscii:return"text.is_ascii"; case PMIROpcode::TextFindText:return"text.find.bytewise"; case PMIROpcode::TextCompare:return"text.compare.unsigned_lexicographic"; case PMIROpcode::TextRFindText:return"text.rfind.bytewise"; case PMIROpcode::TextStreamWrite:return"text.stream_write"; case PMIROpcode::TextStreamRead:return"text.stream_read_all"; case PMIROpcode::FsReadText:return"fs.read_text"; case PMIROpcode::FsExists:return"fs.exists"; case PMIROpcode::FsWriteText:return"fs.write_text"; case PMIROpcode::ProcessRun:return"process.run"; case PMIROpcode::NumericCheckedCast:return"numeric.checked_cast"; case PMIROpcode::MakeAggregate:return"aggregate.make"; case PMIROpcode::ExtractField:return"aggregate.field"; case PMIROpcode::StoreField:return"aggregate.store.field"; case PMIROpcode::ArrayIndex:return"array.index.checked"; case PMIROpcode::ArrayStore:return"array.store.checked"; case PMIROpcode::ResultOk:return"result.ok"; case PMIROpcode::ResultErr:return"result.err"; case PMIROpcode::ResultIsErr:return"result.is_err"; case PMIROpcode::ResultTry:return"result.try"; case PMIROpcode::OptionSome:return"option.some"; case PMIROpcode::OptionNone:return"option.none"; case PMIROpcode::MakeClosure:return"closure.make"; case PMIROpcode::Return:return"ret"; case PMIROpcode::Nop:return"nop";
+        case PMIROpcode::AddImm:return"add.imm"; case PMIROpcode::SubImm:return"sub.imm";
+        case PMIROpcode::MulImm:return"imul.imm"; case PMIROpcode::BitAndImm:return"and.imm";
+        case PMIROpcode::BitOrImm:return"or.imm"; case PMIROpcode::BitXorImm:return"xor.imm";
+        case PMIROpcode::ShlImm:return"shl.imm"; case PMIROpcode::ShrImm:return"sar.imm";
+        case PMIROpcode::EqImm:return"cmp.eq.imm"; case PMIROpcode::NeImm:return"cmp.ne.imm";
+        case PMIROpcode::LtImm:return"cmp.lt.imm"; case PMIROpcode::LeImm:return"cmp.le.imm";
+        case PMIROpcode::GtImm:return"cmp.gt.imm"; case PMIROpcode::GeImm:return"cmp.ge.imm";
         }return"?";
     }
 
@@ -10800,23 +10934,69 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   static void patch32(std::vector<std::uint8_t>& b, std::size_t p, std::int32_t v) { for (int i = 0; i < 4; ++i)b[p + i] = static_cast<std::uint8_t>((static_cast<std::uint32_t>(v) >> (i * 8)) & 0xff); }
                                   static std::int32_t negDisp(std::uint32_t off) { return -static_cast<std::int32_t>(off); }
                                   static void rex(std::vector<std::uint8_t>& b, bool w, int r, int base) { std::uint8_t x = 0x40; if (w)x |= 8; if (r >= 8)x |= 4; if (base >= 8)x |= 1; if (x != 0x40)b.push_back(x); }
-                                  static void movImm(std::vector<std::uint8_t>& b, int reg, std::uint64_t imm) { b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 1 : 0))); b.push_back(static_cast<std::uint8_t>(0xB8 + (reg & 7))); put64(b, imm); }
+                                  // All three forms preserve EFLAGS, unlike xor reg,reg.
+                                  // Zero-extended imm32 -> 5 bytes; sign-extended imm32 -> 7;
+                                  // full-width movabs only when necessary -> 10 bytes.
+                                  static void movImm(std::vector<std::uint8_t>& b, int reg, std::uint64_t imm) {
+                                      if (imm <= std::numeric_limits<std::uint32_t>::max()) {
+                                          if (reg >= 8) b.push_back(0x41);
+                                          b.push_back(static_cast<std::uint8_t>(0xB8 + (reg & 7)));
+                                          put32(b, static_cast<std::int32_t>(static_cast<std::uint32_t>(imm)));
+                                      }
+                                      else if (static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(imm))) == imm) {
+                                          b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 1 : 0)));
+                                          b.push_back(0xC7);
+                                          b.push_back(static_cast<std::uint8_t>(0xC0 + (reg & 7)));
+                                          put32(b, static_cast<std::int32_t>(imm));
+                                      }
+                                      else {
+                                          b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 1 : 0)));
+                                          b.push_back(static_cast<std::uint8_t>(0xB8 + (reg & 7)));
+                                          put64(b, imm);
+                                      }
+                                  }
                                   static void movReg(std::vector<std::uint8_t>& b, int dst, int src) { std::uint8_t r = 0x48; if (src >= 8)r |= 4; if (dst >= 8)r |= 1; b.push_back(r); b.push_back(0x89); b.push_back(static_cast<std::uint8_t>(0xC0 | ((src & 7) << 3) | (dst & 7))); }
-                                  static void loadRbp(std::vector<std::uint8_t>& b, int reg, std::int32_t disp) { b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 4 : 0))); b.push_back(0x8B); b.push_back(static_cast<std::uint8_t>(0x85 | ((reg & 7) << 3))); put32(b, disp); }
-                                  static void storeRbp(std::vector<std::uint8_t>& b, int reg, std::int32_t disp) { b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 4 : 0))); b.push_back(0x89); b.push_back(static_cast<std::uint8_t>(0x85 | ((reg & 7) << 3))); put32(b, disp); }
-                                  static void leaRbp(std::vector<std::uint8_t>& b, int reg, std::int32_t disp) { b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 4 : 0))); b.push_back(0x8D); b.push_back(static_cast<std::uint8_t>(0x85 | ((reg & 7) << 3))); put32(b, disp); }
+                                  // Compress x64 RBP-relative memory displacements from disp32 to
+                                  // disp8 whenever they fit, without changing operand width or ABI.
+                                  static void rbpDisp(std::vector<std::uint8_t>& b, int reg, std::int32_t disp, std::uint8_t op) {
+                                      b.push_back(static_cast<std::uint8_t>(0x48 | (reg >= 8 ? 4 : 0)));
+                                      b.push_back(op);
+                                      if (disp >= -128 && disp <= 127) {
+                                          b.push_back(static_cast<std::uint8_t>(0x45 | ((reg & 7) << 3)));
+                                          b.push_back(static_cast<std::uint8_t>(disp));
+                                      }
+                                      else {
+                                          b.push_back(static_cast<std::uint8_t>(0x85 | ((reg & 7) << 3)));
+                                          put32(b, disp);
+                                      }
+                                  }
+                                  static void loadRbp(std::vector<std::uint8_t>& b, int reg, std::int32_t disp) { rbpDisp(b, reg, disp, 0x8B); }
+                                  static void storeRbp(std::vector<std::uint8_t>& b, int reg, std::int32_t disp) { rbpDisp(b, reg, disp, 0x89); }
+                                  static void leaRbp(std::vector<std::uint8_t>& b, int reg, std::int32_t disp) { rbpDisp(b, reg, disp, 0x8D); }
                                   static void storeRspRax(std::vector<std::uint8_t>& b, std::int32_t disp) { b.insert(b.end(), { 0x48,0x89,0x84,0x24 }); put32(b, disp); }
+                                  static void memModRM(std::vector<std::uint8_t>& b, int reg, int base, std::int32_t disp) {
+                                      const int lowBase = base & 7;
+                                      const bool needsSIB = lowBase == 4;
+                                      // RBP/R13 always require a displacement; [RSP/R12] requires SIB.
+                                      const bool dispZero = disp == 0 && lowBase != 5;
+                                      const bool disp8 = !dispZero && disp >= -128 && disp <= 127;
+                                      const std::uint8_t mod = static_cast<std::uint8_t>(dispZero ? 0x00 : disp8 ? 0x40 : 0x80);
+                                      b.push_back(static_cast<std::uint8_t>(mod | ((reg & 7) << 3) | (needsSIB ? 4 : lowBase)));
+                                      if (needsSIB) b.push_back(static_cast<std::uint8_t>(0x24));
+                                      if (disp8) b.push_back(static_cast<std::uint8_t>(disp));
+                                      else if (!dispZero) put32(b, disp);
+                                  }
                                   static void loadMem(std::vector<std::uint8_t>& b, int dst, int base, std::int32_t disp, std::size_t width, bool sign) {
-                                      if (width >= 8) { rex(b, true, dst, base); b.push_back(0x8B); b.push_back(static_cast<std::uint8_t>(0x80 | ((dst & 7) << 3) | (base & 7))); put32(b, disp); return; }
-                                      if (width == 4 && sign) { rex(b, true, dst, base); b.push_back(0x63); b.push_back(static_cast<std::uint8_t>(0x80 | ((dst & 7) << 3) | (base & 7))); put32(b, disp); return; }
-                                      if (width == 4) { rex(b, false, dst, base); b.push_back(0x8B); b.push_back(static_cast<std::uint8_t>(0x80 | ((dst & 7) << 3) | (base & 7))); put32(b, disp); return; }
-                                      rex(b, true, dst, base); b.push_back(0x0F); b.push_back(static_cast<std::uint8_t>(width == 2 ? (sign ? 0xBF : 0xB7) : (sign ? 0xBE : 0xB6))); b.push_back(static_cast<std::uint8_t>(0x80 | ((dst & 7) << 3) | (base & 7))); put32(b, disp);
+                                      if (width >= 8) { rex(b, true, dst, base); b.push_back(0x8B); memModRM(b, dst, base, disp); return; }
+                                      if (width == 4 && sign) { rex(b, true, dst, base); b.push_back(0x63); memModRM(b, dst, base, disp); return; }
+                                      if (width == 4) { rex(b, false, dst, base); b.push_back(0x8B); memModRM(b, dst, base, disp); return; }
+                                      rex(b, true, dst, base); b.push_back(0x0F); b.push_back(static_cast<std::uint8_t>(width == 2 ? (sign ? 0xBF : 0xB7) : (sign ? 0xBE : 0xB6))); memModRM(b, dst, base, disp);
                                   }
                                   static void storeMem(std::vector<std::uint8_t>& b, int base, std::int32_t disp, int src, std::size_t width) {
                                       if (width >= 8) { rex(b, true, src, base); b.push_back(0x89); }
                                       else if (width == 4) { rex(b, false, src, base); b.push_back(0x89); }
                                       else if (width == 2) { b.push_back(0x66); rex(b, false, src, base); b.push_back(0x89); }
-                                      else { rex(b, false, src, base); b.push_back(0x88); }b.push_back(static_cast<std::uint8_t>(0x80 | ((src & 7) << 3) | (base & 7))); put32(b, disp);
+                                      else { rex(b, false, src, base); b.push_back(0x88); }memModRM(b, src, base, disp);
                                   }
                                   static void storeSlot(std::vector<std::uint8_t>& b, int reg, const PMIRFunction& fn, std::uint32_t slot) { storeRbp(b, reg, negDisp(fn.slots.at(slot).cellOffset)); }
                                   static void loadSlot(std::vector<std::uint8_t>& b, int reg, const PMIRFunction& fn, std::uint32_t slot) { loadRbp(b, reg, negDisp(fn.slots.at(slot).cellOffset)); }
@@ -10835,11 +11015,17 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   // Every virtual slot is eight bytes; float32 occupies the low four.
                                   static void xmmRbp(std::vector<std::uint8_t>& b, int xmm, std::int32_t disp, bool store, bool single) {
                                       b.push_back(single ? 0xF3 : 0xF2);
-                                      b.insert(b.end(), { 0x0F,static_cast<std::uint8_t>(store ? 0x11 : 0x10),static_cast<std::uint8_t>(0x85 | ((xmm & 7) << 3)) });
-                                      put32(b, disp);
+                                      b.push_back(0x0F); b.push_back(static_cast<std::uint8_t>(store ? 0x11 : 0x10));
+                                      if (disp >= -128 && disp <= 127) {
+                                          b.push_back(static_cast<std::uint8_t>(0x45 | ((xmm & 7) << 3)));
+                                          b.push_back(static_cast<std::uint8_t>(disp));
+                                      }
+                                      else { b.push_back(static_cast<std::uint8_t>(0x85 | ((xmm & 7) << 3))); put32(b, disp); }
                                   }
                                   static void xmmRbpOp(std::vector<std::uint8_t>& b, int xmm, std::int32_t disp, std::uint8_t op, bool single) {
-                                      b.push_back(single ? 0xF3 : 0xF2); b.insert(b.end(), { 0x0F,op,static_cast<std::uint8_t>(0x85 | ((xmm & 7) << 3)) }); put32(b, disp);
+                                      b.push_back(single ? 0xF3 : 0xF2); b.push_back(0x0F); b.push_back(op);
+                                      if (disp >= -128 && disp <= 127) { b.push_back(static_cast<std::uint8_t>(0x45 | ((xmm & 7) << 3))); b.push_back(static_cast<std::uint8_t>(disp)); }
+                                      else { b.push_back(static_cast<std::uint8_t>(0x85 | ((xmm & 7) << 3))); put32(b, disp); }
                                   }
                                   static void xmmSlotLoad(std::vector<std::uint8_t>& b, const PMIRFunction& fn, std::uint32_t slot, int xmm = 0) {
                                       auto& info = fn.slots.at(slot); xmmRbp(b, xmm, negDisp(info.cellOffset), false, info.type.kind == IRValueKind::Float32);
@@ -10885,6 +11071,104 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                   static void storeValueInto(std::vector<std::uint8_t>& b, const PMIRFunction& fn, std::uint32_t srcSlot, int dstBase, std::size_t dstOffset, const ABITypeLayout& valueLayout) { if (valueLayout.rich) { movReg(b, 11, dstBase); loadSlot(b, 10, fn, srcSlot); if (dstOffset) { movImm(b, 0, dstOffset);/* add r11,rax */b.insert(b.end(), { 0x49,0x01,0xC3 }); }copyFixed(b, 10, 11, valueLayout.size); } else { loadSlot(b, 0, fn, srcSlot); storeMem(b, dstBase, static_cast<std::int32_t>(dstOffset), 0, std::max<std::size_t>(valueLayout.size, 1)); } }
                                   static void loadValueFrom(std::vector<std::uint8_t>& b, const PMIRFunction& fn, std::uint32_t destSlot, int srcBase, std::size_t srcOffset, const ABITypeLayout& valueLayout) { if (valueLayout.rich) { initRichDest(b, fn, destSlot); movReg(b, 11, 0); movReg(b, 10, srcBase); if (srcOffset) { movImm(b, 0, srcOffset); b.insert(b.end(), { 0x49,0x01,0xC2 }); }copyFixed(b, 10, 11, valueLayout.size); } else { loadMem(b, 0, srcBase, static_cast<std::int32_t>(srcOffset), std::max<std::size_t>(valueLayout.size, 1), valueLayout.signedScalar); storeSlot(b, 0, fn, destSlot); } }
 
+                                  // Iterative branch relaxation. Shrink 6-byte Jcc rel32 or
+                                  // 5-byte JMP rel32 into a 2-byte rel8 encoding when the
+                                  // final displacement fits. Rebase *every* call, literal,
+                                  // imported-symbol relocation and listing range afterward.
+                                  // This keeps object/PE relocation data valid even when
+                                  // short branches are selected in a multi-function module.
+                                  static void relaxBranches(EncodedFunction& out,
+                                      const std::vector<BranchFix>& branches,
+                                      const std::unordered_map<std::uint32_t, std::size_t>& blocks) {
+                                      if (branches.empty()) return;
+                                      struct Relax {
+                                          std::size_t start, disp, oldSize;
+                                          std::uint32_t target;
+                                          std::uint8_t shortOp;
+                                          bool shortForm = false;
+                                      };
+                                      std::vector<Relax> fixes;
+                                      fixes.reserve(branches.size());
+                                      const auto& old = out.bytes;
+                                      for (const auto& f : branches) {
+                                          if (!blocks.contains(f.target))throw std::runtime_error("x64 invalid branch target during relaxation");
+                                          if (f.dispPos < 1 || f.dispPos + 4 > old.size())
+                                              throw std::runtime_error("x64 branch relocation outside machine text");
+                                          if (old[f.dispPos - 1] == 0xE9) {
+                                              fixes.push_back({ f.dispPos - 1,f.dispPos,5,f.target,0xEB,false });
+                                          }
+                                          else if (f.dispPos >= 2 && old[f.dispPos - 2] == 0x0F &&
+                                              (old[f.dispPos - 1] & 0xF0) == 0x80) {
+                                              fixes.push_back({ f.dispPos - 2,f.dispPos,6,f.target,
+                                                  static_cast<std::uint8_t>(0x70 | (old[f.dispPos - 1] & 0x0F)),false });
+                                          }
+                                          else throw std::runtime_error("x64 unexpected branch encoding during relaxation");
+                                      }
+                                      std::sort(fixes.begin(), fixes.end(), [](const Relax& a, const Relax& b) {return a.start < b.start; });
+                                      auto translate = [&](std::size_t oldPosition)->std::size_t {
+                                          std::size_t result = oldPosition;
+                                          for (const auto& f : fixes)if (f.shortForm && f.start < oldPosition)
+                                              result -= f.oldSize - 2;
+                                          return result;
+                                          };
+                                      bool progress = true;
+                                      while (progress) {
+                                          progress = false;
+                                          for (auto& f : fixes)if (!f.shortForm) {
+                                              const std::size_t oldTarget = blocks.at(f.target);
+                                              const auto from = static_cast<std::int64_t>(translate(f.start) + 2);
+                                              // A forward branch also shortens the bytes
+                                              // between itself and its target.
+                                              const auto hypotheticalTarget = static_cast<std::int64_t>(translate(oldTarget)) -
+                                                  (oldTarget > f.start ? static_cast<std::int64_t>(f.oldSize - 2) : 0);
+                                              const auto rel = hypotheticalTarget - from;
+                                              if (rel >= -128 && rel <= 127) { f.shortForm = true; progress = true; }
+                                          }
+                                      }
+                                      std::vector<std::uint8_t> next;
+                                      next.reserve(translate(old.size()));
+                                      std::size_t previous = 0;
+                                      for (const auto& f : fixes) {
+                                          if (!f.shortForm)continue;
+                                          if (f.start < previous)throw std::runtime_error("overlapping x64 branches");
+                                          next.insert(next.end(), old.begin() + static_cast<std::ptrdiff_t>(previous),
+                                              old.begin() + static_cast<std::ptrdiff_t>(f.start));
+                                          next.insert(next.end(), { f.shortOp,0 });
+                                          previous = f.start + f.oldSize;
+                                      }
+                                      next.insert(next.end(), old.begin() + static_cast<std::ptrdiff_t>(previous), old.end());
+                                      for (const auto& f : fixes) {
+                                          const auto target = static_cast<std::int64_t>(translate(blocks.at(f.target)));
+                                          if (f.shortForm) {
+                                              const auto at = translate(f.start);
+                                              const auto rel = target - static_cast<std::int64_t>(at + 2);
+                                              if (rel < -128 || rel > 127)throw std::runtime_error("x64 rel8 relaxation overflow");
+                                              next[at + 1] = static_cast<std::uint8_t>(static_cast<std::int8_t>(rel));
+                                          }
+                                          else {
+                                              const auto at = translate(f.disp);
+                                              const auto rel = target - static_cast<std::int64_t>(at + 4);
+                                              if (rel < std::numeric_limits<std::int32_t>::min() ||
+                                                  rel > std::numeric_limits<std::int32_t>::max())
+                                                  throw std::runtime_error("x64 rel32 branch displacement overflow");
+                                              patch32(next, at, static_cast<std::int32_t>(rel));
+                                          }
+                                      }
+                                      for (auto& c : out.calls)c.dispPos = translate(c.dispPos);
+                                      for (auto& c : out.literals)c.dispPos = translate(c.dispPos);
+                                      for (auto& c : out.imports)c.dispPos = translate(c.dispPos);
+                                      for (auto& line : out.listing) {
+                                          const auto newStart = translate(line.offset);
+                                          const auto newEnd = translate(line.offset + line.bytes.size());
+                                          if (newEnd<newStart || newEnd>next.size())
+                                              throw std::runtime_error("x64 listing invalid after branch relaxation");
+                                          line.offset = newStart;
+                                          line.bytes.assign(next.begin() + static_cast<std::ptrdiff_t>(newStart),
+                                              next.begin() + static_cast<std::ptrdiff_t>(newEnd));
+                                      }
+                                      out.bytes.swap(next);
+                                  }
+
                                   EncodedFunction encodeFunction(const PMIRFunction& fn, const RichABIResolver& abi)const {
                                       EncodedFunction out; auto& b = out.bytes; std::unordered_map<std::uint32_t, std::size_t>blockOffsets; std::vector<BranchFix>branches; auto record = [&](std::size_t st, const std::string& t) {out.listing.push_back({ st,slice(b,st,b.size()),t }); }; std::size_t s = b.size(); b.push_back(0x55); b.insert(b.end(), { 0x48,0x89,0xE5 }); b.insert(b.end(), { 0x48,0x81,0xEC }); put32(b, static_cast<std::int32_t>(fn.frameSize)); record(s, "push rbp; mov rbp,rsp; sub rsp," + std::to_string(fn.frameSize));
                                       std::size_t abiBase = 0; if (fn.richReturn) { s = b.size(); storeRbp(b, 1, negDisp(fn.sretCellOffset)); record(s, "spill hidden sret"); abiBase = 1; }
@@ -10894,9 +11178,38 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                           else storeSlot(b, 0, fn, slot);
                                           record(s, "legalize parameter -> s" + std::to_string(slot) + (si.rich ? " (indirect rich)" : ""));
                                       }
-                                      for (const auto& block : fn.blocks) { blockOffsets[block.id] = b.size(); for (const auto& ins : block.instructions) { s = b.size(); encodeInstruction(fn, ins, abi, b, branches, out.calls, out.literals, out.imports); record(s, pmirOpcodeName(ins.op)); } }
+                                      // A successor laid out immediately after its predecessor needs
+                                      // no unconditional branch. For conditional branches, invert the
+                                      // single jcc when the true edge falls through; omit the jmp.
+                                      for (std::size_t bi = 0; bi < fn.blocks.size(); ++bi) {
+                                          const auto& block = fn.blocks[bi];
+                                          const std::uint32_t next = bi + 1 < fn.blocks.size() ? fn.blocks[bi + 1].id : 0;
+                                          blockOffsets[block.id] = b.size();
+                                          for (std::size_t ii = 0; ii < block.instructions.size(); ++ii) {
+                                              const auto& ins = block.instructions[ii]; s = b.size();
+                                              const bool terminal = ii + 1 == block.instructions.size();
+                                              if (terminal && next && ins.op == PMIROpcode::Branch && ins.targets.size() == 1 && ins.targets[0] == next) {
+                                                  // fall through directly
+                                              }
+                                              else if (terminal && ins.op == PMIROpcode::BranchIf && ins.targets.size() == 2 && ins.srcSlots.size() == 1 &&
+                                                  (ins.targets[0] == ins.targets[1] || (next && (ins.targets[0] == next || ins.targets[1] == next)))) {
+                                                  if (ins.targets[0] == ins.targets[1]) {
+                                                      if (ins.targets[0] != next) emitJmp(b, ins.targets[0], branches);
+                                                  }
+                                                  else {
+                                                      loadSlot(b, 0, fn, ins.srcSlots[0]);
+                                                      b.insert(b.end(), { 0x48,0x85,0xC0 }); // test rax,rax
+                                                      if (ins.targets[0] == next) emitJcc(b, 0x84, ins.targets[1], branches);
+                                                      else emitJcc(b, 0x85, ins.targets[0], branches);
+                                                  }
+                                              }
+                                              else encodeInstruction(fn, ins, abi, b, branches, out.calls, out.literals, out.imports);
+                                              record(s, pmirOpcodeName(ins.op));
+                                          }
+                                      }
                                       if (fn.blocks.empty() || b.empty() || b.back() != 0xC3) { s = b.size(); b.insert(b.end(), { 0x31,0xC0 }); epilogue(b); record(s, "implicit return 0"); }
-                                      for (const auto& f : branches) { auto it = blockOffsets.find(f.target); if (it == blockOffsets.end())throw std::runtime_error("x64 encoder invalid branch target"); std::int64_t rel = static_cast<std::int64_t>(it->second) - static_cast<std::int64_t>(f.dispPos + 4); patch32(b, f.dispPos, static_cast<std::int32_t>(rel)); }return out;
+                                      relaxBranches(out, branches, blockOffsets);
+                                      return out;
                                   }
 
                                   static void emitDirectCall(std::vector<std::uint8_t>& b, const std::string& callee, std::vector<EncodedFunction::Call>& calls) { b.push_back(0xE8); auto p = b.size(); put32(b, 0); calls.push_back({ p,callee }); }
@@ -10942,6 +11255,53 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                               floatOp(fn, i, b); return;
                                           default:break;
                                           }
+                                      }
+                                      // Sign-extended immediate ALU encoding is identical for all
+                                      // 64-bit integer widths: 83 /ext imm8 or 81 /ext imm32.
+                                      if (i.op >= PMIROpcode::AddImm && i.op <= PMIROpcode::GeImm) {
+                                          if (i.srcSlots.size() != 1 || !i.destSlot || !i.hasImmediate)
+                                              throw std::runtime_error("malformed PMIR immediate operation");
+                                          unaryLoad();
+                                          const auto modImmediate = [&](std::uint8_t extension) {
+                                              if (i.immediate >= -128 && i.immediate <= 127) {
+                                                  b.insert(b.end(), { 0x48,0x83,static_cast<std::uint8_t>(0xC0 | (extension << 3)),static_cast<std::uint8_t>(i.immediate) });
+                                              }
+                                              else {
+                                                  b.insert(b.end(), { 0x48,0x81,static_cast<std::uint8_t>(0xC0 | (extension << 3)) });
+                                                  put32(b, static_cast<std::int32_t>(i.immediate));
+                                              }
+                                              };
+                                          switch (i.op) {
+                                          case PMIROpcode::AddImm: modImmediate(0); break;
+                                          case PMIROpcode::SubImm: modImmediate(5); break;
+                                          case PMIROpcode::BitAndImm: modImmediate(4); break;
+                                          case PMIROpcode::BitOrImm: modImmediate(1); break;
+                                          case PMIROpcode::BitXorImm: modImmediate(6); break;
+                                          case PMIROpcode::MulImm:
+                                              if (i.immediate >= -128 && i.immediate <= 127)
+                                                  b.insert(b.end(), { 0x48,0x6B,0xC0,static_cast<std::uint8_t>(i.immediate) });
+                                              else { b.insert(b.end(), { 0x48,0x69,0xC0 }); put32(b, static_cast<std::int32_t>(i.immediate)); }
+                                              break;
+                                          case PMIROpcode::ShlImm: case PMIROpcode::ShrImm: {
+                                              const std::uint8_t shift = static_cast<std::uint8_t>(static_cast<std::uint64_t>(i.immediate) & 63u);
+                                              const std::uint8_t modrm = i.op == PMIROpcode::ShlImm ? 0xE0 : 0xF8;
+                                              if (shift == 1) b.insert(b.end(), { 0x48,0xD1,modrm });
+                                              else if (shift) b.insert(b.end(), { 0x48,0xC1,modrm,shift });
+                                              break;
+                                          }
+                                          case PMIROpcode::EqImm: case PMIROpcode::NeImm:
+                                          case PMIROpcode::LtImm: case PMIROpcode::LeImm:
+                                          case PMIROpcode::GtImm: case PMIROpcode::GeImm: {
+                                              modImmediate(7); // CMP RAX, immediate
+                                              const auto cc = i.op == PMIROpcode::EqImm ? 0x94 : i.op == PMIROpcode::NeImm ? 0x95 :
+                                                  i.op == PMIROpcode::LtImm ? 0x9C : i.op == PMIROpcode::LeImm ? 0x9E :
+                                                  i.op == PMIROpcode::GtImm ? 0x9F : 0x9D;
+                                              b.insert(b.end(), { 0x0F,static_cast<std::uint8_t>(cc),0xC0,0x48,0x0F,0xB6,0xC0 });
+                                              break;
+                                          }
+                                          default: throw std::runtime_error("unsupported PMIR immediate opcode");
+                                          }
+                                          save(); return;
                                       }
                                       switch (i.op) {
                                       case PMIROpcode::ConstInt:case PMIROpcode::ConstFloat:case PMIROpcode::ConstBool:case PMIROpcode::ConstNull:movImm(b, 0, static_cast<std::uint64_t>(i.immediate)); save(); break;
@@ -11944,6 +12304,14 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                                               }break;
                                                           }
                                                           case PMIROpcode::Nop:b.push_back(0x90); break;
+                                                          case PMIROpcode::AddImm: case PMIROpcode::SubImm:
+                                                          case PMIROpcode::MulImm: case PMIROpcode::BitAndImm:
+                                                          case PMIROpcode::BitOrImm: case PMIROpcode::BitXorImm:
+                                                          case PMIROpcode::ShlImm: case PMIROpcode::ShrImm:
+                                                          case PMIROpcode::EqImm: case PMIROpcode::NeImm:
+                                                          case PMIROpcode::LtImm: case PMIROpcode::LeImm:
+                                                          case PMIROpcode::GtImm: case PMIROpcode::GeImm:
+                                                              throw std::runtime_error("target immediate operation reached generic x64 selection");
                                       }
                                   }
 
@@ -13960,6 +14328,10 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       PMIRLowerer pmirLowerer;
                                       out.pmir = pmirLowerer.lower(out.pcir);
                                       markPhase("PMIR lower");
+                                      if (options.optimizationLevel >= 2) {
+                                          PMIRImmediateSelector{}.optimize(out.pmir);
+                                          markPhase("PMIR immediate selection");
+                                      }
                                       PMIRVerifier pmirVerifier;
                                       auto pmirErrors = pmirVerifier.verify(out.pmir);
                                       if (!pmirErrors.empty()) { std::ostringstream oss; oss << "internal compiler error: invalid PMIR"; for (const auto& e : pmirErrors) oss << "\n  " << e; throw std::runtime_error(oss.str()); }
@@ -14516,7 +14888,7 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                               // --- Developer workflows: conservative formatting, deterministic packaging,
                               //     compiler-phase profiling, project creation and environment diagnostics. ---
                               // These tools don't change the language's supported semantic surface.
-                              static constexpr const char* kCompilerBuild = "Paracine 2026 stage0-process-run-20261107.1 (development; non-1.0)";
+                              static constexpr const char* kCompilerBuild = "Paracine 2026 native-backend-optimized-20261110.1 (development; non-1.0)";
 
                               static std::string canonicalFormat(const std::string& source) {
                                   // Whitespace-only normalization: line-ending normalization, trailing-space
@@ -16009,6 +16381,133 @@ class MachineVerifier { public:std::vector<std::string>verify(const MachineProgr
                                       auto analyzed = compileAll(source, CompilerOptions{});
                                       if (analyzed.analysis.succeeded())throw std::runtime_error("process.run accepted integer command");
                                       });
+                                  test("backend: immediate ALU specialization matches native oracle", [&] {
+                                      const std::string src =
+                                          "routine work(x: int) gives int\n"
+                                          "    let a: int = x + 5\n"
+                                          "    let b: int = a * 7\n"
+                                          "    let c: int = b - 11\n"
+                                          "    let d: int = (c & 127) | 64\n"
+                                          "    let e: int = d ^ 3\n"
+                                          "    let f: int = e << 65\n"
+                                          "    if f >= 80\n"
+                                          "        give f >> 1\n"
+                                          "    give 2\n"
+                                          "routine main() gives int\n"
+                                          "    give work(6)\n";
+                                      for (int opt : {0, 2, 3}) {
+                                          CompilerOptions o; o.optimizationLevel = opt;
+                                          auto compiled = compileAll(src, o);
+                                          if (!compiled.analysis.succeeded() || PCIRInterpreter(compiled.pcir).run("") != 65)
+                                              throw std::runtime_error("immediate ALU reference mismatch");
+#if defined(__linux__) && defined(__x86_64__)
+                                          if (executeEmittedMachineTextIsolated(compiled.machine) != 65)
+                                              throw std::runtime_error("immediate ALU native mismatch");
+#endif
+                                          std::size_t selected = 0;
+                                          for (const auto& fn : compiled.pmir.functions) if (fn.name == "work")
+                                              for (const auto& b : fn.blocks)for (const auto& i : b.instructions)
+                                                  if (i.op >= PMIROpcode::AddImm && i.op <= PMIROpcode::GeImm)++selected;
+                                          if (opt >= 2 && selected < 5)throw std::runtime_error("expected diverse target immediate instructions");
+                                          if (opt == 0 && selected)throw std::runtime_error("O0 unexpectedly enabled target specialization");
+                                      }
+                                      });
+                                  test("backend: immediate comparison and negative imm preserve x64 result", [&] {
+                                      const std::string src =
+                                          "routine work(x: int) gives int\n"
+                                          "    let a: int = x + 30000\n"
+                                          "    let b: int = a - 29999\n"
+                                          "    if b < 44\n"
+                                          "        if b != 43\n"
+                                          "            if b <= 42\n"
+                                          "                give b\n"
+                                          "    give 0\n"
+                                          "routine main() gives int\n"
+                                          "    give work(41)\n";
+                                      for (int opt : {0, 2, 3}) {
+                                          CompilerOptions o; o.optimizationLevel = opt;
+                                          auto compiled = compileAll(src, o);
+                                          if (!compiled.analysis.succeeded() || PCIRInterpreter(compiled.pcir).run("") != 42)
+                                              throw std::runtime_error("immediate comparison oracle mismatch");
+#if defined(__linux__) && defined(__x86_64__)
+                                          if (executeEmittedMachineTextIsolated(compiled.machine) != 42)
+                                              throw std::runtime_error("immediate comparison native mismatch");
+#endif
+                                      }
+                                      });
+                                  test("backend: reject unsafe sign-extended immediate selection", [&] {
+                                      const std::string src =
+                                          "routine work(x: int) gives int\n"
+                                          "    let a: int = x + 2147483648\n"
+                                          "    let b: int = a - 2147483648\n"
+                                          "    give b\n"
+                                          "routine main() gives int\n"
+                                          "    give work(23)\n";
+                                      CompilerOptions o; o.optimizationLevel = 3;
+                                      auto compiled = compileAll(src, o);
+                                      if (!compiled.analysis.succeeded() || PCIRInterpreter(compiled.pcir).run("") != 23)
+                                          throw std::runtime_error("wide immediate oracle mismatch");
+                                      for (const auto& fn : compiled.pmir.functions)if (fn.name == "work")
+                                          for (const auto& b : fn.blocks)for (const auto& i : b.instructions)
+                                              if (i.op == PMIROpcode::AddImm || i.op == PMIROpcode::SubImm)
+                                                  throw std::runtime_error("wide immediate truncated into sign-extended imm32");
+#if defined(__linux__) && defined(__x86_64__)
+                                      if (executeEmittedMachineTextIsolated(compiled.machine) != 23)
+                                          throw std::runtime_error("wide immediate changed native result");
+#endif
+                                      });
+                                  test("backend: compact frames exclude optimized-away virtual registers", [&] {
+                                      const std::string src =
+                                          "routine work(x: int) gives int\n"
+                                          "    let unused1: int = x * 43\n"
+                                          "    let unused2: int = x * 53\n"
+                                          "    let unused3: int = x * 63\n"
+                                          "    let unused4: int = x * 73\n"
+                                          "    let unused5: int = x * 83\n"
+                                          "    give x + 1\n"
+                                          "routine main() gives int\n"
+                                          "    give work(41)\n";
+                                      CompilerOptions o; o.optimizationLevel = 3;
+                                      auto compiled = compileAll(src, o);
+                                      if (!compiled.analysis.succeeded() || PCIRInterpreter(compiled.pcir).run("") != 42)
+                                          throw std::runtime_error("compact frame oracle mismatch");
+                                      bool gap = false;
+                                      for (const auto& fn : compiled.pmir.functions)if (fn.name == "work") {
+                                          gap = fn.slots.size() < fn.totalSlots;
+                                          if (fn.frameSize >= fn.totalSlots * 8 + fn.outgoingArea + 32u)
+                                              throw std::runtime_error("dead registers are still occupying stack cells");
+                                      }
+                                      if (!gap)throw std::runtime_error("no dead VReg gaps detected");
+#if defined(__linux__) && defined(__x86_64__)
+                                      if (executeEmittedMachineTextIsolated(compiled.machine) != 42)
+                                          throw std::runtime_error("compacted frame changed native result");
+#endif
+                                      });
+                                  test("backend: branch fallthrough remains correct with loops", [&] {
+                                      const std::string src =
+                                          "routine work(x: int) gives int\n"
+                                          "    var count: int = 0\n"
+                                          "    var total: int = 0\n"
+                                          "    while count < x\n"
+                                          "        if count < 3\n"
+                                          "            total += count\n"
+                                          "        else\n"
+                                          "            total += 2\n"
+                                          "        count += 1\n"
+                                          "    give total\n"
+                                          "routine main() gives int\n"
+                                          "    give work(7)\n";
+                                      for (int opt : {0, 2, 3}) {
+                                          CompilerOptions o; o.optimizationLevel = opt;
+                                          auto compiled = compileAll(src, o);
+                                          if (!compiled.analysis.succeeded() || PCIRInterpreter(compiled.pcir).run("") != 11)
+                                              throw std::runtime_error("branch fallthrough oracle mismatch");
+#if defined(__linux__) && defined(__x86_64__)
+                                          if (executeEmittedMachineTextIsolated(compiled.machine) != 11)
+                                              throw std::runtime_error("branch fallthrough native mismatch");
+#endif
+                                      }
+                                      });
                                   test("frontend: transparent type aliases survive native lowering", [&] {
                                       const auto source = "module aliases\nalias Count = int\nalias Slots = array<Count,3>\n"
                                           "routine increment(n: Count) gives Count\n    give n + 1\n"
@@ -16101,6 +16600,7 @@ int main(int argc, char** argv) {
                 << "  verified Paracine-written bootstrap scanner and typed-IR seeds\n"
                 << "  partial records/variants/closures/generics/results/ownership checks\n"
                 << "  verified PCIR -> PMIR -> x64 -> COFF/PE32+ for covered cases\n"
+                << "  compact stack frames, immediate x64 ALU/compare, disp8 addressing, jump relaxation\n"
                 << "  main(args: view<text>) UTF-8 argv, count/index/iteration; std.fs.read_text/exists/write_text\n"
                 << "PARTIAL / NOT FULLY IMPLEMENTED:\n"
                 << "  arbitrary iterator<I,T>/view<T> loop lowering and mutable array element borrowing\n"
