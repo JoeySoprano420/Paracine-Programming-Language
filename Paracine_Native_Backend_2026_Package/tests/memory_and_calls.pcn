@@ -1,0 +1,13 @@
+module memory_and_calls
+routine transform(x: int, y: int) gives int
+    let a: int = x + 100000
+    let b: int = a * 31
+    let c: int = (b | 19) ^ y
+    let d: int = c - 1021
+    let e: int = d >> 2
+    give e
+routine main() gives int
+    var sum: int = 0
+    from i: int = 1 to 10
+        sum += transform(i, 7)
+    give sum

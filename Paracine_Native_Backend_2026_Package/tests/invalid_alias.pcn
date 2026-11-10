@@ -1,0 +1,4 @@
+module invalid_alias
+alias Loop = Loop
+routine main() gives int
+    give 0

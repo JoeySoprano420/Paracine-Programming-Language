@@ -1,0 +1,5 @@
+module trailing_comma
+routine sum(a: int, b: int,) gives int
+    give a + b
+routine main() gives int
+    give sum(7, 8)

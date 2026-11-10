@@ -1,0 +1,11 @@
+module alias_types
+alias Counter = int
+alias Counters = array<Counter,4>
+record Config
+    offset: Counter
+routine add(value: Counter) gives Counter
+    give value + 2
+routine main() gives int
+    let items: Counters = [1, 2, 3, 4]
+    let initial: Counter = items[0]
+    give add(initial)

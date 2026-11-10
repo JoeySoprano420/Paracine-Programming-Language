@@ -1,0 +1,5 @@
+module precedence_shift
+routine main() gives int
+    if 2 < 1 << 2
+        give 7
+    give 9

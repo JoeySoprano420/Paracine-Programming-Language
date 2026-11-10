@@ -1,0 +1,14 @@
+module arithmetic_and_branches
+routine work(x: int) gives int
+    var value: int = x
+    var total: int = 0
+    from i: int = 1 to 20
+        value = (value * 13 + 299) ^ i
+        if value > 5000
+            value = value >> 2
+        else
+            value = value << 1
+        total += value & 127
+    give total
+routine main() gives int
+    give work(7)

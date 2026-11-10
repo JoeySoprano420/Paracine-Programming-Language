@@ -1,0 +1,7 @@
+module unicode_escape
+routine main() gives int
+    let character: char = '\u{1F642}'
+    let message: text = "Hello \u{1F642}"
+    if character == '\u{1F642}'
+        give 42
+    give 0

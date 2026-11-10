@@ -1,0 +1,4 @@
+module invalid_escape
+routine main() gives int
+    let message = "bad \z"
+    give 0
