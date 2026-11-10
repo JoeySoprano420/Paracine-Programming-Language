@@ -194,3 +194,5 @@ This license is open, sovereign, and future-respecting.
 🜲 — S.U.E.T. v1.0
 
 ## ---------- ##
+
+This license retains all exclusive ownership of abstract ideas in the README.md file, programming-language concepts in the README.md, general logic in the README.md, names in the README.md, as well as complete ownership, royalty, licensing, commercialization, and residual rights in Paracine to JoeySoprano420 (GitHub personlaity, language-and-technologies designer, producer, and author).
